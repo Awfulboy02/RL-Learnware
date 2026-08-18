@@ -1,0 +1,120 @@
+schema: policy-learnware.protocol-draft.v0
+project_seed: 20260811
+
+runtime:
+  python: /home/songyf/miniforge3/envs/GoRL/bin/python
+  fpo_root: /share/songyf/RL_Learnware/fpo
+  fpo_commit: 418c2554f7cd22d52e14c07d951280929d73bf2f
+  reproduction_root: /share/songyf/RL_Learnware/repro_fpo_ppo
+
+environment:
+  backend: mujoco_playground.registry
+  tasks:
+    - FingerSpin
+    - FingerTurnEasy
+    - FingerTurnHard
+    - WalkerStand
+    - WalkerWalk
+    - WalkerRun
+  horizon: 1000
+  action_repeat: 1
+  max_observation_dim: 24
+  max_action_dim: 6
+
+probe:
+  type: clipped_gaussian
+  sigma: 1.0
+  action_low: -1.0
+  action_high: 1.0
+  rng_backend: jax_threefry_full_episode_v0
+
+episodes:
+  encoder_train_per_task: 2
+  encoder_validation_per_task: 2
+  kernel_calibration_per_task: 1
+  separability_calibration_per_task: 2
+  source_taskspec_per_task: 2
+  target_query_max_per_task: 2
+  target_query_prefix_grid: [1, 2]
+  target_query_banks: 2
+  championization_per_candidate: 2
+  final_return_per_task: 2
+
+normalization:
+  fit_split: encoder_train
+  observation: task_balanced_valid_slot_mean_std
+  action: identity_after_env_normalization
+  reward: task_balanced_global_mean_std
+  std_floor: 1.0e-6
+  include_next_observation: true
+
+encoder:
+  framework: flax
+  hidden_dims: [256, 256]
+  latent_dim: 32
+  activation: relu
+  l2_normalize_output: true
+  objective: supervised_contrastive
+  temperature: 0.1
+  batch_size: 24
+  train_steps: 10
+  learning_rate: 3.0e-4
+  weight_decay: 0.0
+  validation_interval: 5
+  checkpoint_metric: validation_supcon_loss
+  checkpoint_tie_break: earliest_step
+  seed: 20260811
+  validation_batches: 2
+
+kernel:
+  type: gaussian
+  bandwidth: source_balanced_median
+  calibration_pairs: 60
+  seed: 20260811
+  pair_sampling: uniform_task_episode_transition
+
+reducer:
+  objective: weighted_kme_ridge
+  support_budget: 4
+  init: weighted_kmeans
+  support_steps: 5
+  learning_rate: 1.0e-2
+  pinv_rcond: 1.0e-8
+  ridge: 1.0e-6
+  reconstruction_tolerance: 0.20
+  reconstruction_tolerance_metric: rkhs_norm
+  kmeans_steps: 8
+  optimizer_backend: numpy
+  negative_tolerance: 1.0e-8
+
+pool:
+  pool_id: dmc6-outer006-policy-learnware-v0-smoke
+  checkpoint_outer: 6
+  actual_environment_steps: 5898240
+  candidates_per_task: 10
+
+selector:
+  negative_tolerance: 1.0e-8
+  tie_break: opaque_id_lexical
+  fallback: none
+
+gates:
+  unreduced:
+    minimum_between_within_ratio: 1.25
+    minimum_absolute_margin: 1.0e-6
+    minimum_split_retrieval_accuracy: 1.0
+  reduced_unreduced_ranking:
+    minimum_top1_agreement: 1.0
+  retrieval:
+    minimum_max_prefix_accuracy: 0.95
+  deployment:
+    minimum_correct_retrieval_deployability_rate: 1.0
+
+policy:
+  parity_atol: 1.0e-6
+  parity_rtol: 1.0e-6
+  golden_sample_count: 8
+  golden_parity_on_load: true
+  require_runtime_commit_match: true
+  verify_module_origin: true
+  dependency_mode: locked_upstream_source

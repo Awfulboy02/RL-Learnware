@@ -1,0 +1,43 @@
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+build/
+dist/
+
+# IDE and operating-system metadata
+.DS_Store
+.idea/
+.vscode/
+
+# Local secrets
+.env
+.env.*
+!.env.example
+
+# Generated experiment data and immutable run artifacts
+/artifacts/
+/artifacts_retry_roundoff/
+/datasets/
+/runs/
+/checkpoints/
+/policy_bundles/
+/frozen_policies/
+
+# Learned parameters, checkpoints, and binary research artifacts
+*.msgpack
+*.npz
+*.ckpt
+*.pt
+*.pth
+*.safetensors
+*.onnx
+*.pkl
+*.pickle

@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "policy-learnware-v0"
+version = "0.1.0"
+description = "Closed-set TaskSpec retrieval for Policy Learnware v0"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "numpy>=1.24",
+  "PyYAML>=6.0",
+]
+
+[project.scripts]
+policy-learnware-v0 = "policy_learnware_v0.cli:main"
+
+[project.optional-dependencies]
+research = [
+  "jax>=0.7",
+  "flax>=0.12",
+  "optax>=0.2",
+  "scipy>=1.12",
+]
+test = ["pytest>=8"]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-ra"
