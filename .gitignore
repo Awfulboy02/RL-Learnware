@@ -25,7 +25,7 @@ dist/
 # Generated experiment data and immutable run artifacts
 /artifacts/
 /artifacts_retry_roundoff/
-/artifacts_v01/
+/artifacts_v01*/
 /datasets/
 /runs/
 /checkpoints/
