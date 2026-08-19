@@ -190,6 +190,8 @@ def test_controlled_v0_regression_runs_fixed_suite_and_reopens_base() -> None:
         assert os.environ["JAX_PLATFORMS"] == "cuda"
     assert verify.call_count == 2
     assert "jax.default_backend" in run.call_args_list[0].args[0][-1]
+    assert "jax._src.xla_bridge" in run.call_args_list[0].args[0][-1]
+    assert "setLevel(logging.CRITICAL)" in run.call_args_list[0].args[0][-1]
     assert run.call_args_list[1].args[0][3:7] == [
         "-q", "tests/unit", "tests/integration", "--disable-warnings"
     ]

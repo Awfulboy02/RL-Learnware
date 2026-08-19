@@ -121,6 +121,8 @@ def _v0_regression_backend_probe_command() -> list[str]:
         sys.executable,
         "-c",
         (
+            "import logging; "
+            "logging.getLogger('jax._src.xla_bridge').setLevel(logging.CRITICAL); "
             "import json, jax; "
             "devices = jax.devices(); "
             "print(json.dumps({"
