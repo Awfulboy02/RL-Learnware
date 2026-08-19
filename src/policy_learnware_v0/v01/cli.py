@@ -17,7 +17,6 @@ import json
 import os
 from pathlib import Path
 import platform
-import re
 import subprocess
 import sys
 from typing import Any, Callable, Iterator, Mapping, Sequence
@@ -79,6 +78,9 @@ COMMANDS = (
 _V0_REGRESSION_BACKEND_PROBE_SCHEMA = (
     "policy-learnware.v01-regression-backend-probe.v0"
 )
+_V0_REGRESSION_TEST_RESULT_SCHEMA = (
+    "policy-learnware.v01-v0-unittest-result.v0"
+)
 _V0_REGRESSION_SUBPROCESS_ENVIRONMENT = {
     "CUDA_VISIBLE_DEVICES": "",
     "JAX_PLATFORMS": "cpu",
@@ -115,7 +117,7 @@ def _v0_regression_backend_probe_passed(
 
 
 def _v0_regression_backend_probe_command() -> list[str]:
-    """Return the exact executable probe bound into the v1 attestation."""
+    """Return the exact executable probe bound into the regression attestation."""
 
     return [
         sys.executable,
@@ -133,6 +135,85 @@ def _v0_regression_backend_probe_command() -> list[str]:
             "}, sort_keys=True))"
         ),
     ]
+
+
+def _v0_regression_test_command() -> list[str]:
+    """Run the legacy unittest suites without an external test-runner package."""
+
+    script = "\n".join(
+        [
+            "import contextlib, json, sys, unittest",
+            "with contextlib.redirect_stdout(sys.stderr):",
+            "    unit = unittest.TestLoader().discover('tests/unit', top_level_dir='.')",
+            "    integration = unittest.TestLoader().discover('tests/integration', top_level_dir='.')",
+            "    unit_discovered = unit.countTestCases()",
+            "    integration_discovered = integration.countTestCases()",
+            "    suite = unittest.TestSuite([unit, integration])",
+            "    result = unittest.TextTestRunner(stream=sys.stderr, verbosity=1).run(suite)",
+            "record = {",
+            f"    'schema': '{_V0_REGRESSION_TEST_RESULT_SCHEMA}',",
+            "    'unit_discovered': unit_discovered,",
+            "    'integration_discovered': integration_discovered,",
+            "    'tests_run': result.testsRun,",
+            "    'failures': len(result.failures),",
+            "    'errors': len(result.errors),",
+            "    'skipped': len(result.skipped),",
+            "    'expected_failures': len(result.expectedFailures),",
+            "    'unexpected_successes': len(result.unexpectedSuccesses),",
+            "    'successful': result.wasSuccessful(),",
+            "}",
+            "print(json.dumps(record, sort_keys=True))",
+            "sys.exit(0 if result.wasSuccessful() else 1)",
+        ]
+    )
+    return [
+        sys.executable,
+        "-c",
+        script,
+    ]
+
+
+def _v0_regression_test_record_passed(
+    record: Mapping[str, Any] | None, *, returncode: int
+) -> bool:
+    """Validate the structured result emitted by the stdlib unittest runner."""
+
+    return bool(
+        returncode == 0
+        and record is not None
+        and set(record)
+        == {
+            "schema",
+            "unit_discovered",
+            "integration_discovered",
+            "tests_run",
+            "failures",
+            "errors",
+            "skipped",
+            "expected_failures",
+            "unexpected_successes",
+            "successful",
+        }
+        and record.get("schema") == _V0_REGRESSION_TEST_RESULT_SCHEMA
+        and type(record.get("unit_discovered")) is int
+        and int(record["unit_discovered"]) > 0
+        and type(record.get("integration_discovered")) is int
+        and int(record["integration_discovered"]) > 0
+        and type(record.get("tests_run")) is int
+        and int(record["tests_run"])
+        == int(record["unit_discovered"]) + int(record["integration_discovered"])
+        and type(record.get("failures")) is int
+        and int(record["failures"]) == 0
+        and type(record.get("errors")) is int
+        and int(record["errors"]) == 0
+        and type(record.get("skipped")) is int
+        and 0 <= int(record["skipped"]) < int(record["tests_run"])
+        and type(record.get("expected_failures")) is int
+        and int(record["expected_failures"]) == 0
+        and type(record.get("unexpected_successes")) is int
+        and int(record["unexpected_successes"]) == 0
+        and record.get("successful") is True
+    )
 
 
 def _v0_regression_resume_json_passed(record: Any) -> bool:
@@ -177,6 +258,12 @@ def _v0_regression_base_resume_digest(
             ),
             "backend_probe_record": report.get("backend_probe_record"),
             "backend_probe_passed": report.get("backend_probe_passed"),
+            "test_command": report.get("command"),
+            "test_exit_code": report.get("exit_code"),
+            "test_stdout_sha256": report.get("test_stdout_sha256"),
+            "test_stderr_sha256": report.get("test_stderr_sha256"),
+            "test_record": report.get("test_record"),
+            "test_runner_passed": report.get("test_runner_passed"),
             "resume_config_sha256": report.get("base_resume_config_sha256"),
             "resume_exit_code": report.get("base_resume_exit_code"),
             "resume_stdout_sha256": report.get("base_resume_stdout_sha256"),
@@ -206,6 +293,18 @@ def _v0_regression_binding_evidence_valid(
             report.get("backend_probe_stderr_sha256"),
             "regression backend probe stderr digest",
         )
+        test_record = report.get("test_record")
+        if not isinstance(test_record, Mapping):
+            return False
+        test_stdout = json.dumps(dict(test_record), sort_keys=True) + "\n"
+        test_stdout_digest = _require_sha256(
+            report.get("test_stdout_sha256"),
+            "regression unittest stdout digest",
+        )
+        _require_sha256(
+            report.get("test_stderr_sha256"),
+            "regression unittest stderr digest",
+        )
         for name in (
             "base_resume_config_sha256",
             "base_resume_stdout_sha256",
@@ -225,6 +324,17 @@ def _v0_regression_binding_evidence_valid(
             and report.get("backend_probe_passed") is True
             and probe_stdout_digest == sha256_bytes(probe_stdout.encode("utf-8"))
             and probe_stderr_digest == sha256_bytes(b"")
+            and report.get("command") == _v0_regression_test_command()
+            and _v0_regression_test_record_passed(
+                test_record,
+                returncode=int(report.get("exit_code", -1)),
+            )
+            and report.get("test_runner_passed") is True
+            and test_stdout_digest == sha256_bytes(test_stdout.encode("utf-8"))
+            and report.get("passed_test_count")
+            == int(test_record["tests_run"]) - int(test_record["skipped"])
+            and report.get("failed_test_count") == int(test_record["failures"])
+            and report.get("error_test_count") == int(test_record["errors"])
             and report.get("base_resume_digest")
             == _v0_regression_base_resume_digest(report, base_ref)
         )
@@ -1459,6 +1569,8 @@ def _require_private_gate0(layout: V01ArtifactLayout) -> Mapping[str, Any]:
         "backend_probe_command", "backend_probe_exit_code",
         "backend_probe_stdout_sha256", "backend_probe_stderr_sha256",
         "backend_probe_record", "backend_probe_passed",
+        "test_stdout_sha256", "test_stderr_sha256", "test_record",
+        "test_runner_passed",
         "cwd", "exit_code", "base_resume_exit_code", "base_resume_stdout_sha256",
         "base_resume_stderr_sha256", "base_resume_json_record", "passed_test_count",
         "failed_test_count", "error_test_count", "log_sha256", "base_resume_digest",
@@ -1471,7 +1583,7 @@ def _require_private_gate0(layout: V01ArtifactLayout) -> Mapping[str, Any]:
     base_ref = _object(layout.base_protocol_ref, "base protocol reference")
     regression_log = layout.benchmark_private_dir / "v0_regression.log"
     if (
-        regression.get("schema") != "policy-learnware.v01-v0-regression-attestation.v1"
+        regression.get("schema") != "policy-learnware.v01-v0-regression-attestation.v2"
         or not _v0_regression_binding_evidence_valid(regression, base_ref)
         or regression.get("passed") is not True
         or regression.get("base_resume_passed") is not True
@@ -1620,15 +1732,7 @@ def _run_controlled_v0_regression(
     )
     # Legacy protocols are already migration-checked by the two verified loads.
     semantic_identity = frozen_semantic in {None, current_semantic}
-    command = [
-        sys.executable,
-        "-m",
-        "pytest",
-        "-q",
-        "tests/unit",
-        "tests/integration",
-        "--disable-warnings",
-    ]
+    command = _v0_regression_test_command()
     # Gate 0 has already exercised the pinned GPU runtime through trajectory
     # identity, finite rollouts and compiled FPO/PPO parity.  Keep the code
     # regression subprocess on the same pinned Python/JAX packages but isolate
@@ -1672,6 +1776,20 @@ def _run_controlled_v0_regression(
         env=subprocess_environment,
     )
     test_log = completed.stdout + completed.stderr
+    test_record: Mapping[str, Any] | None = None
+    try:
+        candidate = json.loads(completed.stdout.strip())
+        if isinstance(candidate, Mapping):
+            test_record = candidate
+    except json.JSONDecodeError:
+        pass
+    test_runner_passed = bool(
+        _v0_regression_test_record_passed(
+            test_record,
+            returncode=int(completed.returncode),
+        )
+        and completed.stdout == json.dumps(dict(test_record), sort_keys=True) + "\n"
+    )
     config_path = _project_root() / "configs" / "dmc6_outer006_v0.yaml"
     if not config_path.is_file():
         raise V01CommandFailure(f"controlled v0 config is missing: {config_path}")
@@ -1731,15 +1849,23 @@ def _run_controlled_v0_regression(
         + "\n[v0 formal resume]\n"
         + resume_log
     )
-    passed_match = re.search(r"(?:^|\s)(\d+) passed(?:[,\s]|$)", log)
-    failed_match = re.search(r"(?:^|\s)(\d+) failed(?:[,\s]|$)", log)
-    error_match = re.search(r"(?:^|\s)(\d+) errors?(?:[,\s]|$)", log)
-    passed_count = int(passed_match.group(1)) if passed_match else 0
-    failed_count = int(failed_match.group(1)) if failed_match else 0
-    error_count = int(error_match.group(1)) if error_match else 0
+    if test_record is None:
+        passed_count = 0
+        failed_count = 0
+        error_count = 0
+    else:
+        passed_count = max(
+            int(test_record.get("tests_run", 0))
+            - int(test_record.get("failures", 0))
+            - int(test_record.get("errors", 0))
+            - int(test_record.get("skipped", 0)),
+            0,
+        )
+        failed_count = int(test_record.get("failures", 0))
+        error_count = int(test_record.get("errors", 0))
     base_resume_passed = first.binding_digest == second.binding_digest
     report = {
-        "schema": "policy-learnware.v01-v0-regression-attestation.v1",
+        "schema": "policy-learnware.v01-v0-regression-attestation.v2",
         "command": command,
         "subprocess_environment": regression_environment,
         "backend_probe_command": backend_probe_command,
@@ -1754,6 +1880,10 @@ def _run_controlled_v0_regression(
             None if backend_probe_record is None else dict(backend_probe_record)
         ),
         "backend_probe_passed": backend_probe_passed,
+        "test_stdout_sha256": sha256_bytes(completed.stdout.encode("utf-8")),
+        "test_stderr_sha256": sha256_bytes(completed.stderr.encode("utf-8")),
+        "test_record": None if test_record is None else dict(test_record),
+        "test_runner_passed": test_runner_passed,
         "base_resume_command": resume_command,
         "base_resume_config_sha256": config_sha256,
         "cwd": str(_project_root()),
@@ -1783,7 +1913,7 @@ def _run_controlled_v0_regression(
         "semantic_source_passed": semantic_identity,
         "passed": bool(
             backend_probe_passed
-            and completed.returncode == 0
+            and test_runner_passed
             and passed_count > 0
             and failed_count == 0
             and error_count == 0

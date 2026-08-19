@@ -78,8 +78,9 @@ v0.1 的主要输出是 candidate-independent `TaskSpecMatrix`、private
 
 Gate 0 的 trajectory、finite 与 FPO/PPO compiled parity 在 pinned GPU runtime 上执行；
 末尾 v0 unit/integration regression 则在同一 Python/JAX 软件环境的显式 CPU 隔离子进程中
-运行，并把隔离环境写入 attestation。这样可避免长期 MJX 审计仍占用 CUDA context 时，
-测试子进程因资源竞争而产生与代码无关的 cuSolver handle 失败。
+用 Python 标准库 `unittest` 运行，并把隔离环境与结构化测试结果写入 attestation；服务器
+无需额外安装 `pytest`。这样可避免长期 MJX 审计仍占用 CUDA context 时，测试子进程因
+资源竞争而产生与代码无关的 cuSolver handle 失败。
 
 ### Smoke 与 formal
 

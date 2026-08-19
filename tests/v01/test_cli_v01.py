@@ -16,6 +16,7 @@ from policy_learnware_v0.v01.cli import (
     _v0_regression_binding_evidence_valid,
     _run_controlled_v0_regression,
     _v0_regression_backend_probe_passed,
+    _v0_regression_test_record_passed,
     build_parser,
     main,
 )
@@ -135,8 +136,23 @@ def test_controlled_v0_regression_runs_fixed_suite_and_reopens_base() -> None:
             component_digests={"taskspec_semantic_source": semantic}
         ),
     )
+    test_record = {
+        "schema": "policy-learnware.v01-v0-unittest-result.v0",
+        "unit_discovered": 217,
+        "integration_discovered": 1,
+        "tests_run": 218,
+        "failures": 0,
+        "errors": 0,
+        "skipped": 1,
+        "expected_failures": 0,
+        "unexpected_successes": 0,
+        "successful": True,
+    }
     completed = subprocess.CompletedProcess(
-        args=[], returncode=0, stdout="217 passed in 3.0s\n", stderr=""
+        args=[],
+        returncode=0,
+        stdout=json.dumps(test_record, sort_keys=True) + "\n",
+        stderr="Ran 218 tests in 3.0s\n\nOK (skipped=1)\n",
     )
     backend_probe_record = {
         "schema": "policy-learnware.v01-regression-backend-probe.v0",
@@ -192,9 +208,11 @@ def test_controlled_v0_regression_runs_fixed_suite_and_reopens_base() -> None:
     assert "jax.default_backend" in run.call_args_list[0].args[0][-1]
     assert "jax._src.xla_bridge" in run.call_args_list[0].args[0][-1]
     assert "setLevel(logging.CRITICAL)" in run.call_args_list[0].args[0][-1]
-    assert run.call_args_list[1].args[0][3:7] == [
-        "-q", "tests/unit", "tests/integration", "--disable-warnings"
-    ]
+    assert run.call_args_list[1].args[0][1] == "-c"
+    assert "tests/unit" in run.call_args_list[1].args[0][2]
+    assert "tests/integration" in run.call_args_list[1].args[0][2]
+    assert "unittest.TextTestRunner" in run.call_args_list[1].args[0][2]
+    assert "redirect_stdout(sys.stderr)" in run.call_args_list[1].args[0][2]
     for call in run.call_args_list:
         child_environment = call.kwargs["env"]
         assert child_environment["CUDA_VISIBLE_DEVICES"] == ""
@@ -212,6 +230,8 @@ def test_controlled_v0_regression_runs_fixed_suite_and_reopens_base() -> None:
     }
     assert report["backend_probe_record"] == backend_probe_record
     assert report["backend_probe_passed"] is True
+    assert report["test_record"] == test_record
+    assert report["test_runner_passed"] is True
     assert len(report["base_resume_config_sha256"]) == 64
     assert report["semantic_source_passed"] is True
     assert report["log_sha256"]
@@ -231,6 +251,16 @@ def test_controlled_v0_regression_runs_fixed_suite_and_reopens_base() -> None:
     poisoned_record = json.loads(json.dumps(report))
     poisoned_record["backend_probe_record"]["device_count"] = 2
     assert not _v0_regression_binding_evidence_valid(poisoned_record, binding_base_ref)
+    poisoned_test_command = json.loads(json.dumps(report))
+    poisoned_test_command["command"].append("--forged")
+    assert not _v0_regression_binding_evidence_valid(
+        poisoned_test_command, binding_base_ref
+    )
+    poisoned_test_record = json.loads(json.dumps(report))
+    poisoned_test_record["test_record"]["tests_run"] = 219
+    assert not _v0_regression_binding_evidence_valid(
+        poisoned_test_record, binding_base_ref
+    )
     poisoned_binding = json.loads(json.dumps(report))
     poisoned_binding["base_resume_digest"] = "0" * 64
     assert not _v0_regression_binding_evidence_valid(
@@ -254,6 +284,30 @@ def test_v0_regression_backend_probe_rejects_gpu_or_malformed_evidence() -> None
     assert not _v0_regression_backend_probe_passed(
         {**cpu, "device_count": 2}, returncode=0
     )
+
+
+def test_v0_regression_unittest_record_requires_both_suites() -> None:
+    record = {
+        "schema": "policy-learnware.v01-v0-unittest-result.v0",
+        "unit_discovered": 100,
+        "integration_discovered": 1,
+        "tests_run": 101,
+        "failures": 0,
+        "errors": 0,
+        "skipped": 1,
+        "expected_failures": 0,
+        "unexpected_successes": 0,
+        "successful": True,
+    }
+    assert _v0_regression_test_record_passed(record, returncode=0)
+    assert not _v0_regression_test_record_passed(
+        {**record, "integration_discovered": 0, "tests_run": 100},
+        returncode=0,
+    )
+    assert not _v0_regression_test_record_passed(
+        {**record, "tests_run": 100}, returncode=0
+    )
+    assert not _v0_regression_test_record_passed(record, returncode=1)
 
 
 def test_freeze_dry_run_is_side_effect_free(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
