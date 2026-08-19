@@ -1,0 +1,100 @@
+schema: policy-learnware.v01-experiment-config.v0
+experiment_id: dmc2-damping-outer006-v01-r0
+project_seed: 20260819
+
+base:
+  pool_id: dmc6-outer006-policy-learnware-v0
+  expected_protocol_id: 60d7d7ef7e6bac9031f59cb09e5d919f545299184cec2a75a3f86e3d46355633
+  expected_protocol_draft_hash: 61b796dcb28bbc4f0aef58deaf25e402d074e788ae92a2ac575eed5b481a5f3a
+  checkpoint_outer: 6
+  actual_environment_steps: 5898240
+  candidates_per_task: 10
+
+tasks:
+  infrastructure: [WalkerWalk]
+  confirmatory: [FingerTurnEasy]
+
+shift:
+  shift_id: global_nonzero_dof_damping_scale
+  nominal_factor: 1.0
+  diagnostic_grid: [0.5, 0.75, 1.0, 1.5, 2.0]
+  static_within_episode: true
+  allow_cli_override: false
+
+evidence:
+  shifted_random_probe: allowed_for_diagnostic
+  shifted_candidate_rollout: oracle_only
+  selector_may_read_context: false
+  selector_may_read_oracle: false
+
+return_contract:
+  horizon: 1000
+  discount: 1.0
+  primary: undiscounted_per_step_mean
+  save_raw_episodic_sum: true
+  early_termination: fail_gate0
+
+probe:
+  banks: 10
+  max_episodes_per_bank: 64
+  prefix_grid: [1, 2, 4, 8, 16, 32, 64]
+  gate_b_unreduced_prefix: 16
+  sparse_within_bank_pairs: [[0, 1], [2, 3], [4, 5], [6, 7], [8, 9]]
+  between_pairing: same_bank_nominal_to_each_shift
+  max_prefix_role: six_source_rkme_routing
+
+oracle:
+  episodes_per_candidate_variant: 50
+  paired_across_variants: true
+  paired_across_candidates: false
+  require_golden_parity: true
+  require_compiled_parity: true
+
+statistics:
+  competence_alpha: 0.80
+  minimum_material_effect: 0.05
+  minimum_sensitivity_heterogeneity: 0.05
+  confidence_level: 0.95
+  bootstrap_method: contract_aware_percentile
+  p_value_method: centered_bootstrap
+  bootstrap_resamples: 10000
+  multiplicity: holm_bonferroni_per_task_and_test_family
+  holm_population: all_10_candidates_before_competence_filter
+  holm_families: [material, heterogeneity, ranking_gap]
+  top1_bootstrap_probability: 0.95
+  gate_c_resampling: nested_probe_banks_and_oracle_episodes
+  gate_c_minimum_finite_bootstrap_fraction: 0.95
+
+gates:
+  identity:
+    audit_episodes: 4
+    non_nominal_finite_episodes_per_factor: 4
+    non_nominal_action_source: v01_gaussian_random_probe
+    audit_seed_namespace: v01_gate0
+    model_digest_exact: true
+    flag_and_seed_exact: true
+    trajectory_atol: 1.0e-6
+    trajectory_rtol: 1.0e-6
+    return_atol: 1.0e-6
+    return_atol_metric: undiscounted_per_step_mean
+  taskspec:
+    minimum_between_within_ratio: 1.25
+    minimum_severity_spearman: 0.80
+    severity_excludes_nominal_self_point: true
+    undefined_spearman: fail_with_null_reason
+    minimum_max_prefix_routing_accuracy: 0.95
+    numerical_zero_tolerance: 1.0e-10
+  leakage:
+    forbidden_measurement_fields:
+      [lambda, factor, d_theta, policy_id, job_id, algorithm,
+       training_seed, return, bundle_path, bundle_digest,
+       task, task_private, source_task, candidate_id,
+       raw_episodic_sum, mean_step_return, delta_return,
+       abs_transfer_gap, environment_instance_digest,
+       base_model_digest, shifted_model_digest]
+
+failure_policy:
+  gate0_or_gate_d: block_formal_run
+  gate_a: report_no_go_pool
+  gate_b: report_no_go_taskspec
+  automatic_range_or_pool_expansion: false

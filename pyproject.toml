@@ -15,6 +15,7 @@ dependencies = [
 
 [project.scripts]
 policy-learnware-v0 = "policy_learnware_v0.cli:main"
+policy-learnware-v01 = "policy_learnware_v0.v01.cli:main"
 
 [project.optional-dependencies]
 research = [

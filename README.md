@@ -1,4 +1,208 @@
-# Policy Learnware v0
+# Policy Learnware v0 / v0.1
+
+## v0.1：dynamics-shift diagnostic
+
+v0.1 是一个独立的诊断实验，不是新的 selector。它保持 v0 的 frozen
+TaskSpec 表征和 `outer006` policy pool 不变，回答两个先于 TransferSpec 的问题：
+
+1. 同一任务内的受控 dynamics shift 是否会让冻结 policies 产生候选相关的迁移差异；
+2. 当前 candidate-independent TaskSpec 是否能稳定感知这种 shift。
+
+对任务 $q$，实验族固定为
+
+$$
+\mathcal M_{q,\lambda}
+=(\mathcal S_q,\mathcal A_q,P_{q,\lambda},r_q,\rho_{0,q},H),
+\qquad
+\lambda\in\{0.5,0.75,1.0,1.5,2.0\},\quad H=1000.
+$$
+
+注册算子 `global_nonzero_dof_damping_scale` 只把 MuJoCo model 中原本非零的
+DoF damping entries 同时乘以 $\lambda$；$\lambda=1$ 是 nominal instance，且
+$\lambda$ 在一个 episode 内保持不变。它应被理解为
+*one-dimensional contextual intervention inducing a correlated damping
+perturbation*，而不是单关节参数变化。
+
+### 冻结边界
+
+- `WalkerWalk` 是 infrastructure task，`FingerTurnEasy` 是 confirmatory replicate；
+- observation/action 的维数、slot 语义、单位和 bounds 不变；reward、reset、
+  termination、horizon、action repeat、task goal 与 morphology 不变；
+- 每个任务固定使用 10 个 `outer006` policies，即 PPO/FPO 各 5 个 seeds，训练预算为
+  5,898,240 environment steps；policy 不微调、不续训、不换 checkpoint；
+- random probe 可以在 shifted pseudo-real 环境运行，但保持 candidate-independent；
+  候选 rollout 只构成 private oracle，不能进入 TaskSpec 或 selector 输入；
+- 复用 v0 冻结的 109D padding+mask、32D transition encoder、Gaussian kernel、
+  normalizer 与六个 source RKMEs，不用 shifted data 重训或重新校准；
+- 五点 factor grid 全部是已知的 diagnostic points，不声称 held-out、OOD、真实
+  sim-to-real、鲁棒选择或开放世界迁移；也不覆盖 reward/noise/delay、非平稳、多因素、
+  schema、morphology 或 runtime shift。
+
+v0.1 的主要输出是 candidate-independent `TaskSpecMatrix`、private
+`OracleMatrix`、Gate 0/A/B/C/D 和 stratified recomputation audit。它只判断问题和
+当前表征是否值得进入 v0.2，不会根据 oracle 自动改动 factor、任务、policy pool 或阈值。
+
+### Artifact 能力域
+
+所有生成物写入 `artifacts_v01/<experiment_id>/`，与 v0 正式 artifact 分离：
+
+| 区域 | 内容 | TaskSpec compute 可读 |
+|---|---|---:|
+| `frozen/` | immutable config、base/protocol bindings、contracts、pair/audit plan | 否（绑定投影位于 `measurement/`） |
+| `benchmark_private/` | factor/context 映射、shift manifest、environment instance 与 Gate 0 证据 | 否 |
+| `measurement/` | opaque schema views、candidate-independent probe datasets、semantic cache、独立 primitive manifest、TaskSpec/routing matrices、execution-only profiles | 是 |
+| `oracle_private/` | candidate inventory、policy-return episode shards 与 aggregates | 否 |
+| `analysis/` | private joins、Gate reports、recompute audit 与 summary | 否 |
+| experiment root | `completion_manifest.json` 或 compute preflight manifest | 否 |
+
+`measurement/` 对 context/factor、candidate/policy、algorithm、return、bundle path/digest
+等字段执行 exact-schema allowlist 和递归泄漏检查。`compute-taskspec-matrix` 的 CLI 也不
+接受 oracle 或 private benchmark root，从目录能力上隔离 TaskSpec 与 oracle。
+
+### Gates 与退出语义
+
+| Gate | 含义 | 失败语义 |
+|---|---|---|
+| Gate 0 | shift implementation、$\lambda=1$ identity、finite rollout、instance isolation、policy parity 与 v0 regression | 工程硬失败，阻断 probe/oracle |
+| Gate A | 当前 policy pool 中是否存在 material、heterogeneous 且有 ranking evidence 的迁移效应 | 科学 No-Go，保留结果并正常退出 |
+| Gate B | 当前 TaskSpec 的 between/within ratio、severity correlation、schema negative control 与 source routing | 科学 No-Go，保留结果并正常退出 |
+| Gate C | TaskSpec distance 与 pool-level transfer effect 的 nested-bootstrap 相关诊断 | 永远不产生 `passed`/`strong` |
+| Gate D | measurement/oracle/context 的信息与写入能力隔离 | 工程硬失败，阻断正式报告 |
+| recompute audit | Oracle 全量聚合复算、TaskSpec 全量 digest/primitive 重建与预注册 raw 数值抽查 | 工程硬失败，阻断完成声明 |
+
+因此 Gate A/B 的 `FAIL` 是有效科研结果；Gate 0/D、provenance/tamper 或 recompute
+失败才返回非零并阻断正式完成。最终决策为
+`NO_GO_CURRENT_POOL_SHIFT`、`GO_PROBLEM_NO_GO_TASKSPEC` 或
+`GO_V02_TRANSFERSPEC`；资源审核拒绝 exact computation 时使用
+`NO_GO_COMPUTE`，不能伪装成 Gate B 科学失败。
+
+### Smoke 与 formal
+
+- `configs/v01_smoke.yaml`：仅 `WalkerWalk`，2 banks × 16 episodes，4 oracle
+  episodes/candidate/variant，1,000 bootstrap resamples；只验证接口、Gate 0、计算路径与
+  资源画像，不能进入正式结论。
+- `configs/dmc2_damping_v01.yaml`：两任务、10 banks × 64 episodes、50 oracle
+  episodes/candidate/variant、10,000 bootstrap resamples；只有该已提交配置的精确 digest
+  会被识别为 formal。
+
+两者必须使用不同的 `experiment_id` 和 artifact root。禁止把 smoke artifact 提升为
+formal，或在看到结果后通过 CLI 临时覆盖 task、factor、effect threshold 和 policy pool。
+
+### 运行顺序
+
+以下是 formal 的单进程参考流程；建议先把 `V01_CONFIG` 和 `V01_EXPERIMENT` 换成
+smoke 对应值走通同一条链路。`--base-artifacts-root` 必须指向包含 pool 目录的父目录，
+不能指到 `dmc6-outer006-policy-learnware-v0/` 本身。
+
+```bash
+cd /share/songyf/RL_Learnware/policy_learnware_v0
+
+V01_PY=/home/songyf/miniforge3/envs/GoRL/bin/python
+V01_CONFIG=configs/dmc2_damping_v01.yaml
+V01_EXPERIMENT=dmc2-damping-outer006-v01-r0
+V01_BASE=/share/songyf/RL_Learnware/policy_learnware_v0/artifacts_retry_roundoff
+V01_ARTIFACTS=/share/songyf/RL_Learnware/policy_learnware_v0/artifacts_v01
+V01_RUN="$V01_ARTIFACTS/$V01_EXPERIMENT"
+V01_FPO=/share/songyf/RL_Learnware/fpo
+V01_POLICY_RUNS=/share/songyf/RL_Learnware/repro_fpo_ppo/runs
+
+v01() {
+  PYTHONPATH=src "$V01_PY" -m policy_learnware_v0.v01.cli "$@"
+}
+
+v01 validate-config \
+  --config "$V01_CONFIG" \
+  --base-artifacts-root "$V01_BASE"
+
+v01 freeze-run \
+  --config "$V01_CONFIG" \
+  --base-artifacts-root "$V01_BASE" \
+  --artifacts-root "$V01_ARTIFACTS"
+
+v01 audit-variants \
+  --artifacts-root "$V01_ARTIFACTS" \
+  --experiment-id "$V01_EXPERIMENT" \
+  --base-artifacts-root "$V01_BASE" \
+  --fpo-root "$V01_FPO" \
+  --runs-root "$V01_POLICY_RUNS"
+
+v01 collect-probes \
+  --artifacts-root "$V01_ARTIFACTS" \
+  --experiment-id "$V01_EXPERIMENT"
+
+v01 compute-taskspec-matrix \
+  --base-artifacts-root "$V01_BASE" \
+  --measurement-root "$V01_RUN/measurement" \
+  --computation-backend jax
+
+v01 evaluate-oracle \
+  --frozen-root "$V01_RUN/frozen" \
+  --benchmark-private-root "$V01_RUN/benchmark_private" \
+  --oracle-root "$V01_RUN/oracle_private" \
+  --fpo-root "$V01_FPO" \
+  --runs-root "$V01_POLICY_RUNS"
+
+v01 evaluate-gates \
+  --base-artifacts-root "$V01_BASE" \
+  --frozen-root "$V01_RUN/frozen" \
+  --benchmark-private-root "$V01_RUN/benchmark_private" \
+  --measurement-root "$V01_RUN/measurement" \
+  --oracle-root "$V01_RUN/oracle_private" \
+  --analysis-root "$V01_RUN/analysis"
+
+v01 audit-recompute \
+  --base-artifacts-root "$V01_BASE" \
+  --frozen-root "$V01_RUN/frozen" \
+  --benchmark-private-root "$V01_RUN/benchmark_private" \
+  --measurement-root "$V01_RUN/measurement" \
+  --oracle-root "$V01_RUN/oracle_private" \
+  --analysis-root "$V01_RUN/analysis"
+
+v01 build-report \
+  --base-artifacts-root "$V01_BASE" \
+  --frozen-root "$V01_RUN/frozen" \
+  --benchmark-private-root "$V01_RUN/benchmark_private" \
+  --measurement-root "$V01_RUN/measurement" \
+  --oracle-root "$V01_RUN/oracle_private" \
+  --analysis-root "$V01_RUN/analysis"
+```
+
+Gate 0 通过后，`collect-probes` 与 `evaluate-oracle` 在数据依赖上彼此独立。仅这两个命令的成对
+`--shard-index/--shard-count` 可确定性划分工作单元；`--devices` 目前只接受 `auto`，其他值会
+直接拒绝而不会被静默忽略。当前 v0.1 writer 仍采用实验级锁，
+因此基础验收按顺序执行 shards；并发多进程调度与 `--devices` 设备编排尚未认证。完成
+oracle 分片后需再执行一次不带 shard 参数且带 `--resume` 的 `evaluate-oracle`，以完成
+全量校验和 merge。所有命令支持 `--dry-run` 或 `--resume`，两者互斥；`--resume` 只重验
+并复用 byte-identical immutable work units，不是 overwrite。
+
+若 smoke profile 表明 exact TaskSpec 计算资源不可承受，可在 Gate 0 通过后向
+`build-report` 追加 `--no-go-compute --execution-profile-attempt-id <v01xa-...>`；它只允许在
+同一个 smoke experiment root 中引用一个重新验真的 `SUCCESS` profile，并发布
+`preflight_completion_manifest.json`，不会产生 formal completion manifest。profile 缺失、失败、
+输入/semantic/output digest 漂移或属于 formal root 时都会 fail closed。该资源拒绝只接受
+预注册 `configs/v01_smoke.yaml` 的 canonical config digest，要求 fresh-cache 全覆盖 profile、
+当前 runtime、live base support 数、相同 backend/block size，并在发布前重新执行 measurement
+exact-schema allowlist 与 private/oracle isolation；completion 只复制经过验证的受限 profile 投影。
+
+`compute-taskspec-matrix` 每次运行都会在
+`measurement/execution_attempts/<execution_attempt_id>.json` 写入 execution-only 记录：block
+size、backend/device/runtime、wall time、RSS/可用的设备峰值内存、数学 kernel entries 与按
+backend/block size 实际执行的 padded block entries（均分 self/pair-cross/routing）、正式 P5
+资源外推及输入/输出 digest。正式外推使用同一 backend/block 算法，并取 padded-kernel 与
+semantic-rebuild 两种缩放比中较大的保守值；预注册 raw audit 成本单列。它不进入 measurement protocol/run ID；OOM 后可以换
+block size 产生新 attempt。失败 attempt 只保留受限 reason code，不能授权残缺矩阵参与 merge。
+
+严格 golden/compiled parity 和正式数值实验应在 pinned Linux/JAX/GPU runtime 上执行。
+完整 formal run 计算量很大，必须先完成 smoke profile 与资源审核。代码完成、单元测试通过、
+分支合并或服务器 basic smoke **都不等于** formal v0.1 实验完成，也不构成 Gate A/B 的科学
+结论；只有冻结 formal digest 下的全部 matrices、Gate reports、stratified audit 与合法
+completion manifest 齐全后，才能称该 formal run 完成。
+
+本仓库始终是 code-only：只版本化源码、测试、配置和脚本，不提交 PPO/FPO policy、
+checkpoint、probe/trajectory data、encoder 参数或任何运行 artifact。外部冻结资产只通过
+manifest 和 SHA-256 绑定，`artifacts_v01/` 已被 Git 忽略。
+
+## v0：exact-recurrence TaskSpec 基线
 
 这是 `TaskSpec-only` 的 Policy Learnware 最小工程闭环。它研究一个受限但可检验的问题：在固定的六个 MuJoCo Playground 连续控制任务中，能否仅通过候选无关的随机 probe 构造目标环境 TaskSpec，并检索到该任务预先上传的冻结 policy。
 

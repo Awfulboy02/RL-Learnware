@@ -1,0 +1,222 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+import subprocess
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import pytest
+
+from policy_learnware_v0.v01.cli import (
+    COMMANDS,
+    V01CommandFailure,
+    _identity_candidates,
+    _run_controlled_v0_regression,
+    build_parser,
+    main,
+)
+
+
+PROJECT = Path(__file__).resolve().parents[2]
+
+
+def _actions(parser):
+    return {action.dest: action for action in parser._actions}
+
+
+def _subcommands():
+    parser = build_parser()
+    action = next(action for action in parser._actions if action.dest == "command")
+    return parser, action.choices
+
+
+def test_cli_exposes_exact_registered_command_set_and_scoped_roots() -> None:
+    _, commands = _subcommands()
+    assert tuple(commands) == COMMANDS
+    assert "config" in _actions(commands["validate-config"])
+    assert "config" in _actions(commands["freeze-run"])
+    for name in set(COMMANDS) - {"validate-config", "freeze-run"}:
+        assert "config" not in _actions(commands[name])
+
+    taskspec = _actions(commands["compute-taskspec-matrix"])
+    assert "base_artifacts_root" in taskspec
+    assert "measurement_root" in taskspec
+    for forbidden in (
+        "artifacts_root",
+        "benchmark_private_root",
+        "oracle_root",
+        "factor",
+        "model_path",
+        "overwrite",
+        "alpha",
+        "delta_effect",
+        "task",
+    ):
+        assert forbidden not in taskspec
+
+
+def test_all_commands_expose_dry_run_and_resume() -> None:
+    _, commands = _subcommands()
+    for command in commands.values():
+        actions = _actions(command)
+        assert "dry_run" in actions
+        assert "resume" in actions
+
+
+def test_only_probe_and_oracle_expose_certified_shard_interface() -> None:
+    _, commands = _subcommands()
+    for name, command in commands.items():
+        actions = _actions(command)
+        if name in {"collect-probes", "evaluate-oracle"}:
+            assert {"devices", "shard_index", "shard_count"} <= set(actions)
+        else:
+            assert {"devices", "shard_index", "shard_count"}.isdisjoint(actions)
+
+
+def test_explicit_device_selection_fails_instead_of_being_silently_ignored(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code = main(
+        [
+            "collect-probes",
+            "--artifacts-root",
+            str(tmp_path),
+            "--experiment-id",
+            "smoke",
+            "--devices",
+            "0",
+            "--dry-run",
+        ]
+    )
+    assert code == 1
+    payload = json.loads(capsys.readouterr().err)
+    assert payload["fail_closed"] is True
+    assert "not certified" in payload["message"]
+
+
+def test_variant_audit_requires_controlled_base_and_policy_roots() -> None:
+    _, commands = _subcommands()
+    actions = _actions(commands["audit-variants"])
+    assert actions["base_artifacts_root"].required
+    assert actions["fpo_root"].required
+    assert not actions["runs_root"].required
+    assert "keep_going" not in actions
+
+
+def test_identity_candidate_selection_is_exact_fpo_ppo_seed0() -> None:
+    def candidate(algorithm: str, seed: int, task: str = "WalkerWalk"):
+        return SimpleNamespace(
+            algorithm=algorithm, training_seed=seed, task_private=task
+        )
+
+    fpo, ppo = _identity_candidates(
+        [candidate("ppo", 1), candidate("fpo", 0), candidate("ppo", 0)],
+        "WalkerWalk",
+    )
+    assert fpo.algorithm == "fpo" and fpo.training_seed == 0
+    assert ppo.algorithm == "ppo" and ppo.training_seed == 0
+    with pytest.raises(V01CommandFailure, match="exactly one"):
+        _identity_candidates([candidate("fpo", 0), candidate("ppo", 1)], "WalkerWalk")
+
+
+def test_controlled_v0_regression_runs_fixed_suite_and_reopens_base() -> None:
+    semantic = "a" * 64
+    base = SimpleNamespace(
+        base_artifacts_root=Path("/base"),
+        binding_digest="b" * 64,
+        protocol_manifest_sha256="c" * 64,
+        pool_manifest_sha256="d" * 64,
+        public_pool_manifest_sha256="e" * 64,
+        protocol=SimpleNamespace(
+            component_digests={"taskspec_semantic_source": semantic}
+        ),
+    )
+    completed = subprocess.CompletedProcess(
+        args=[], returncode=0, stdout="217 passed in 3.0s\n", stderr=""
+    )
+    resume_record = {
+        "schema": "policy-learnware.cli-result.v0",
+        "status": "ok",
+        "command": "build-pool",
+        "result": {"resumed": True},
+    }
+    resumed = subprocess.CompletedProcess(
+        args=[], returncode=0, stdout=json.dumps(resume_record) + "\n", stderr=""
+    )
+    base_ref = {
+        "pool_id": "pool",
+        "protocol_id": "1" * 64,
+        "protocol_draft_hash": "2" * 64,
+    }
+    with (
+        patch(
+            "policy_learnware_v0.v01.cli.verify_and_load_base_runtime",
+            side_effect=[base, base],
+        ) as verify,
+        patch(
+            "policy_learnware_v0.cli._taskspec_semantic_source_digest",
+            return_value=semantic,
+        ),
+        patch(
+            "policy_learnware_v0.v01.cli.subprocess.run",
+            side_effect=[completed, resumed],
+        ) as run,
+    ):
+        report, log = _run_controlled_v0_regression(
+            base_artifacts_root=Path("/base"), base_ref=base_ref
+        )
+    assert verify.call_count == 2
+    assert run.call_args_list[0].args[0][3:7] == [
+        "-q", "tests/unit", "tests/integration", "--disable-warnings"
+    ]
+    assert "build-pool" in run.call_args_list[1].args[0]
+    assert report["passed"] is True
+    assert report["passed_test_count"] == 217
+    assert report["base_resume_passed"] is True
+    assert report["base_resume_json_record"] == resume_record
+    assert len(report["base_resume_config_sha256"]) == 64
+    assert report["semantic_source_passed"] is True
+    assert report["log_sha256"]
+    assert completed.stdout in log and resumed.stdout in log
+
+
+def test_freeze_dry_run_is_side_effect_free(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    output = tmp_path / "must-not-exist"
+    code = main(
+        [
+            "freeze-run",
+            "--config",
+            str(PROJECT / "configs" / "v01_smoke.yaml"),
+            "--base-artifacts-root",
+            str(tmp_path / "base-can-be-absent-in-dry-run"),
+            "--artifacts-root",
+            str(output),
+            "--dry-run",
+        ]
+    )
+    assert code == 0
+    assert not output.exists()
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "dry-run"
+    assert payload["writes_performed"] is False
+    assert payload["gpu_work_performed"] is False
+    assert payload["inputs"]["registered_work"]["variants"] == 5
+
+
+def test_dry_run_and_resume_together_fail_closed(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    code = main(
+        [
+            "validate-config",
+            "--config",
+            str(PROJECT / "configs" / "v01_smoke.yaml"),
+            "--base-artifacts-root",
+            str(tmp_path),
+            "--dry-run",
+            "--resume",
+        ]
+    )
+    assert code == 1
+    payload = json.loads(capsys.readouterr().err)
+    assert payload["fail_closed"] is True
+    assert "mutually exclusive" in payload["message"]
