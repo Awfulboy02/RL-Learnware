@@ -939,12 +939,16 @@ _TASKSPEC_SEMANTIC_SOURCE_FILES = (
 # and orchestration scopes.  Their full-tree digests were audited at migration
 # time against the semantic file set above.  Pure CLI/policy-evaluator changes
 # may use them only while that semantic digest remains unchanged.
+# The 2026-08-19 Git bootstrap removed one terminal blank line from
+# ``envs/factory.py``.  The pre-bootstrap backup hashes to the earlier semantic
+# digest and has an identical Python AST; the current digest below records that
+# audited, syntax-preserving normalization rather than widening the migration.
 _LEGACY_SOURCE_TO_TASKSPEC_SEMANTIC_SOURCE = {
     "982b300d2e978ea77d837a23a40e751b4ad396234e6051463d168c84a817bd61": (
-        "10978d1360ad813af8d8f068f59325e6e1b8b462e902f116452b2315dc7800cb"
+        "65d9ab4406542f8ae78fbcd20d32449f9304d7eed172dc1278ac0a56e78fff16"
     ),
     "a67d1a46f14eefd79317c7f453a63670083d7060576f103908fc949d4221f5da": (
-        "10978d1360ad813af8d8f068f59325e6e1b8b462e902f116452b2315dc7800cb"
+        "65d9ab4406542f8ae78fbcd20d32449f9304d7eed172dc1278ac0a56e78fff16"
     ),
 }
 
