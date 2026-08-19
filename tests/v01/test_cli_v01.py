@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import subprocess
 from types import SimpleNamespace
@@ -12,7 +13,9 @@ from policy_learnware_v0.v01.cli import (
     COMMANDS,
     V01CommandFailure,
     _identity_candidates,
+    _v0_regression_binding_evidence_valid,
     _run_controlled_v0_regression,
+    _v0_regression_backend_probe_passed,
     build_parser,
     main,
 )
@@ -135,6 +138,18 @@ def test_controlled_v0_regression_runs_fixed_suite_and_reopens_base() -> None:
     completed = subprocess.CompletedProcess(
         args=[], returncode=0, stdout="217 passed in 3.0s\n", stderr=""
     )
+    backend_probe_record = {
+        "schema": "policy-learnware.v01-regression-backend-probe.v0",
+        "default_backend": "cpu",
+        "device_count": 1,
+        "device_platforms": ["cpu"],
+    }
+    probed = subprocess.CompletedProcess(
+        args=[],
+        returncode=0,
+        stdout=json.dumps(backend_probe_record, sort_keys=True) + "\n",
+        stderr="",
+    )
     resume_record = {
         "schema": "policy-learnware.cli-result.v0",
         "status": "ok",
@@ -150,6 +165,11 @@ def test_controlled_v0_regression_runs_fixed_suite_and_reopens_base() -> None:
         "protocol_draft_hash": "2" * 64,
     }
     with (
+        patch.dict(
+            os.environ,
+            {"CUDA_VISIBLE_DEVICES": "7", "JAX_PLATFORMS": "cuda"},
+            clear=False,
+        ),
         patch(
             "policy_learnware_v0.v01.cli.verify_and_load_base_runtime",
             side_effect=[base, base],
@@ -160,25 +180,78 @@ def test_controlled_v0_regression_runs_fixed_suite_and_reopens_base() -> None:
         ),
         patch(
             "policy_learnware_v0.v01.cli.subprocess.run",
-            side_effect=[completed, resumed],
+            side_effect=[probed, completed, resumed],
         ) as run,
     ):
         report, log = _run_controlled_v0_regression(
             base_artifacts_root=Path("/base"), base_ref=base_ref
         )
+        assert os.environ["CUDA_VISIBLE_DEVICES"] == "7"
+        assert os.environ["JAX_PLATFORMS"] == "cuda"
     assert verify.call_count == 2
-    assert run.call_args_list[0].args[0][3:7] == [
+    assert "jax.default_backend" in run.call_args_list[0].args[0][-1]
+    assert run.call_args_list[1].args[0][3:7] == [
         "-q", "tests/unit", "tests/integration", "--disable-warnings"
     ]
-    assert "build-pool" in run.call_args_list[1].args[0]
+    for call in run.call_args_list:
+        child_environment = call.kwargs["env"]
+        assert child_environment["CUDA_VISIBLE_DEVICES"] == ""
+        assert child_environment["JAX_PLATFORMS"] == "cpu"
+        assert child_environment["XLA_PYTHON_CLIENT_PREALLOCATE"] == "false"
+    assert "build-pool" in run.call_args_list[2].args[0]
     assert report["passed"] is True
     assert report["passed_test_count"] == 217
     assert report["base_resume_passed"] is True
     assert report["base_resume_json_record"] == resume_record
+    assert report["subprocess_environment"] == {
+        "CUDA_VISIBLE_DEVICES": "",
+        "JAX_PLATFORMS": "cpu",
+        "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
+    }
+    assert report["backend_probe_record"] == backend_probe_record
+    assert report["backend_probe_passed"] is True
     assert len(report["base_resume_config_sha256"]) == 64
     assert report["semantic_source_passed"] is True
     assert report["log_sha256"]
     assert completed.stdout in log and resumed.stdout in log
+    binding_base_ref = {
+        "binding_digest": base.binding_digest,
+        "protocol_manifest_sha256": base.protocol_manifest_sha256,
+        "pool_manifest_sha256": base.pool_manifest_sha256,
+        "public_pool_manifest_sha256": base.public_pool_manifest_sha256,
+    }
+    assert _v0_regression_binding_evidence_valid(report, binding_base_ref)
+    poisoned_command = json.loads(json.dumps(report))
+    poisoned_command["backend_probe_command"].append("--forged")
+    assert not _v0_regression_binding_evidence_valid(
+        poisoned_command, binding_base_ref
+    )
+    poisoned_record = json.loads(json.dumps(report))
+    poisoned_record["backend_probe_record"]["device_count"] = 2
+    assert not _v0_regression_binding_evidence_valid(poisoned_record, binding_base_ref)
+    poisoned_binding = json.loads(json.dumps(report))
+    poisoned_binding["base_resume_digest"] = "0" * 64
+    assert not _v0_regression_binding_evidence_valid(
+        poisoned_binding, binding_base_ref
+    )
+
+
+def test_v0_regression_backend_probe_rejects_gpu_or_malformed_evidence() -> None:
+    cpu = {
+        "schema": "policy-learnware.v01-regression-backend-probe.v0",
+        "default_backend": "cpu",
+        "device_count": 1,
+        "device_platforms": ["cpu"],
+    }
+    assert _v0_regression_backend_probe_passed(cpu, returncode=0)
+    assert not _v0_regression_backend_probe_passed(
+        {**cpu, "default_backend": "gpu", "device_platforms": ["gpu"]},
+        returncode=0,
+    )
+    assert not _v0_regression_backend_probe_passed(cpu, returncode=1)
+    assert not _v0_regression_backend_probe_passed(
+        {**cpu, "device_count": 2}, returncode=0
+    )
 
 
 def test_freeze_dry_run_is_side_effect_free(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:

@@ -76,6 +76,11 @@ v0.1 的主要输出是 candidate-independent `TaskSpecMatrix`、private
 `GO_V02_TRANSFERSPEC`；资源审核拒绝 exact computation 时使用
 `NO_GO_COMPUTE`，不能伪装成 Gate B 科学失败。
 
+Gate 0 的 trajectory、finite 与 FPO/PPO compiled parity 在 pinned GPU runtime 上执行；
+末尾 v0 unit/integration regression 则在同一 Python/JAX 软件环境的显式 CPU 隔离子进程中
+运行，并把隔离环境写入 attestation。这样可避免长期 MJX 审计仍占用 CUDA context 时，
+测试子进程因资源竞争而产生与代码无关的 cuSolver handle 失败。
+
 ### Smoke 与 formal
 
 - `configs/v01_smoke.yaml`：仅 `WalkerWalk`，2 banks × 16 episodes，4 oracle

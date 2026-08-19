@@ -14,6 +14,7 @@ from contextlib import contextmanager
 import csv
 import importlib.metadata
 import json
+import os
 from pathlib import Path
 import platform
 import re
@@ -75,6 +76,14 @@ COMMANDS = (
     "audit-recompute",
     "build-report",
 )
+_V0_REGRESSION_BACKEND_PROBE_SCHEMA = (
+    "policy-learnware.v01-regression-backend-probe.v0"
+)
+_V0_REGRESSION_SUBPROCESS_ENVIRONMENT = {
+    "CUDA_VISIBLE_DEVICES": "",
+    "JAX_PLATFORMS": "cpu",
+    "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
+}
 
 
 class V01CommandFailure(RuntimeError):
@@ -83,6 +92,142 @@ class V01CommandFailure(RuntimeError):
 
 class V01IncompleteArtifacts(V01CommandFailure):
     """A downstream command was attempted before all registered work units exist."""
+
+
+def _v0_regression_backend_probe_passed(
+    record: Mapping[str, Any] | None, *, returncode: int
+) -> bool:
+    """Validate executable evidence that the regression child is CPU-only."""
+
+    return bool(
+        returncode == 0
+        and record is not None
+        and set(record)
+        == {"schema", "default_backend", "device_count", "device_platforms"}
+        and record.get("schema") == _V0_REGRESSION_BACKEND_PROBE_SCHEMA
+        and record.get("default_backend") == "cpu"
+        and type(record.get("device_count")) is int
+        and int(record["device_count"]) > 0
+        and isinstance(record.get("device_platforms"), list)
+        and len(record["device_platforms"]) == int(record["device_count"])
+        and all(value == "cpu" for value in record["device_platforms"])
+    )
+
+
+def _v0_regression_backend_probe_command() -> list[str]:
+    """Return the exact executable probe bound into the v1 attestation."""
+
+    return [
+        sys.executable,
+        "-c",
+        (
+            "import json, jax; "
+            "devices = jax.devices(); "
+            "print(json.dumps({"
+            f"'schema': '{_V0_REGRESSION_BACKEND_PROBE_SCHEMA}', "
+            "'default_backend': jax.default_backend(), "
+            "'device_count': len(devices), "
+            "'device_platforms': [device.platform for device in devices]"
+            "}, sort_keys=True))"
+        ),
+    ]
+
+
+def _v0_regression_resume_json_passed(record: Any) -> bool:
+    return bool(
+        isinstance(record, Mapping)
+        and record.get("status") == "ok"
+        and isinstance(record.get("result"), Mapping)
+        and record["result"].get("resumed") is True
+    )
+
+
+def _v0_regression_base_resume_digest(
+    report: Mapping[str, Any], base_ref: Mapping[str, Any]
+) -> str:
+    """Rebuild the regression/base-resume binding from persisted fields."""
+
+    binding = _require_sha256(base_ref.get("binding_digest"), "base binding digest")
+    return sha256_json(
+        {
+            "first_binding_digest": binding,
+            "second_binding_digest": binding,
+            "protocol_manifest_sha256": _require_sha256(
+                base_ref.get("protocol_manifest_sha256"),
+                "base protocol manifest digest",
+            ),
+            "pool_manifest_sha256": _require_sha256(
+                base_ref.get("pool_manifest_sha256"), "base pool manifest digest"
+            ),
+            "public_pool_manifest_sha256": _require_sha256(
+                base_ref.get("public_pool_manifest_sha256"),
+                "base public pool manifest digest",
+            ),
+            "resume_command": report.get("base_resume_command"),
+            "subprocess_environment": report.get("subprocess_environment"),
+            "backend_probe_command": report.get("backend_probe_command"),
+            "backend_probe_exit_code": report.get("backend_probe_exit_code"),
+            "backend_probe_stdout_sha256": report.get(
+                "backend_probe_stdout_sha256"
+            ),
+            "backend_probe_stderr_sha256": report.get(
+                "backend_probe_stderr_sha256"
+            ),
+            "backend_probe_record": report.get("backend_probe_record"),
+            "backend_probe_passed": report.get("backend_probe_passed"),
+            "resume_config_sha256": report.get("base_resume_config_sha256"),
+            "resume_exit_code": report.get("base_resume_exit_code"),
+            "resume_stdout_sha256": report.get("base_resume_stdout_sha256"),
+            "resume_stderr_sha256": report.get("base_resume_stderr_sha256"),
+            "resume_json_passed": _v0_regression_resume_json_passed(
+                report.get("base_resume_json_record")
+            ),
+        }
+    )
+
+
+def _v0_regression_binding_evidence_valid(
+    report: Mapping[str, Any], base_ref: Mapping[str, Any]
+) -> bool:
+    """Fail closed on forged CPU-probe or base-resume provenance."""
+
+    try:
+        probe = report.get("backend_probe_record")
+        if not isinstance(probe, Mapping):
+            return False
+        probe_stdout = json.dumps(dict(probe), sort_keys=True) + "\n"
+        probe_stdout_digest = _require_sha256(
+            report.get("backend_probe_stdout_sha256"),
+            "regression backend probe stdout digest",
+        )
+        probe_stderr_digest = _require_sha256(
+            report.get("backend_probe_stderr_sha256"),
+            "regression backend probe stderr digest",
+        )
+        for name in (
+            "base_resume_config_sha256",
+            "base_resume_stdout_sha256",
+            "base_resume_stderr_sha256",
+            "base_resume_digest",
+        ):
+            _require_sha256(report.get(name), f"regression {name}")
+        return bool(
+            report.get("subprocess_environment")
+            == _V0_REGRESSION_SUBPROCESS_ENVIRONMENT
+            and report.get("backend_probe_command")
+            == _v0_regression_backend_probe_command()
+            and _v0_regression_backend_probe_passed(
+                probe,
+                returncode=int(report.get("backend_probe_exit_code", -1)),
+            )
+            and report.get("backend_probe_passed") is True
+            and probe_stdout_digest == sha256_bytes(probe_stdout.encode("utf-8"))
+            and probe_stderr_digest == sha256_bytes(b"")
+            and report.get("base_resume_digest")
+            == _v0_regression_base_resume_digest(report, base_ref)
+        )
+    except (TypeError, ValueError, V01CommandFailure):
+        return False
 
 
 def _emit(value: Mapping[str, Any], *, stream: Any | None = None) -> None:
@@ -1308,6 +1453,10 @@ def _require_private_gate0(layout: V01ArtifactLayout) -> Mapping[str, Any]:
     regression = _object(regression_path, "v0 regression attestation")
     regression_keys = {
         "schema", "command", "base_resume_command", "base_resume_config_sha256",
+        "subprocess_environment",
+        "backend_probe_command", "backend_probe_exit_code",
+        "backend_probe_stdout_sha256", "backend_probe_stderr_sha256",
+        "backend_probe_record", "backend_probe_passed",
         "cwd", "exit_code", "base_resume_exit_code", "base_resume_stdout_sha256",
         "base_resume_stderr_sha256", "base_resume_json_record", "passed_test_count",
         "failed_test_count", "error_test_count", "log_sha256", "base_resume_digest",
@@ -1320,7 +1469,8 @@ def _require_private_gate0(layout: V01ArtifactLayout) -> Mapping[str, Any]:
     base_ref = _object(layout.base_protocol_ref, "base protocol reference")
     regression_log = layout.benchmark_private_dir / "v0_regression.log"
     if (
-        regression.get("schema") != "policy-learnware.v01-v0-regression-attestation.v0"
+        regression.get("schema") != "policy-learnware.v01-v0-regression-attestation.v1"
+        or not _v0_regression_binding_evidence_valid(regression, base_ref)
         or regression.get("passed") is not True
         or regression.get("base_resume_passed") is not True
         or regression.get("semantic_source_passed") is not True
@@ -1477,12 +1627,47 @@ def _run_controlled_v0_regression(
         "tests/integration",
         "--disable-warnings",
     ]
+    # Gate 0 has already exercised the pinned GPU runtime through trajectory
+    # identity, finite rollouts and compiled FPO/PPO parity.  Keep the code
+    # regression subprocess on the same pinned Python/JAX packages but isolate
+    # it from the parent process' live CUDA contexts.  Otherwise a late
+    # cuSolver handle allocation can fail solely because the audit parent still
+    # owns several compiled MJX environments and their device memory.
+    regression_environment = dict(_V0_REGRESSION_SUBPROCESS_ENVIRONMENT)
+    subprocess_environment = os.environ.copy()
+    subprocess_environment.update(regression_environment)
+    backend_probe_command = _v0_regression_backend_probe_command()
+    backend_probe_completed = subprocess.run(
+        backend_probe_command,
+        cwd=_project_root(),
+        check=False,
+        capture_output=True,
+        text=True,
+        env=subprocess_environment,
+    )
+    backend_probe_record: Mapping[str, Any] | None = None
+    try:
+        candidate = json.loads(backend_probe_completed.stdout.strip())
+        if isinstance(candidate, Mapping):
+            backend_probe_record = candidate
+    except json.JSONDecodeError:
+        pass
+    backend_probe_passed = bool(
+        _v0_regression_backend_probe_passed(
+            backend_probe_record,
+            returncode=int(backend_probe_completed.returncode),
+        )
+        and backend_probe_completed.stdout
+        == json.dumps(dict(backend_probe_record), sort_keys=True) + "\n"
+        and backend_probe_completed.stderr == ""
+    )
     completed = subprocess.run(
         command,
         cwd=_project_root(),
         check=False,
         capture_output=True,
         text=True,
+        env=subprocess_environment,
     )
     test_log = completed.stdout + completed.stderr
     config_path = _project_root() / "configs" / "dmc6_outer006_v0.yaml"
@@ -1506,6 +1691,7 @@ def _run_controlled_v0_regression(
         check=False,
         capture_output=True,
         text=True,
+        env=subprocess_environment,
     )
     resume_log = resume_completed.stdout + resume_completed.stderr
     resume_record: Mapping[str, Any] | None = None
@@ -1530,28 +1716,19 @@ def _run_controlled_v0_regression(
             records.append(candidate)
     if len(records) == 1:
         resume_record = records[0]
-    resume_json_passed = bool(
-        resume_record is not None
-        and resume_record.get("status") == "ok"
-        and isinstance(resume_record.get("result"), Mapping)
-        and resume_record["result"].get("resumed") is True
-    )
+    resume_json_passed = _v0_regression_resume_json_passed(resume_record)
     second = verify_and_load_base_runtime(base_artifacts_root, **kwargs)
-    base_resume_digest = sha256_json(
-        {
-            "first_binding_digest": first.binding_digest,
-            "second_binding_digest": second.binding_digest,
-            "protocol_manifest_sha256": first.protocol_manifest_sha256,
-            "pool_manifest_sha256": first.pool_manifest_sha256,
-            "public_pool_manifest_sha256": first.public_pool_manifest_sha256,
-            "resume_command": resume_command,
-            "resume_config_sha256": config_sha256,
-            "resume_exit_code": int(resume_completed.returncode),
-            "resume_log_sha256": sha256_bytes(resume_log.encode("utf-8")),
-            "resume_json_passed": resume_json_passed,
-        }
+    log = (
+        "[subprocess environment]\n"
+        + json.dumps(regression_environment, sort_keys=True)
+        + "\n[backend probe]\n"
+        + backend_probe_completed.stdout
+        + backend_probe_completed.stderr
+        + "\n[v0 tests]\n"
+        + test_log
+        + "\n[v0 formal resume]\n"
+        + resume_log
     )
-    log = "[v0 tests]\n" + test_log + "\n[v0 formal resume]\n" + resume_log
     passed_match = re.search(r"(?:^|\s)(\d+) passed(?:[,\s]|$)", log)
     failed_match = re.search(r"(?:^|\s)(\d+) failed(?:[,\s]|$)", log)
     error_match = re.search(r"(?:^|\s)(\d+) errors?(?:[,\s]|$)", log)
@@ -1560,8 +1737,21 @@ def _run_controlled_v0_regression(
     error_count = int(error_match.group(1)) if error_match else 0
     base_resume_passed = first.binding_digest == second.binding_digest
     report = {
-        "schema": "policy-learnware.v01-v0-regression-attestation.v0",
+        "schema": "policy-learnware.v01-v0-regression-attestation.v1",
         "command": command,
+        "subprocess_environment": regression_environment,
+        "backend_probe_command": backend_probe_command,
+        "backend_probe_exit_code": int(backend_probe_completed.returncode),
+        "backend_probe_stdout_sha256": sha256_bytes(
+            backend_probe_completed.stdout.encode("utf-8")
+        ),
+        "backend_probe_stderr_sha256": sha256_bytes(
+            backend_probe_completed.stderr.encode("utf-8")
+        ),
+        "backend_probe_record": (
+            None if backend_probe_record is None else dict(backend_probe_record)
+        ),
+        "backend_probe_passed": backend_probe_passed,
         "base_resume_command": resume_command,
         "base_resume_config_sha256": config_sha256,
         "cwd": str(_project_root()),
@@ -1580,7 +1770,6 @@ def _run_controlled_v0_regression(
         "failed_test_count": failed_count,
         "error_test_count": error_count,
         "log_sha256": sha256_bytes(log.encode("utf-8")),
-        "base_resume_digest": base_resume_digest,
         "base_resume_passed": bool(
             base_resume_passed
             and resume_completed.returncode == 0
@@ -1591,7 +1780,8 @@ def _run_controlled_v0_regression(
         "frozen_taskspec_semantic_source_digest": frozen_semantic,
         "semantic_source_passed": semantic_identity,
         "passed": bool(
-            completed.returncode == 0
+            backend_probe_passed
+            and completed.returncode == 0
             and passed_count > 0
             and failed_count == 0
             and error_count == 0
@@ -1601,6 +1791,15 @@ def _run_controlled_v0_regression(
             and semantic_identity
         ),
     }
+    report["base_resume_digest"] = _v0_regression_base_resume_digest(
+        report,
+        {
+            "binding_digest": first.binding_digest,
+            "protocol_manifest_sha256": first.protocol_manifest_sha256,
+            "pool_manifest_sha256": first.pool_manifest_sha256,
+            "public_pool_manifest_sha256": first.public_pool_manifest_sha256,
+        },
+    )
     return report, log
 
 
