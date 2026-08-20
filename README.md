@@ -181,6 +181,13 @@ oracle 分片后需再执行一次不带 shard 参数且带 `--resume` 的 `eval
 全量校验和 merge。所有命令支持 `--dry-run` 或 `--resume`，两者互斥；`--resume` 只重验
 并复用 byte-identical immutable work units，不是 overwrite。
 
+`collect-probes` 在单个进程内按 variant 创建一次环境，并让该 variant 的全部 bank 复用同一组
+缓存执行器：`jit(lax.map(reset))` 与 `jit(lax.scan(lax.map(step)))`。复用范围不跨 variant、
+episode shape 或独立 shard 进程；每个 bank 的 seed、初始 state、dataset、manifest 和私有
+collection attestation 仍独立生成。完整 `--resume` 只重建并核验一次该 variant 的 live
+environment binding，不创建或调用 rollout executor。`vmap` 目前仅用于独立等价性消融，
+在真实 MJX 的数值摘要、编译时间与峰值显存通过验收前不进入正式采集路径。
+
 若 smoke profile 表明 exact TaskSpec 计算资源不可承受，可在 Gate 0 通过后向
 `build-report` 追加 `--no-go-compute --execution-profile-attempt-id <v01xa-...>`；它只允许在
 同一个 smoke experiment root 中引用一个重新验真的 `SUCCESS` profile，并发布

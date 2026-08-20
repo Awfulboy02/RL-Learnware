@@ -63,6 +63,204 @@ def frozen_probe_action_tensor(
     return jax.vmap(sample)(keys)
 
 
+class ProbeBatchExecutor:
+    """Shape-stable probe rollout executables reusable across banks."""
+
+    _MAP_MODES = frozenset({"lax_map", "vmap"})
+
+    def __init__(
+        self,
+        adapter: Any,
+        *,
+        episode_count: int,
+        map_mode: str = "lax_map",
+    ) -> None:
+        try:
+            import jax
+            import jax.numpy as jnp
+        except ImportError as error:  # pragma: no cover - server dependency gate
+            raise ProbeCollectionError(
+                "v0.1 production probe collection requires JAX"
+            ) from error
+        if type(episode_count) is not int or episode_count <= 0:
+            raise ValueError("episode_count must be a positive integer")
+        if map_mode not in self._MAP_MODES:
+            raise ValueError(
+                f"map_mode must be one of {sorted(self._MAP_MODES)}, got {map_mode!r}"
+            )
+        self._adapter = adapter
+        self._schema = adapter.schema
+        self._episode_count = episode_count
+        self._map_mode = map_mode
+        environment = adapter.environment
+
+        if map_mode == "lax_map":
+            def reset_batch(keys: Any) -> Any:
+                return jax.lax.map(environment.reset, keys)
+
+            def step_batch(state: Any, actions: Any) -> Any:
+                return jax.lax.map(
+                    lambda pair: environment.step(pair[0], pair[1]),
+                    (state, actions),
+                )
+        else:
+            reset_batch = jax.vmap(environment.reset)
+            step_batch = jax.vmap(environment.step)
+
+        observation_dim = int(self._schema.observation_dim)
+
+        def scan_many(initial_state: Any, actions_by_step: Any) -> tuple[Any, ...]:
+            def step(carry: Any, actions: Any) -> tuple[Any, tuple[Any, ...]]:
+                observation = jnp.reshape(
+                    carry.obs, (episode_count, observation_dim)
+                )
+                next_state = step_batch(carry, actions)
+                next_observation = jnp.reshape(
+                    next_state.obs, (episode_count, observation_dim)
+                )
+                done = jnp.asarray(
+                    getattr(next_state, "done", False), dtype=jnp.bool_
+                )
+                info = getattr(next_state, "info", {}) or {}
+                truncation = (
+                    jnp.asarray(
+                        info.get("truncation", jnp.zeros_like(done)),
+                        dtype=jnp.bool_,
+                    )
+                    if hasattr(info, "get")
+                    else jnp.zeros_like(done)
+                )
+                terminated = jnp.logical_and(done, jnp.logical_not(truncation))
+                return next_state, (
+                    observation,
+                    actions,
+                    next_state.reward,
+                    next_observation,
+                    terminated,
+                    truncation,
+                )
+
+            _, scanned = jax.lax.scan(step, initial_state, actions_by_step)
+            return scanned
+
+        # Reset stays outside scan, preserving the original execution order.
+        # The JIT objects themselves remain alive for all banks of one variant.
+        self._reset_many = jax.jit(reset_batch)
+        self._scan_many = jax.jit(scan_many)
+        self._jax = jax
+        self._jnp = jnp
+
+    @property
+    def adapter(self) -> Any:
+        return self._adapter
+
+    @property
+    def episode_count(self) -> int:
+        return self._episode_count
+
+    @property
+    def map_mode(self) -> str:
+        return self._map_mode
+
+    def collect(
+        self,
+        *,
+        reset_seeds: Sequence[int],
+        probe_seeds: Sequence[int],
+        sigma: float = 1.0,
+        action_tensor: Any | None = None,
+    ) -> EpisodeDataset:
+        """Collect one bank without rebuilding reset/scan JIT callables."""
+
+        jax = self._jax
+        jnp = self._jnp
+        schema = self._schema
+        episode_count = self._episode_count
+        reset_values = np.asarray(reset_seeds, dtype=np.int64)
+        probe_values = np.asarray(probe_seeds, dtype=np.int64)
+        if (
+            reset_values.ndim != 1
+            or reset_values.size != episode_count
+            or probe_values.shape != reset_values.shape
+            or np.any(reset_values < 0)
+            or np.any(probe_values < 0)
+        ):
+            raise ValueError("reset/probe seeds must be aligned nonnegative vectors")
+        if action_tensor is None:
+            action_tensor = frozen_probe_action_tensor(
+                schema, probe_values, sigma=sigma
+            )
+        else:
+            action_tensor = jnp.asarray(action_tensor, dtype=jnp.float32)
+            expected = (
+                int(reset_values.size),
+                int(schema.horizon),
+                int(schema.action_dim),
+            )
+            if action_tensor.shape != expected:
+                raise ValueError(
+                    "pre-generated action_tensor has shape "
+                    f"{action_tensor.shape}, expected {expected}"
+                )
+            low = jnp.asarray(schema.action_low, dtype=jnp.float32)
+            high = jnp.asarray(schema.action_high, dtype=jnp.float32)
+            if not bool(
+                np.asarray(
+                    jax.device_get(
+                        jnp.all(jnp.isfinite(action_tensor))
+                        & jnp.all(action_tensor >= low)
+                        & jnp.all(action_tensor <= high)
+                    )
+                )
+            ):
+                raise ValueError(
+                    "pre-generated action_tensor is non-finite or out of bounds"
+                )
+        reset_keys = _jax_keys(jax, reset_values)
+        actions_by_step = jnp.swapaxes(action_tensor, 0, 1)
+        initial_state = self._reset_many(reset_keys)
+        scanned = self._scan_many(initial_state, actions_by_step)
+        observation, action, reward, next_observation, terminated, truncated = (
+            np.asarray(jax.device_get(value)) for value in scanned
+        )
+        arrays = [observation, action, reward, next_observation, terminated, truncated]
+        arrays = [np.swapaxes(value, 0, 1) for value in arrays]
+        observation, action, reward, next_observation, terminated, truncated = arrays
+        terminated = terminated.astype(np.bool_)
+        truncated = truncated.astype(np.bool_)
+        ended = np.logical_or(terminated, truncated)
+        if np.any(ended[:, :-1]):
+            raise ProbeCollectionError(
+                "variant ended before the registered fixed horizon"
+            )
+        if not all(
+            np.all(np.isfinite(value))
+            for value in (observation, action, reward, next_observation)
+        ):
+            raise ProbeCollectionError("variant emitted non-finite probe data")
+        truncated[:, -1] = np.logical_or(
+            truncated[:, -1], np.logical_not(terminated[:, -1])
+        )
+        horizon = int(schema.horizon)
+        return EpisodeDataset(
+            observation=observation.reshape(
+                episode_count * horizon, int(schema.observation_dim)
+            ).astype(np.float32),
+            action=action.reshape(
+                episode_count * horizon, int(schema.action_dim)
+            ).astype(np.float32),
+            reward=reward.reshape(-1).astype(np.float32),
+            next_observation=next_observation.reshape(
+                episode_count * horizon, int(schema.observation_dim)
+            ).astype(np.float32),
+            terminated=terminated.reshape(-1),
+            truncated=truncated.reshape(-1),
+            episode_offsets=np.arange(episode_count + 1, dtype=np.int64) * horizon,
+            reset_seeds=reset_values,
+            probe_seeds=probe_values,
+        )
+
+
 def collect_probe_batch(
     adapter: Any,
     *,
@@ -70,122 +268,25 @@ def collect_probe_batch(
     probe_seeds: Sequence[int],
     sigma: float = 1.0,
     action_tensor: Any | None = None,
+    executor: ProbeBatchExecutor | None = None,
 ) -> EpisodeDataset:
-    """Collect paired fixed-horizon episodes with one JIT map/scan executable."""
+    """Backward-compatible one-bank wrapper around a reusable executor."""
 
-    try:
-        import jax
-        import jax.numpy as jnp
-    except ImportError as error:  # pragma: no cover - server dependency gate
-        raise ProbeCollectionError("v0.1 production probe collection requires JAX") from error
-    schema = adapter.schema
-    reset_values = np.asarray(reset_seeds, dtype=np.int64)
-    probe_values = np.asarray(probe_seeds, dtype=np.int64)
-    if (
-        reset_values.ndim != 1
-        or reset_values.size == 0
-        or probe_values.shape != reset_values.shape
-        or np.any(reset_values < 0)
-        or np.any(probe_values < 0)
-    ):
-        raise ValueError("reset/probe seeds must be aligned nonnegative vectors")
-    environment = adapter.environment
-    if action_tensor is None:
-        action_tensor = frozen_probe_action_tensor(
-            schema, probe_values, sigma=sigma
+    reset_values = np.asarray(reset_seeds)
+    if reset_values.ndim != 1 or reset_values.size == 0:
+        raise ValueError("reset_seeds must be a non-empty vector")
+    if executor is None:
+        executor = ProbeBatchExecutor(
+            adapter,
+            episode_count=int(reset_values.size),
         )
-    else:
-        action_tensor = jnp.asarray(action_tensor, dtype=jnp.float32)
-        expected = (
-            int(reset_values.size),
-            int(schema.horizon),
-            int(schema.action_dim),
-        )
-        if action_tensor.shape != expected:
-            raise ValueError(
-                f"pre-generated action_tensor has shape {action_tensor.shape}, expected {expected}"
-            )
-        low = jnp.asarray(schema.action_low, dtype=jnp.float32)
-        high = jnp.asarray(schema.action_high, dtype=jnp.float32)
-        if not bool(
-            np.asarray(
-                jax.device_get(
-                    jnp.all(jnp.isfinite(action_tensor))
-                    & jnp.all(action_tensor >= low)
-                    & jnp.all(action_tensor <= high)
-                )
-            )
-        ):
-            raise ValueError("pre-generated action_tensor is non-finite or out of bounds")
-    reset_keys = _jax_keys(jax, reset_values)
-    episode_count = int(reset_values.size)
-    initial_state = jax.lax.map(environment.reset, reset_keys)
-    actions_by_step = jnp.swapaxes(action_tensor, 0, 1)
-
-    def step(carry: Any, actions: Any) -> tuple[Any, tuple[Any, ...]]:
-        observation = jnp.reshape(carry.obs, (episode_count, int(schema.observation_dim)))
-        next_state = jax.lax.map(
-            lambda pair: environment.step(pair[0], pair[1]), (carry, actions)
-        )
-        next_observation = jnp.reshape(
-            next_state.obs, (episode_count, int(schema.observation_dim))
-        )
-        done = jnp.asarray(getattr(next_state, "done", False), dtype=jnp.bool_)
-        info = getattr(next_state, "info", {}) or {}
-        truncation = (
-            jnp.asarray(info.get("truncation", jnp.zeros_like(done)), dtype=jnp.bool_)
-            if hasattr(info, "get")
-            else jnp.zeros_like(done)
-        )
-        terminated = jnp.logical_and(done, jnp.logical_not(truncation))
-        return next_state, (
-            observation,
-            actions,
-            next_state.reward,
-            next_observation,
-            terminated,
-            truncation,
-        )
-
-    _, scanned = jax.jit(
-        lambda state, actions: jax.lax.scan(step, state, actions)
-    )(initial_state, actions_by_step)
-    observation, action, reward, next_observation, terminated, truncated = (
-        np.asarray(jax.device_get(value)) for value in scanned
-    )
-    arrays = [observation, action, reward, next_observation, terminated, truncated]
-    arrays = [np.swapaxes(value, 0, 1) for value in arrays]
-    observation, action, reward, next_observation, terminated, truncated = arrays
-    terminated = terminated.astype(np.bool_)
-    truncated = truncated.astype(np.bool_)
-    ended = np.logical_or(terminated, truncated)
-    if np.any(ended[:, :-1]):
-        raise ProbeCollectionError("variant ended before the registered fixed horizon")
-    if not all(
-        np.all(np.isfinite(value))
-        for value in (observation, action, reward, next_observation)
-    ):
-        raise ProbeCollectionError("variant emitted non-finite probe data")
-    truncated[:, -1] = np.logical_or(
-        truncated[:, -1], np.logical_not(terminated[:, -1])
-    )
-    horizon = int(schema.horizon)
-    return EpisodeDataset(
-        observation=observation.reshape(
-            episode_count * horizon, int(schema.observation_dim)
-        ).astype(np.float32),
-        action=action.reshape(episode_count * horizon, int(schema.action_dim)).astype(
-            np.float32
-        ),
-        reward=reward.reshape(-1).astype(np.float32),
-        next_observation=next_observation.reshape(
-            episode_count * horizon, int(schema.observation_dim)
-        ).astype(np.float32),
-        terminated=terminated.reshape(-1),
-        truncated=truncated.reshape(-1),
-        episode_offsets=np.arange(episode_count + 1, dtype=np.int64) * horizon,
-        reset_seeds=reset_values,
-        probe_seeds=probe_values,
+    elif executor.adapter is not adapter:
+        raise ValueError("probe executor is bound to a different adapter")
+    return executor.collect(
+        reset_seeds=reset_seeds,
+        probe_seeds=probe_seeds,
+        sigma=sigma,
+        action_tensor=action_tensor,
     )
 
 
@@ -260,6 +361,7 @@ def collect_probe_scalar(
 
 
 __all__ = [
+    "ProbeBatchExecutor",
     "ProbeCollectionError",
     "collect_probe_batch",
     "collect_probe_scalar",

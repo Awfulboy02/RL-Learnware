@@ -2224,7 +2224,7 @@ def _collect_probes(args: argparse.Namespace) -> dict[str, Any]:
         verify_collection_binding_attestation,
         verify_live_instance_binding,
     )
-    from .probe import collect_probe_batch
+    from .probe import ProbeBatchExecutor, collect_probe_batch
     from .seeds import V01SeedPlan
     from .variant_env import VariantEnvFactory
 
@@ -2253,6 +2253,12 @@ def _collect_probes(args: argparse.Namespace) -> dict[str, Any]:
     with _run_lock(layout.run_lock):
         measurement = layout.writer("measurement")
         private = layout.writer("benchmark_private")
+        active_variant_id: str | None = None
+        active_adapter: Any | None = None
+        active_live_binding: Any | None = None
+        active_expected_view: str | None = None
+        active_instance_path: Path | None = None
+        active_executor: ProbeBatchExecutor | None = None
         for raw, bank in work:
             context = PrivateContextRecord.from_dict(raw["context"])
             shift = ShiftManifest.from_dict(raw["shift_manifest"])
@@ -2261,26 +2267,50 @@ def _collect_probes(args: argparse.Namespace) -> dict[str, Any]:
                 seed_plan.probe_episode(context.task, bank, index)
                 for index in range(int(contract["episodes_per_bank"]))
             ]
-            adapter = factory.create(
-                task=context.task,
-                shift_manifest=shift,
-                variant_id=variant_id,
-                expected_horizon=1000,
-                expected_action_repeat=1,
-                jit=True,
-            )
-            expected_view = str(run_ref["schema_view_digests"][variant_id])
-            if adapter.measurement_schema_view.digest != expected_view:
-                raise V01CommandFailure(
-                    "live measurement schema differs from frozen view"
+            if variant_id != active_variant_id:
+                active_adapter = factory.create(
+                    task=context.task,
+                    shift_manifest=shift,
+                    variant_id=variant_id,
+                    expected_horizon=1000,
+                    expected_action_repeat=1,
+                    # Batch executor owns the collection JITs.  Avoid compiling
+                    # scalar reset/step wrappers that this command never calls.
+                    jit=False,
                 )
-            instance_path = layout.instance_record(context.task, variant_id)
-            audited_instance = _object(instance_path, "Gate-0 environment instance")
-            live_binding = verify_live_instance_binding(
-                adapter,
-                audited_instance,
-                audited_instance_record_sha256=sha256_file(instance_path),
-            )
+                active_expected_view = str(
+                    run_ref["schema_view_digests"][variant_id]
+                )
+                if active_adapter.measurement_schema_view.digest != active_expected_view:
+                    raise V01CommandFailure(
+                        "live measurement schema differs from frozen view"
+                    )
+                active_instance_path = layout.instance_record(
+                    context.task, variant_id
+                )
+                audited_instance = _object(
+                    active_instance_path, "Gate-0 environment instance"
+                )
+                active_live_binding = verify_live_instance_binding(
+                    active_adapter,
+                    audited_instance,
+                    audited_instance_record_sha256=sha256_file(
+                        active_instance_path
+                    ),
+                )
+                active_variant_id = variant_id
+                active_executor = None
+            if (
+                active_adapter is None
+                or active_live_binding is None
+                or active_expected_view is None
+                or active_instance_path is None
+            ):
+                raise AssertionError("active probe variant was not initialized")
+            adapter = active_adapter
+            live_binding = active_live_binding
+            expected_view = active_expected_view
+            instance_path = active_instance_path
             dataset_path = layout.dataset_npz(variant_id, bank)
             manifest_path = layout.dataset_manifest(variant_id, bank)
             attestation_path = layout.collection_attestation(variant_id, bank)
@@ -2340,10 +2370,16 @@ def _collect_probes(args: argparse.Namespace) -> dict[str, Any]:
                 raise V01CommandFailure(
                     "probe artifacts already exist; use --resume for immutable validation"
                 )
+            if active_executor is None:
+                active_executor = ProbeBatchExecutor(
+                    adapter,
+                    episode_count=int(contract["episodes_per_bank"]),
+                )
             dataset = collect_probe_batch(
                 adapter,
                 reset_seeds=[item.reset_seed for item in seeds],
                 probe_seeds=[item.probe_seed for item in seeds],
+                executor=active_executor,
             )
             attestation = build_collection_binding_attestation(
                 live_binding,
