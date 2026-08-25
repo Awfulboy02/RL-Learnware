@@ -306,14 +306,17 @@ def test_two_axes_must_share_exactly_one_nominal_anchor() -> None:
         V02ExperimentConfig.from_dict(payload)
 
 
-def test_rfc_configs_are_recordable_but_freeze_template_is_not_executable() -> None:
+def test_rfc_discovery_is_recordable_and_reviewed_freeze_is_executable() -> None:
     discovery = load_v02_config_draft(PROJECT / "configs" / "v02_discovery.yaml")
-    confirmatory = load_v02_config_draft(PROJECT / "configs" / "v02_freeze_ready.yaml")
+    reviewed = load_v02_config_draft(PROJECT / "configs" / "v02_freeze_ready.yaml")
     assert discovery.unresolved_fields
-    assert confirmatory.unresolved_fields
-    assert discovery.config_digest != confirmatory.config_digest
-    with pytest.raises(V02ConfigError):
-        load_v02_formal_config(PROJECT / "configs" / "v02_freeze_ready.yaml")
+    assert reviewed.unresolved_fields == ()
+    assert discovery.config_digest != reviewed.config_digest
+
+    formal = load_v02_formal_config(PROJECT / "configs" / "v02_freeze_ready.yaml")
+    assert formal.config_digest == reviewed.config_digest
+    assert formal.stage == "v02_freeze_ready"
+    assert len(formal.source_anchor_ids) == 30
 
 
 def test_config_round_trip_is_canonical() -> None:
