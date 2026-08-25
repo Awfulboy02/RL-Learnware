@@ -111,6 +111,73 @@ def _positive_float(value: str) -> float:
     return result
 
 
+def _nonnegative_int(value: str) -> int:
+    result = int(value)
+    if result < 0:
+        raise argparse.ArgumentTypeError("value must be nonnegative")
+    return result
+
+
+def parse_gpu_resource_snapshot(
+    output: str,
+    *,
+    compute_output: str,
+    requested_gpus: Sequence[str],
+) -> dict[str, dict[str, Any]]:
+    """Parse explicit GPU and compute-process ``nvidia-smi`` projections."""
+
+    rows: dict[str, dict[str, Any]] = {}
+    for line in output.splitlines():
+        if not line.strip():
+            continue
+        parts = [item.strip() for item in line.split(",")]
+        if len(parts) != 4:
+            raise ContractError("nvidia-smi GPU resource row must have four columns")
+        gpu, uuid, memory_used, utilization = parts
+        if not gpu.isdigit() or gpu in rows:
+            raise ContractError("nvidia-smi GPU resource indices are invalid or duplicated")
+        if not uuid or any(item.get("uuid") == uuid for item in rows.values()):
+            raise ContractError("nvidia-smi GPU UUIDs are invalid or duplicated")
+        try:
+            memory_value = int(memory_used)
+            utilization_value = int(utilization)
+        except ValueError as error:
+            raise ContractError("nvidia-smi GPU resource values must be integers") from error
+        if memory_value < 0 or not 0 <= utilization_value <= 100:
+            raise ContractError("nvidia-smi GPU resource values are outside valid ranges")
+        rows[gpu] = {
+            "uuid": uuid,
+            "memory_used_mib": memory_value,
+            "utilization_percent": utilization_value,
+            "compute_process_count": 0,
+        }
+    missing = sorted(set(requested_gpus) - set(rows), key=int)
+    if missing:
+        raise ContractError(f"nvidia-smi omitted requested GPUs: {missing}")
+    uuid_to_gpu = {item["uuid"]: gpu for gpu, item in rows.items()}
+    seen_processes: set[tuple[str, int]] = set()
+    if compute_output.strip().lower() == "no running processes found":
+        compute_output = ""
+    for line in compute_output.splitlines():
+        if not line.strip():
+            continue
+        parts = [item.strip() for item in line.split(",")]
+        if len(parts) != 2:
+            raise ContractError("nvidia-smi compute-process row must have two columns")
+        uuid, raw_pid = parts
+        try:
+            pid = int(raw_pid)
+        except ValueError as error:
+            raise ContractError("nvidia-smi compute-process PID must be an integer") from error
+        if not uuid or pid <= 0 or (uuid, pid) in seen_processes:
+            raise ContractError("nvidia-smi compute-process rows are invalid or duplicated")
+        seen_processes.add((uuid, pid))
+        gpu = uuid_to_gpu.get(uuid)
+        if gpu is not None:
+            rows[gpu]["compute_process_count"] += 1
+    return {gpu: rows[gpu] for gpu in requested_gpus}
+
+
 def _load_optional_json(path: Path) -> dict[str, Any] | None:
     if not path.is_file():
         return None
@@ -245,8 +312,20 @@ def validate_completed_attempt(
     ):
         raise ContractError("run command legacy exporter path drifted from provenance")
     observed_outers = [item["outer_iteration"] for item in record["checkpoint_bundles"]]
-    if observed_outers != job["training_protocol"]["export_outer_iterations"]:
-        raise ContractError("training record checkpoint set drifted from the frozen export rule")
+    frozen_outers = job["training_protocol"]["export_outer_iterations"]
+    expected_outers = (
+        frozen_outers
+        if record["state"] == "succeeded"
+        else [
+            outer
+            for outer in frozen_outers
+            if outer <= record["completed_outer_iterations"]
+        ]
+    )
+    if observed_outers != expected_outers:
+        raise ContractError(
+            "training record checkpoint set drifted from the frozen terminal prefix"
+        )
     checkpoint_root = (attempt_dir / "checkpoints").resolve()
     require_evaluation = bool(job["training_protocol"]["evaluation"]["enabled"])
     for item in record["checkpoint_bundles"]:
@@ -315,11 +394,18 @@ def validate_completed_attempt(
                 raise ContractError(f"checkpoint provenance {key} binding mismatch")
     status = load_strict_json(attempt_dir / "status.json")
     required_status = {
-        "state": "completed",
+        "state": "completed" if record["state"] == "succeeded" else "recovered",
         "job_digest": job["job_digest"],
         "attempt_digest": attempt["attempt_digest"],
         "anchor_manifest_digest": anchor.manifest_digest,
         "environment_instance_digest": anchor.environment_instance_digest,
+        "last_completed_outer": record["completed_outer_iterations"],
+        "environment_steps": record["completed_environment_steps"],
+        "planned_outer_iterations": record["planned_outer_iterations"],
+        "planned_environment_steps": record["planned_environment_steps"],
+        "promoted_outer_iteration": record["promoted_outer_iteration"],
+        "promoted_environment_steps": record["promoted_environment_steps"],
+        "terminal_failure": record["terminal_failure"],
         "training_record_digest": record["record_digest"],
     }
     for key, expected in required_status.items():
@@ -552,6 +638,13 @@ class QueueMaster:
         self.stop_requested = False
         self.stop_signal: int | None = None
         self.started_at = utc_now()
+        self.gpu_resource_snapshot: dict[str, dict[str, Any]] = {}
+        self.gpu_resource_probe_error: str | None = None
+        self.gpu_idle_streak = {gpu: 0 for gpu in args.gpus}
+        self.idle_gpu_cache: tuple[str, ...] = ()
+        self.next_gpu_resource_probe = 0.0
+        if args.idle_max_utilization_percent > 100:
+            raise ContractError("--idle-max-utilization-percent cannot exceed 100")
 
     def acquire_lock(self) -> None:
         path = self.runs_root / "queue_master.lock"
@@ -603,8 +696,12 @@ class QueueMaster:
             success = self.store.successful_attempt(job)
             attempts = len(self.store.attempt_dirs(job))
             if success is not None:
+                terminal_record_state = load_strict_json(
+                    success / "training_record.json"
+                )["state"]
                 self.states[job["job_id"]] = {
                     "state": "succeeded",
+                    "terminal_record_state": terminal_record_state,
                     "attempts": attempts,
                     "attempt_dir": str(success),
                 }
@@ -624,6 +721,15 @@ class QueueMaster:
         for value in self.states.values():
             state = str(value["state"])
             result[state] = result.get(state, 0) + 1
+        return dict(sorted(result.items()))
+
+    def terminal_record_counts(self) -> dict[str, int]:
+        result: dict[str, int] = {}
+        for value in self.states.values():
+            terminal = value.get("terminal_record_state")
+            if terminal is not None:
+                name = str(terminal)
+                result[name] = result.get(name, 0) + 1
         return dict(sorted(result.items()))
 
     def write_status(self, *, state: str) -> None:
@@ -656,15 +762,90 @@ class QueueMaster:
                 "master_pid": os.getpid(),
                 "stop_signal": self.stop_signal,
                 "gpus": list(self.args.gpus),
+                "gpu_resource_gate": {
+                    "enabled": bool(self.args.wait_for_idle_gpus),
+                    "idle_max_memory_used_mib": self.args.idle_max_memory_used_mib,
+                    "idle_max_utilization_percent": (
+                        self.args.idle_max_utilization_percent
+                    ),
+                    "resource_poll_seconds": self.args.resource_poll_seconds,
+                    "idle_gpus": list(self.idle_gpu_cache),
+                    "idle_streak": dict(self.gpu_idle_streak),
+                    "snapshot": self.gpu_resource_snapshot,
+                    "last_probe_error": self.gpu_resource_probe_error,
+                },
                 "execution_mode": self.execution_mode,
                 "formal_eligible": self.formal_eligible,
                 "vendor": self.vendor,
                 "implementation": self.implementation,
                 "counts": self.counts(),
+                "terminal_record_counts": self.terminal_record_counts(),
                 "running": running,
                 "jobs": self.states,
             },
         )
+
+    def idle_gpus(self, *, force: bool = False) -> tuple[str, ...]:
+        if not self.args.wait_for_idle_gpus:
+            return tuple(self.args.gpus)
+        now = time.monotonic()
+        if not force and now < self.next_gpu_resource_probe:
+            return self.idle_gpu_cache
+        try:
+            completed = subprocess.run(
+                [
+                    "nvidia-smi",
+                    "--query-gpu=index,uuid,memory.used,utilization.gpu",
+                    "--format=csv,noheader,nounits",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            compute = subprocess.run(
+                [
+                    "nvidia-smi",
+                    "--query-compute-apps=gpu_uuid,pid",
+                    "--format=csv,noheader,nounits",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            snapshot = parse_gpu_resource_snapshot(
+                completed.stdout,
+                compute_output=compute.stdout,
+                requested_gpus=self.args.gpus,
+            )
+        except (ContractError, OSError, subprocess.SubprocessError) as error:
+            self.gpu_resource_probe_error = f"{type(error).__name__}: {error}"
+            self.gpu_resource_snapshot = {}
+            self.gpu_idle_streak = {gpu: 0 for gpu in self.args.gpus}
+            self.idle_gpu_cache = ()
+            self.next_gpu_resource_probe = now + self.args.resource_poll_seconds
+            self.log(f"GPU resource probe failed closed: {self.gpu_resource_probe_error}")
+            return ()
+        for gpu in self.args.gpus:
+            currently_idle = (
+                snapshot[gpu]["memory_used_mib"]
+                <= self.args.idle_max_memory_used_mib
+                and snapshot[gpu]["utilization_percent"]
+                <= self.args.idle_max_utilization_percent
+                and snapshot[gpu]["compute_process_count"] == 0
+            )
+            self.gpu_idle_streak[gpu] = (
+                self.gpu_idle_streak[gpu] + 1 if currently_idle else 0
+            )
+        idle = tuple(
+            gpu for gpu in self.args.gpus if self.gpu_idle_streak[gpu] >= 2
+        )
+        self.gpu_resource_snapshot = snapshot
+        self.gpu_resource_probe_error = None
+        self.idle_gpu_cache = idle
+        self.next_gpu_resource_probe = now + self.args.resource_poll_seconds
+        return idle
 
     def launch_job(self, job: dict[str, Any], gpu: str) -> None:
         attempt_dir, attempt = self.store.allocate(job, gpu=gpu)
@@ -750,15 +931,17 @@ class QueueMaster:
         item.stderr_handle.close()
         succeeded = returncode == 0 and not interrupted
         validation_error: str | None = None
+        terminal_record_state: str | None = None
         if succeeded:
             try:
-                validate_completed_attempt(
+                record = validate_completed_attempt(
                     item.attempt_dir,
                     item.job,
                     item.attempt,
                     expected_vendor=self.vendor,
                     expected_implementation=self.implementation,
                 )
+                terminal_record_state = str(record["state"])
             except (ContractError, OSError) as error:
                 succeeded = False
                 validation_error = str(error)
@@ -790,6 +973,7 @@ class QueueMaster:
         attempts = item.attempt["attempt_number"]
         self.states[item.job["job_id"]] = {
             "state": result["state"],
+            "terminal_record_state": terminal_record_state,
             "attempts": attempts,
             "attempt_dir": str(item.attempt_dir),
             "returncode": int(returncode),
@@ -801,6 +985,7 @@ class QueueMaster:
         )
         self.log(
             f"{result['state']} job={item.job['job_id']} gpu={gpu} "
+            f"terminal_record_state={terminal_record_state} "
             f"returncode={returncode} elapsed={result['elapsed_seconds']}s"
         )
         return succeeded, item.job
@@ -847,6 +1032,13 @@ class QueueMaster:
                 f"vendor={self.vendor['tree_digest']} "
                 f"implementation={self.implementation['implementation_digest']}"
             )
+            if self.args.wait_for_idle_gpus:
+                self.log(
+                    "GPU idle gate enabled "
+                    f"memory<={self.args.idle_max_memory_used_mib}MiB "
+                    f"utilization<={self.args.idle_max_utilization_percent}% "
+                    f"poll={self.args.resource_poll_seconds}s"
+                )
             self.write_status(state="running")
             while pending or self.running:
                 if self.stop_requested:
@@ -855,11 +1047,20 @@ class QueueMaster:
                         self.states[job["job_id"]]["state"] = "queued_after_stop"
                     self.write_status(state="stopped")
                     return 130
-                for gpu in self.args.gpus:
+                launchable_gpus = self.idle_gpus()
+                for gpu in launchable_gpus:
                     if gpu not in self.running and pending:
                         job = pending.pop(0)
                         self.launch_job(job, gpu)
+                        self.idle_gpu_cache = tuple(
+                            item for item in self.idle_gpu_cache if item != gpu
+                        )
+                        self.gpu_idle_streak[gpu] = 0
                 if not self.running:
+                    if pending and self.args.wait_for_idle_gpus:
+                        self.write_status(state="waiting_for_idle_gpu")
+                        time.sleep(self.args.resource_poll_seconds)
+                        continue
                     break
                 time.sleep(self.args.poll_seconds)
                 for gpu in list(self.running):
@@ -909,6 +1110,26 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--max-attempts", type=_positive_int, required=True)
     parser.add_argument("--poll-seconds", type=_positive_float, default=1.0)
+    parser.add_argument(
+        "--wait-for-idle-gpus",
+        action="store_true",
+        help="launch only on GPUs below explicit memory/utilization thresholds",
+    )
+    parser.add_argument(
+        "--idle-max-memory-used-mib",
+        type=_nonnegative_int,
+        default=512,
+    )
+    parser.add_argument(
+        "--idle-max-utilization-percent",
+        type=_nonnegative_int,
+        default=5,
+    )
+    parser.add_argument(
+        "--resource-poll-seconds",
+        type=_positive_float,
+        default=15.0,
+    )
     parser.add_argument("--terminate-grace-seconds", type=_positive_float, default=20.0)
     parser.add_argument("--allow-non-gpu", action="store_true")
     parser.add_argument(

@@ -611,6 +611,7 @@ def _inputs(tmp_path: Path) -> IndependentRecomputeInputs:
         mean_tolerance=0.0,
         lcb_z=None,
         return_contract_id=_d("dmc-normalized-return-v0"),
+        competence_mode="OBSERVE",
     )
     source_payload = championization_payload(
         champion,
@@ -624,6 +625,7 @@ def _inputs(tmp_path: Path) -> IndependentRecomputeInputs:
         mean_tolerance=0.0,
         lcb_z=None,
         return_contract_id=_d("dmc-normalized-return-v0"),
+        competence_mode="OBSERVE",
         published=PublishedSnapshot.create(source_payload),
     )
 

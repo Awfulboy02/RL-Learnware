@@ -499,7 +499,8 @@ def test_file_driven_training_to_championization_pipeline(
         "config_digest": config.config_digest,
         "selection_rows": rows[:2],
         "attestation_rows": rows[2:],
-        "competence_floors": {anchor_id: 0.5},
+        "competence_floors": {anchor_id: 0.9},
+        "competence_mode": "OBSERVE",
         "mean_tolerance": 0.0,
         "lcb_z": None,
         "return_contract_id": _d("normalized-return-contract"),
@@ -519,8 +520,12 @@ def test_file_driven_training_to_championization_pipeline(
     ) == 0
     champion = json.loads(capsys.readouterr().out)
     assert champion["passed"] is True
+    assert champion["competence_mode"] == "OBSERVE"
     assert champion["selected_by_anchor"] == {anchor_id: candidate_id}
-    assert champion["competence_records"][anchor_id]["passed"] is True
+    # OBSERVE publishes the independently attested low-q record while keeping
+    # the threshold outcome visible and distinct from admission.
+    assert champion["competence_records"][anchor_id]["passed"] is False
+    assert champion["rejected_anchors"] == {}
 
 
 def test_audit_axes_recomputes_primitives_and_fails_closed(

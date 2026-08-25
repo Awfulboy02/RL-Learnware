@@ -15,6 +15,10 @@ RUNNER="${SCRIPT_DIR}/runner.py"
 POLL_SECONDS="1"
 TERMINATE_GRACE_SECONDS="20"
 ALLOW_NON_GPU=0
+WAIT_FOR_IDLE_GPUS=0
+IDLE_MAX_MEMORY_USED_MIB="512"
+IDLE_MAX_UTILIZATION_PERCENT="5"
+RESOURCE_POLL_SECONDS="15"
 EXECUTION_PURPOSE=""
 
 usage() {
@@ -41,6 +45,10 @@ usage() {
     "  --runner PATH                anchor-aware runner (default: ${RUNNER})" \
     "  --poll-seconds N             child polling interval (default: 1)" \
     "  --terminate-grace-seconds N  process-group shutdown grace (default: 20)" \
+    "  --wait-for-idle-gpus         wait for two consecutive idle resource probes" \
+    "  --idle-max-memory-used-mib N idle gate memory threshold (default: 512)" \
+    "  --idle-max-utilization-percent N idle gate utilization threshold (default: 5)" \
+    "  --resource-poll-seconds N    idle gate polling interval (default: 15)" \
     "  --allow-non-gpu              synthetic/debug use only; never formal evidence" \
     "  -h, --help                   show this help"
 }
@@ -54,7 +62,7 @@ need_value() {
 
 while (($#)); do
   case "$1" in
-    --plan|--execution-purpose|--runs-root|--gpus|--max-attempts|--session|--fpo-root|--python|--vendor-dir|--legacy-policy-io|--runner|--poll-seconds|--terminate-grace-seconds)
+    --plan|--execution-purpose|--runs-root|--gpus|--max-attempts|--session|--fpo-root|--python|--vendor-dir|--legacy-policy-io|--runner|--poll-seconds|--terminate-grace-seconds|--idle-max-memory-used-mib|--idle-max-utilization-percent|--resource-poll-seconds)
       need_value "$@"
       case "$1" in
         --plan) PLAN="$2" ;;
@@ -70,11 +78,18 @@ while (($#)); do
         --runner) RUNNER="$2" ;;
         --poll-seconds) POLL_SECONDS="$2" ;;
         --terminate-grace-seconds) TERMINATE_GRACE_SECONDS="$2" ;;
+        --idle-max-memory-used-mib) IDLE_MAX_MEMORY_USED_MIB="$2" ;;
+        --idle-max-utilization-percent) IDLE_MAX_UTILIZATION_PERCENT="$2" ;;
+        --resource-poll-seconds) RESOURCE_POLL_SECONDS="$2" ;;
       esac
       shift 2
       ;;
     --allow-non-gpu)
       ALLOW_NON_GPU=1
+      shift
+      ;;
+    --wait-for-idle-gpus)
+      WAIT_FOR_IDLE_GPUS=1
       shift
       ;;
     -h|--help)
@@ -169,6 +184,14 @@ COMMAND_ARGS=(
   --poll-seconds "$POLL_SECONDS"
   --terminate-grace-seconds "$TERMINATE_GRACE_SECONDS"
 )
+if [[ "$WAIT_FOR_IDLE_GPUS" -eq 1 ]]; then
+  COMMAND_ARGS+=(
+    --wait-for-idle-gpus
+    --idle-max-memory-used-mib "$IDLE_MAX_MEMORY_USED_MIB"
+    --idle-max-utilization-percent "$IDLE_MAX_UTILIZATION_PERCENT"
+    --resource-poll-seconds "$RESOURCE_POLL_SECONDS"
+  )
+fi
 if [[ "$ALLOW_NON_GPU" -eq 1 ]]; then
   COMMAND_ARGS+=(--allow-non-gpu)
   printf 'WARNING: --allow-non-gpu output is synthetic/debug evidence only.\n' >&2

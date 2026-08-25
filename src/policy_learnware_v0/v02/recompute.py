@@ -41,6 +41,7 @@ from .competence import (
     SourceEpisodeRow,
     championize_by_anchor,
 )
+from .config import COMPETENCE_MODES, CompetenceMode
 from .costs import CostRecord, reconcile_cold_warm_costs
 from .gates import (
     CanonicalEvidenceRef,
@@ -820,6 +821,7 @@ class SourceRecomputeInputs:
     mean_tolerance: float
     lcb_z: float | None
     return_contract_id: str
+    competence_mode: CompetenceMode
     published: PublishedSnapshot
 
     def __post_init__(self) -> None:
@@ -842,6 +844,13 @@ class SourceRecomputeInputs:
         if not floors or any(value < 0.0 or value > 1.0 for value in floors.values()):
             raise RecomputeContractError(
                 "competence floors must cover anchors on [0, 1]"
+            )
+        if (
+            not isinstance(self.competence_mode, str)
+            or self.competence_mode not in COMPETENCE_MODES
+        ):
+            raise RecomputeContractError(
+                "source competence_mode must be OBSERVE or ENFORCE"
             )
         object.__setattr__(self, "selection_rows", selection)
         object.__setattr__(self, "attestation_rows", attestation)
@@ -898,6 +907,7 @@ def championization_payload(
             ),
         },
         "selected_by_anchor": dict(sorted(result.selected_by_anchor.items())),
+        "competence_mode": result.competence_mode,
         "selection_summaries": [item.to_dict() for item in result.selection_summaries],
         "competence_records": {
             anchor: record.to_dict()
@@ -938,6 +948,7 @@ def recompute_source(
         mean_tolerance=inputs.mean_tolerance,
         lcb_z=inputs.lcb_z,
         return_contract_id=inputs.return_contract_id,
+        competence_mode=inputs.competence_mode,
     )
     if set(result.competence_records) != set(coverage.source_market_bindings):
         raise RecomputeContractError(
@@ -2125,6 +2136,7 @@ def _source_projection_from_inputs(inputs: IndependentRecomputeInputs) -> dict[s
                 for row in _ordered_source_rows(inputs.source.attestation_rows)
             ],
             "competence_floors": dict(inputs.source.competence_floors),
+            "competence_mode": inputs.source.competence_mode,
             "mean_tolerance": inputs.source.mean_tolerance,
             "lcb_z": inputs.source.lcb_z,
             "return_contract_id": inputs.source.return_contract_id,
@@ -2157,6 +2169,7 @@ def _source_projection_from_loaded(value: LoadedFormalSourceSection) -> dict[str
                 for row in _ordered_source_rows(value.source.attestation_rows)
             ],
             "competence_floors": dict(value.source.competence_floors),
+            "competence_mode": value.source.competence_mode,
             "mean_tolerance": value.source.mean_tolerance,
             "lcb_z": value.source.lcb_z,
             "return_contract_id": value.source.return_contract_id,
@@ -2190,6 +2203,7 @@ def _load_source_projection(value: object) -> LoadedFormalSourceSection:
             "selection_rows",
             "attestation_rows",
             "competence_floors",
+            "competence_mode",
             "mean_tolerance",
             "lcb_z",
             "return_contract_id",
@@ -2212,6 +2226,7 @@ def _load_source_projection(value: object) -> LoadedFormalSourceSection:
                 for index, row in enumerate(source["attestation_rows"])
             ),
             competence_floors=source["competence_floors"],
+            competence_mode=source["competence_mode"],
             mean_tolerance=source["mean_tolerance"],
             lcb_z=source["lcb_z"],
             return_contract_id=source["return_contract_id"],

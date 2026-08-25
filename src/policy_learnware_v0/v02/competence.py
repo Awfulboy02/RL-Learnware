@@ -10,7 +10,7 @@ from typing import Any, Literal, Mapping, Sequence
 import numpy as np
 
 from ..hashing import sha256_json
-from .config import V02ExperimentConfig
+from .config import COMPETENCE_MODES, CompetenceMode, V02ExperimentConfig
 from .schemas import SourceCompetenceRecord
 from .training import (
     AdmittedTrainingRecord,
@@ -20,6 +20,12 @@ from .training import (
 
 
 EvaluationBlock = Literal["source_selection", "source_attestation"]
+
+
+def _competence_mode(value: Any) -> CompetenceMode:
+    if not isinstance(value, str) or value not in COMPETENCE_MODES:
+        raise ValueError("competence_mode must be OBSERVE or ENFORCE")
+    return value
 
 
 def _nonempty(value: Any, where: str) -> str:
@@ -189,11 +195,13 @@ class ChampionizationResult:
     selection_summaries: tuple[CandidateSelectionSummary, ...]
     competence_records: Mapping[str, SourceCompetenceRecord]
     rejected_anchors: Mapping[str, str]
+    competence_mode: CompetenceMode
     selection_digest: str
     attested_bundle_digests: Mapping[str, str] = field(default_factory=dict)
     formal_admission: FormalChampionizationAdmission | None = None
 
     def __post_init__(self) -> None:
+        mode = _competence_mode(self.competence_mode)
         selected = {
             _digest(anchor, "selected source anchor"): _nonempty(candidate, "selected candidate")
             for anchor, candidate in self.selected_by_anchor.items()
@@ -221,6 +229,8 @@ class ChampionizationResult:
         rejected = dict(self.rejected_anchors)
         if set(competence) & set(rejected) or set(competence) | set(rejected) != set(selected):
             raise ValueError("competence and rejection outcomes must partition selected anchors")
+        if mode == "OBSERVE" and rejected:
+            raise ValueError("OBSERVE competence mode cannot reject an attested anchor")
         for anchor, record in competence.items():
             if not isinstance(record, SourceCompetenceRecord):
                 raise ValueError("competence records must be typed")
@@ -228,6 +238,8 @@ class ChampionizationResult:
                 raise ValueError("competence record belongs to another source anchor")
             if record.championization_digest != self.selection_digest:
                 raise ValueError("competence record is bound to another selection")
+            if mode == "ENFORCE" and not record.passed:
+                raise ValueError("ENFORCE competence records must pass the absolute floor")
         attested = {
             _digest(anchor, "attested source anchor"): _digest(bundle, "attested bundle digest")
             for anchor, bundle in self.attested_bundle_digests.items()
@@ -275,6 +287,7 @@ class ChampionizationResult:
                 ):
                     raise ValueError("formal admission is bound to other attestation evidence")
         object.__setattr__(self, "selection_digest", _digest(self.selection_digest, "selection_digest"))
+        object.__setattr__(self, "competence_mode", mode)
         object.__setattr__(self, "selected_by_anchor", MappingProxyType(dict(sorted(selected.items()))))
         object.__setattr__(self, "selection_summaries", summaries)
         object.__setattr__(self, "competence_records", MappingProxyType(dict(sorted(competence.items()))))
@@ -325,9 +338,16 @@ def championize_by_anchor(
     mean_tolerance: float,
     lcb_z: float | None,
     return_contract_id: str,
+    competence_mode: CompetenceMode = "ENFORCE",
 ) -> ChampionizationResult:
-    """Select on one seed block, publish competence from another, never fall back."""
+    """Select on one seed block and attest on another, without policy fallback.
 
+    ``OBSERVE`` preserves the independently recomputed competence record and its
+    absolute-floor result but does not turn a low score into a market rejection.
+    ``ENFORCE`` retains the original hard-admission semantics.
+    """
+
+    mode = _competence_mode(competence_mode)
     if not math.isfinite(float(mean_tolerance)) or mean_tolerance < 0.0:
         raise ValueError("mean_tolerance must be finite and non-negative")
     if lcb_z is not None and (not math.isfinite(float(lcb_z)) or lcb_z < 0.0):
@@ -366,6 +386,7 @@ def championize_by_anchor(
 
     selection_payload = {
         "schema": "policy-learnware.v02-championization.v0",
+        "competence_mode": mode,
         "mean_tolerance": float(mean_tolerance),
         "rows": [item.to_dict() for item in summaries],
         "selected": dict(sorted(selected.items())),
@@ -425,7 +446,7 @@ def championize_by_anchor(
             championization_digest=selection_digest,
             private_attestation_digest=attestation_digest,
         )
-        if record.passed:
+        if mode == "OBSERVE" or record.passed:
             competence[anchor] = record
         else:
             rejected[anchor] = "selected_champion_failed_independent_attestation"
@@ -434,6 +455,7 @@ def championize_by_anchor(
         selection_summaries=summaries,
         competence_records=competence,
         rejected_anchors=rejected,
+        competence_mode=mode,
         selection_digest=selection_digest,
         attested_bundle_digests={
             anchor: _summary(rows).bundle_digest
@@ -537,6 +559,7 @@ def admit_formal_championization(
         mean_tolerance=reviewed_mean_tolerance,
         lcb_z=reviewed_lcb_z,
         return_contract_id=return_contract_id,
+        competence_mode=protocol.competence_mode,
     )
     attestation_groups: dict[str, list[SourceEpisodeRow]] = {}
     for row in attestation:
@@ -561,6 +584,7 @@ def admit_formal_championization(
             "schema": "policy-learnware.v02-championization-protocol.v0",
             "mean_tolerance": reviewed_mean_tolerance,
             "lcb_z": reviewed_lcb_z,
+            "competence_mode": protocol.competence_mode,
             "return_contract_id": return_digest,
             "selection_episodes_per_candidate": config.source_eval_episodes.selection_episodes,
             "attestation_episodes_per_champion": config.source_eval_episodes.attestation_episodes,

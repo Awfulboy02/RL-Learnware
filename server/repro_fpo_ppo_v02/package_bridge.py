@@ -29,6 +29,7 @@ from .provenance import (
     revalidate_formal_freeze_binding,
     require_digest,
     require_exact_keys,
+    sha256_file,
     sha256_json,
     validate_attempt,
     validate_execution_evidence,
@@ -736,6 +737,13 @@ def _validate_success_record_mapping(
             "implementation",
             "execution_evidence_digest",
             "checkpoint_bundles",
+            "planned_outer_iterations",
+            "completed_outer_iterations",
+            "promoted_outer_iteration",
+            "planned_environment_steps",
+            "completed_environment_steps",
+            "promoted_environment_steps",
+            "terminal_failure",
             "started_at",
             "finished_at",
             "wall_seconds",
@@ -743,8 +751,11 @@ def _validate_success_record_mapping(
         },
         "training success record",
     )
-    if value["schema"] != TRAINING_RECORD_SCHEMA or value["state"] != "succeeded":
-        raise ContractError("training record is not a successful v0.2 record")
+    if value["schema"] != TRAINING_RECORD_SCHEMA or value["state"] not in {
+        "succeeded",
+        "recovered",
+    }:
+        raise ContractError("training record is not an admissible v0.2 terminal record")
     expected = {
         "config_digest": server_job["config_digest"],
         "execution_purpose": server_job["execution_purpose"],
@@ -766,11 +777,26 @@ def _validate_success_record_mapping(
     checkpoints = value["checkpoint_bundles"]
     if not isinstance(checkpoints, list) or not checkpoints:
         raise ContractError("successful training record has no checkpoints")
-    expected_outers = server_job["training_protocol"]["export_outer_iterations"]
+    protocol = server_job["training_protocol"]
+    expected_outers = protocol["export_outer_iterations"]
     observed_outers: list[int] = []
-    per_outer = _planned_environment_steps(server_job["training_protocol"]) // (
-        server_job["training_protocol"]["max_outer_iterations"]
+    planned_outer = protocol["max_outer_iterations"]
+    planned_steps = _planned_environment_steps(protocol)
+    per_outer = planned_steps // planned_outer
+    completed_outer = _positive_int(
+        value["completed_outer_iterations"], "completed_outer_iterations"
     )
+    promoted_outer = _positive_int(
+        value["promoted_outer_iteration"], "promoted_outer_iteration"
+    )
+    if value["planned_outer_iterations"] != planned_outer:
+        raise ContractError("training record planned outer budget drifted from the job")
+    if value["planned_environment_steps"] != planned_steps:
+        raise ContractError("training record planned step budget drifted from the job")
+    if value["completed_environment_steps"] != completed_outer * per_outer:
+        raise ContractError("training record completed-step geometry drifted")
+    if value["promoted_environment_steps"] != promoted_outer * per_outer:
+        raise ContractError("training record promoted-step geometry drifted")
     for index, checkpoint in enumerate(checkpoints):
         if not isinstance(checkpoint, Mapping):
             raise ContractError(f"checkpoint {index} must be an object")
@@ -847,8 +873,45 @@ def _validate_success_record_mapping(
             raise ContractError("checkpoint golden raw-action parity is incomplete")
         if checkpoint["compiled_parity"].get("next_keys_equal") is not True:
             raise ContractError("checkpoint compiled PRNG-key parity is incomplete")
-    if observed_outers != expected_outers:
-        raise ContractError("checkpoint export set differs from the frozen protocol")
+    expected_observed = (
+        expected_outers
+        if value["state"] == "succeeded"
+        else [outer for outer in expected_outers if outer <= completed_outer]
+    )
+    if observed_outers != expected_observed:
+        raise ContractError("checkpoint export set differs from the terminal protocol prefix")
+    if observed_outers[-1] != promoted_outer:
+        raise ContractError("promoted checkpoint is not the last validated checkpoint")
+    failure = value["terminal_failure"]
+    if value["state"] == "succeeded":
+        if failure is not None:
+            raise ContractError("succeeded training cannot retain failure metadata")
+        if not (
+            completed_outer == promoted_outer == planned_outer
+            and value["completed_environment_steps"]
+            == value["promoted_environment_steps"]
+            == planned_steps
+        ):
+            raise ContractError("succeeded training did not promote the frozen final budget")
+    else:
+        if protocol["checkpoint_rule"] != "fixed_ladder":
+            raise ContractError("numerical recovery requires a fixed_ladder protocol")
+        if not (promoted_outer <= completed_outer < planned_outer):
+            raise ContractError("recovered training outer-iteration provenance is inconsistent")
+        if not isinstance(failure, Mapping):
+            raise ContractError("recovered training has no numerical failure metadata")
+        require_exact_keys(
+            failure,
+            {"type", "message", "traceback_file", "traceback_sha256"},
+            "recovered terminal failure",
+        )
+        if failure["type"] != "NumericalIntegrityError":
+            raise ContractError("only NumericalIntegrityError may be recovered")
+        if not isinstance(failure["message"], str) or not failure["message"]:
+            raise ContractError("recovered failure message must be non-empty")
+        if failure["traceback_file"] != "recovery_traceback.txt":
+            raise ContractError("recovered failure trace path is not canonical")
+        require_digest(failure["traceback_sha256"], "recovered failure trace digest")
     for key in ("started_at", "finished_at"):
         if not isinstance(value[key], str) or not value[key]:
             raise ContractError(f"training record {key} must be non-empty")
@@ -962,6 +1025,13 @@ def _validate_formal_attempt_root(
         path = root / name
         if load_strict_json(path) != expected:
             raise ContractError(f"supplied {name} differs from immutable attempt bytes")
+    if training_record["state"] == "recovered":
+        failure = training_record["terminal_failure"]
+        trace_path = root / failure["traceback_file"]
+        if not trace_path.is_file():
+            raise ContractError("recovered attempt is missing its immutable failure trace")
+        if sha256_file(trace_path) != failure["traceback_sha256"]:
+            raise ContractError("recovered attempt failure trace digest mismatch")
     if load_strict_json(root.parent / "job_manifest.json") != server_job:
         raise ContractError("formal attempt job root differs from the server job")
     if AnchorManifest.from_path(server_job["anchor_manifest_path"]).to_dict() != anchor.to_dict():
@@ -1114,10 +1184,12 @@ def attestation_from_server_success(
             attempt_root=attempt_root,
         )
     final = record["checkpoint_bundles"][-1]
-    if final["outer_iteration"] != server_job["training_protocol"]["max_outer_iterations"]:
-        raise ContractError("final attested bundle is not the frozen final checkpoint")
-    if final["environment_steps"] != package_job.environment_steps:
-        raise ContractError("final bundle budget differs from the package job")
+    if record["planned_environment_steps"] != package_job.environment_steps:
+        raise ContractError("planned training budget differs from the package job")
+    if final["outer_iteration"] != record["promoted_outer_iteration"]:
+        raise ContractError("final attested bundle is not the promoted checkpoint")
+    if final["environment_steps"] != record["promoted_environment_steps"]:
+        raise ContractError("promoted bundle budget differs from the terminal record")
     checkpoints = {
         f"outer_{item['outer_iteration']:06d}": item["bundle_digest"]
         for item in record["checkpoint_bundles"]
@@ -1136,7 +1208,7 @@ def attestation_from_server_success(
         model_diff_digest=run["model_diff_digest"],
         algorithm=package_job.algorithm,
         seed=package_job.seed,
-        environment_steps=package_job.environment_steps,
+        environment_steps=final["environment_steps"],
         checkpoint_rule=package_job.checkpoint_rule,
         checkpoint_digests=checkpoints,
         bundle_digest=final["bundle_digest"],
@@ -1154,7 +1226,12 @@ def attestation_from_server_success(
         started_at=record["started_at"],
         finished_at=record["finished_at"],
         elapsed_seconds=record["wall_seconds"],
-        status="succeeded",
+        status=record["state"],
+        failure_reason=(
+            None
+            if record["terminal_failure"] is None
+            else record["terminal_failure"]["message"]
+        ),
         bundle_path=str(verified_paths[final["outer_iteration"]]),
         server_plan_binding_digest=binding["binding_digest"],
         server_training_plan_digest=plan["plan_digest"],
@@ -1162,6 +1239,22 @@ def attestation_from_server_success(
         server_attempt_digest=attempt["attempt_digest"],
         server_run_manifest_digest=run["run_manifest_digest"],
         server_training_record_digest=record["record_digest"],
+        planned_outer_iterations=record["planned_outer_iterations"],
+        completed_outer_iterations=record["completed_outer_iterations"],
+        promoted_outer_iteration=record["promoted_outer_iteration"],
+        planned_environment_steps=record["planned_environment_steps"],
+        completed_environment_steps=record["completed_environment_steps"],
+        promoted_environment_steps=record["promoted_environment_steps"],
+        failure_type=(
+            None
+            if record["terminal_failure"] is None
+            else record["terminal_failure"]["type"]
+        ),
+        failure_trace_digest=(
+            None
+            if record["terminal_failure"] is None
+            else record["terminal_failure"]["traceback_sha256"]
+        ),
     )
 
 

@@ -624,12 +624,37 @@ def _policy_attestation(raw: Any) -> Any:
     from .training import PolicyTrainingAttestation
 
     fields = set(PolicyTrainingAttestation.__dataclass_fields__)
-    values = _typed_payload(
-        raw,
-        schema="policy-learnware.v02-policy-training-attestation.v0",
-        fields=fields,
-        where="policy training attestation",
-    )
+    recovery_fields = {
+        "planned_outer_iterations",
+        "completed_outer_iterations",
+        "promoted_outer_iteration",
+        "planned_environment_steps",
+        "completed_environment_steps",
+        "promoted_environment_steps",
+        "failure_type",
+        "failure_trace_digest",
+    }
+    if not isinstance(raw, Mapping):
+        raise V02CommandError("policy training attestation must be an object")
+    schema = raw.get("schema")
+    if schema == "policy-learnware.v02-policy-training-attestation.v0":
+        legacy_fields = fields - recovery_fields
+        legacy = _typed_payload(
+            raw,
+            schema=schema,
+            fields=legacy_fields,
+            where="policy training attestation",
+        )
+        values = {**legacy, **{name: None for name in recovery_fields}}
+    elif schema == "policy-learnware.v02-policy-training-attestation.v1":
+        values = _typed_payload(
+            raw,
+            schema=schema,
+            fields=fields,
+            where="policy training attestation",
+        )
+    else:
+        raise V02CommandError("unsupported policy training attestation schema")
     attestation = PolicyTrainingAttestation(**values)
     if attestation.bundle_path is not None:
         _guard_path(attestation.bundle_path, "attested bundle path", must_exist=True)
@@ -1079,6 +1104,7 @@ def _championize_anchors(args: argparse.Namespace) -> Mapping[str, Any]:
             "selection_rows",
             "attestation_rows",
             "competence_floors",
+            "competence_mode",
             "mean_tolerance",
             "lcb_z",
             "return_contract_id",
@@ -1089,6 +1115,19 @@ def _championize_anchors(args: argparse.Namespace) -> Mapping[str, Any]:
         raise V02CommandError("unsupported championization input schema")
     if payload["config_digest"] != config.config_digest:
         raise V02CommandError("championization inputs are bound to another config")
+    if not isinstance(payload["competence_mode"], str) or payload[
+        "competence_mode"
+    ] not in {"OBSERVE", "ENFORCE"}:
+        raise V02CommandError("competence_mode must be OBSERVE or ENFORCE")
+    reviewed_mode = (
+        None
+        if config.source_championization is None
+        else config.source_championization.competence_mode
+    )
+    if reviewed_mode is not None and payload["competence_mode"] != reviewed_mode:
+        raise V02CommandError(
+            "competence_mode must equal the reviewed source championization config"
+        )
     selection = tuple(
         _source_row(row)
         for row in _mapping_rows(payload["selection_rows"], "selection rows")
@@ -1158,6 +1197,7 @@ def _championize_anchors(args: argparse.Namespace) -> Mapping[str, Any]:
             mean_tolerance=payload["mean_tolerance"],
             lcb_z=payload["lcb_z"],
             return_contract_id=payload["return_contract_id"],
+            competence_mode=payload["competence_mode"],
         )
     formal_admission = result_typed.formal_admission
     result = {
@@ -1165,6 +1205,7 @@ def _championize_anchors(args: argparse.Namespace) -> Mapping[str, Any]:
         "config_digest": payload["config_digest"],
         "input_digest": sha256_json(payload),
         "mean_tolerance": float(payload["mean_tolerance"]),
+        "competence_mode": result_typed.competence_mode,
         "passed": not result_typed.rejected_anchors,
         "selection_digest": result_typed.selection_digest,
         "selected_by_anchor": dict(result_typed.selected_by_anchor),
@@ -1389,6 +1430,7 @@ def _championization_result(path: str | Path) -> tuple[Mapping[str, Any], Any]:
             "config_digest",
             "input_digest",
             "mean_tolerance",
+            "competence_mode",
             "passed",
             "selection_digest",
             "selected_by_anchor",
@@ -1452,6 +1494,7 @@ def _championization_result(path: str | Path) -> tuple[Mapping[str, Any], Any]:
         selection_summaries=summaries,
         competence_records=competence,
         rejected_anchors=payload["rejected_anchors"],
+        competence_mode=payload["competence_mode"],
         selection_digest=_digest(payload["selection_digest"], "selection_digest"),
         attested_bundle_digests=payload["attested_bundle_digests"],
         formal_admission=formal_admission,
@@ -1459,6 +1502,7 @@ def _championization_result(path: str | Path) -> tuple[Mapping[str, Any], Any]:
     expected_selection_digest = sha256_json(
         {
             "schema": "policy-learnware.v02-championization.v0",
+            "competence_mode": typed.competence_mode,
             "mean_tolerance": float(payload["mean_tolerance"]),
             "rows": [row.to_dict() for row in summaries],
             "selected": dict(sorted(typed.selected_by_anchor.items())),

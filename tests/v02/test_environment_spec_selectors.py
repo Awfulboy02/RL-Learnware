@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import numpy as np
 import pytest
 
@@ -46,7 +47,8 @@ def _market() -> PublicMarketView:
     specs = {"anchor-a": _spec(0.0), "anchor-b": _spec(1.0), "anonymous-c": _spec(5.0)}
     entries = {
         "anchor-a": PublicMarketEntry("anchor-a", 0.9, "a" * 64),
-        "anchor-b": PublicMarketEntry("anchor-b", 0.7, "b" * 64),
+        # Below the formal 0.50 reference floor, as permitted by OBSERVE mode.
+        "anchor-b": PublicMarketEntry("anchor-b", 0.2, "b" * 64),
         "anonymous-c": PublicMarketEntry("anonymous-c", 1.0, "c" * 64),
     }
     index = RepresentationIndex(
@@ -95,6 +97,11 @@ def test_lmin_formula_uses_anonymous_full_market_and_deterministic_ranking() -> 
     assert len(result.ranking) == 3
     assert {row.opaque_id for row in result.ranking} == {"anchor-a", "anchor-b", "anonymous-c"}
     assert "environment_distance" in result.to_dict()["ranking"][0]
+    low = next(row for row in result.ranking if row.opaque_id == "anchor-b")
+    assert low.normalized_source_competence == pytest.approx(0.2)
+    assert low.log_score == pytest.approx(
+        math.log(0.2) - float(low.environment_distance) / selector.sigma
+    )
 
 
 def test_public_market_rejects_tie_token_collision() -> None:

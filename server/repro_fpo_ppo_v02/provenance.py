@@ -30,7 +30,7 @@ TRAINING_PROTOCOL_SCHEMA = "policy-learnware.v02-training-protocol.v0"
 TRAINING_JOB_SCHEMA = "policy-learnware.v02-training-job.v0"
 TRAINING_PLAN_SCHEMA = "policy-learnware.v02-training-plan.v0"
 ATTEMPT_SCHEMA = "policy-learnware.v02-training-attempt.v0"
-TRAINING_RECORD_SCHEMA = "policy-learnware.v02-training-record.v0"
+TRAINING_RECORD_SCHEMA = "policy-learnware.v02-training-record.v1"
 QUEUE_RESULT_SCHEMA = "policy-learnware.v02-queue-result.v0"
 EXECUTION_EVIDENCE_SCHEMA = "policy-learnware.v02-execution-evidence.v0"
 VENDOR_PROVENANCE_SCHEMA = "policy-learnware.v02-vendor-directory.v0"
@@ -1636,14 +1636,24 @@ def validate_success_record(
         "implementation",
         "execution_evidence_digest",
         "checkpoint_bundles",
+        "planned_outer_iterations",
+        "completed_outer_iterations",
+        "promoted_outer_iteration",
+        "planned_environment_steps",
+        "completed_environment_steps",
+        "promoted_environment_steps",
+        "terminal_failure",
         "started_at",
         "finished_at",
         "wall_seconds",
         "record_digest",
     }
     require_exact_keys(value, required, "training success record")
-    if value["schema"] != TRAINING_RECORD_SCHEMA or value["state"] != "succeeded":
-        raise ContractError("training record is not a successful v0.2 record")
+    if value["schema"] != TRAINING_RECORD_SCHEMA or value["state"] not in {
+        "succeeded",
+        "recovered",
+    }:
+        raise ContractError("training record is not an admissible v0.2 terminal record")
     if value["job_digest"] != require_digest(expected_job_digest, "expected_job_digest"):
         raise ContractError("training record belongs to another semantic job")
     require_digest(value["config_digest"], "training record.config_digest")
@@ -1694,7 +1704,68 @@ def validate_success_record(
         "training record.execution_evidence_digest",
     )
     if not isinstance(value["checkpoint_bundles"], list) or not value["checkpoint_bundles"]:
-        raise ContractError("successful training record has no checkpoint bundles")
+        raise ContractError("admissible training record has no checkpoint bundles")
+    planned_outer = _positive_int(
+        value["planned_outer_iterations"], "planned_outer_iterations"
+    )
+    completed_outer = _positive_int(
+        value["completed_outer_iterations"], "completed_outer_iterations"
+    )
+    promoted_outer = _positive_int(
+        value["promoted_outer_iteration"], "promoted_outer_iteration"
+    )
+    planned_steps = _positive_int(
+        value["planned_environment_steps"], "planned_environment_steps"
+    )
+    completed_steps = _positive_int(
+        value["completed_environment_steps"], "completed_environment_steps"
+    )
+    promoted_steps = _positive_int(
+        value["promoted_environment_steps"], "promoted_environment_steps"
+    )
+    if planned_steps % planned_outer != 0:
+        raise ContractError("training record planned geometry is not integral")
+    per_outer = planned_steps // planned_outer
+    if completed_steps != completed_outer * per_outer:
+        raise ContractError("training record completed-step geometry drifted")
+    if promoted_steps != promoted_outer * per_outer:
+        raise ContractError("training record promoted-step geometry drifted")
+    terminal_failure = value["terminal_failure"]
+    if value["state"] == "succeeded":
+        if terminal_failure is not None:
+            raise ContractError("succeeded training cannot retain terminal failure metadata")
+        if not (
+            planned_outer == completed_outer == promoted_outer
+            and planned_steps == completed_steps == promoted_steps
+        ):
+            raise ContractError("succeeded training did not promote its completed final budget")
+    else:
+        if not (promoted_outer <= completed_outer < planned_outer):
+            raise ContractError("recovered training outer-iteration provenance is inconsistent")
+        if not (promoted_steps <= completed_steps < planned_steps):
+            raise ContractError("recovered training step-budget provenance is inconsistent")
+        if not isinstance(terminal_failure, dict):
+            raise ContractError("recovered training must retain terminal failure metadata")
+        require_exact_keys(
+            terminal_failure,
+            {"type", "message", "traceback_file", "traceback_sha256"},
+            "recovered terminal failure",
+        )
+        if terminal_failure["type"] != "NumericalIntegrityError":
+            raise ContractError("only NumericalIntegrityError is recoverable")
+        if not isinstance(terminal_failure["message"], str) or not terminal_failure["message"]:
+            raise ContractError("recovered numerical failure message must be non-empty")
+        if terminal_failure["traceback_file"] != "recovery_traceback.txt":
+            raise ContractError("recovered failure trace path is not canonical")
+        require_digest(
+            terminal_failure["traceback_sha256"],
+            "recovered failure traceback_sha256",
+        )
+        trace_path = Path(path).resolve().parent / terminal_failure["traceback_file"]
+        if not trace_path.is_file():
+            raise ContractError("recovered failure trace file is missing")
+        if sha256_file(trace_path) != terminal_failure["traceback_sha256"]:
+            raise ContractError("recovered failure trace digest mismatch")
     observed_outers: list[int] = []
     for index, checkpoint in enumerate(value["checkpoint_bundles"]):
         if not isinstance(checkpoint, dict):
@@ -1721,7 +1792,11 @@ def validate_success_record(
             f"checkpoint_bundles[{index}]",
         )
         observed_outers.append(_positive_int(checkpoint["outer_iteration"], "outer_iteration"))
-        _positive_int(checkpoint["environment_steps"], "environment_steps")
+        checkpoint_steps = _positive_int(
+            checkpoint["environment_steps"], "environment_steps"
+        )
+        if checkpoint_steps != observed_outers[-1] * per_outer:
+            raise ContractError("checkpoint environment steps drifted from record geometry")
         if not isinstance(checkpoint["path"], str) or not checkpoint["path"]:
             raise ContractError("checkpoint path must be a non-empty string")
         require_digest(checkpoint["bundle_manifest_sha256"], "bundle_manifest_sha256")
@@ -1770,6 +1845,8 @@ def validate_success_record(
             raise ContractError("compiled parity must preserve next PRNG keys")
     if observed_outers != sorted(set(observed_outers)):
         raise ContractError("checkpoint outer iterations must be sorted and unique")
+    if observed_outers[-1] != promoted_outer:
+        raise ContractError("promoted checkpoint is not the final validated checkpoint")
     for key in ("started_at", "finished_at"):
         if not isinstance(value[key], str) or not value[key]:
             raise ContractError(f"training record {key} must be non-empty")

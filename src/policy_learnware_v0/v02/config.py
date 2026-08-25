@@ -16,7 +16,7 @@ import math
 from pathlib import Path
 import re
 from types import MappingProxyType
-from typing import Any, Mapping, Sequence
+from typing import Any, Literal, Mapping, Sequence
 
 import yaml
 
@@ -51,6 +51,8 @@ TARGET_REGIMES = frozenset(
     }
 )
 REVIEW_MARKERS = frozenset({"TBD", "REVIEW_REQUIRED", "[REVIEW REQUIRED]"})
+COMPETENCE_MODES = frozenset({"OBSERVE", "ENFORCE"})
+CompetenceMode = Literal["OBSERVE", "ENFORCE"]
 _SAFE_ID = re.compile(r"^[A-Za-z0-9_.:/-]+$")
 _OPAQUE_TARGET_ID = re.compile(r"^v02q-[0-9a-f]{32}$")
 _TOP_LEVEL_FIELDS = {
@@ -419,11 +421,25 @@ class SourceChampionizationConfig:
 
     mean_tolerance: float
     lcb_z: float
+    competence_mode: CompetenceMode
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "SourceChampionizationConfig":
         data = _mapping(value, "source_championization")
-        _strict(data, {"mean_tolerance", "lcb_z"}, "source_championization")
+        _strict(
+            data,
+            {"mean_tolerance", "lcb_z", "competence_mode"},
+            "source_championization",
+        )
+        mode = _string(
+            data["competence_mode"],
+            "source_championization.competence_mode",
+            safe=True,
+        )
+        if mode not in COMPETENCE_MODES:
+            raise V02ConfigError(
+                "source_championization.competence_mode must be OBSERVE or ENFORCE"
+            )
         return cls(
             mean_tolerance=_float(
                 data["mean_tolerance"],
@@ -435,10 +451,15 @@ class SourceChampionizationConfig:
                 "source_championization.lcb_z",
                 minimum=0.0,
             ),
+            competence_mode=mode,
         )
 
-    def to_dict(self) -> dict[str, float]:
-        return {"mean_tolerance": self.mean_tolerance, "lcb_z": self.lcb_z}
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "mean_tolerance": self.mean_tolerance,
+            "lcb_z": self.lcb_z,
+            "competence_mode": self.competence_mode,
+        }
 
 
 @dataclass(frozen=True)
@@ -1043,6 +1064,8 @@ def load_v02_formal_config(path: str | Path) -> V02ExperimentConfig:
 __all__ = [
     "AxisConfig",
     "BootstrapPlan",
+    "COMPETENCE_MODES",
+    "CompetenceMode",
     "FACTOR_ROLES",
     "FORMAL_V02_METHOD_IDS",
     "FORMAL_V02_TASKS",

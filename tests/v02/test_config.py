@@ -142,7 +142,11 @@ def _formal_payload() -> dict:
         "checkpoint_rule": "fixed_final_checkpoint",
         "source_eval_episodes": {"selection": 2, "attestation": 3},
         "competence_floor": {task: 0.5 for task in TASKS},
-        "source_championization": {"mean_tolerance": 0.01, "lcb_z": 1.645},
+        "source_championization": {
+            "mean_tolerance": 0.01,
+            "lcb_z": 1.645,
+            "competence_mode": "OBSERVE",
+        },
         "probe_protocol_id": _d("probe"),
         "probe_prefixes": [1, 2, 4, 8, 16, 32],
         "encoder_eval_prefixes": [1, 2, 4, 8, 16, 32, 64],
@@ -209,6 +213,7 @@ def test_formal_source_championization_is_required_and_digest_bound() -> None:
     mutations = (
         lambda value: value["source_championization"].update(mean_tolerance=0.02),
         lambda value: value["source_championization"].update(lcb_z=1.96),
+        lambda value: value["source_championization"].update(competence_mode="ENFORCE"),
         lambda value: value["source_eval_episodes"].update(selection=25),
         lambda value: value["competence_floor"].update({TASKS[0]: 0.51}),
     )
@@ -223,10 +228,16 @@ def test_formal_source_championization_is_required_and_digest_bound() -> None:
 @pytest.mark.parametrize(
     "source_championization",
     [
-        {"mean_tolerance": -0.01, "lcb_z": 1.645},
-        {"mean_tolerance": 0.01, "lcb_z": float("inf")},
-        {"mean_tolerance": 0.01},
-        {"mean_tolerance": 0.01, "lcb_z": 1.645, "unknown": 1},
+        {"mean_tolerance": -0.01, "lcb_z": 1.645, "competence_mode": "OBSERVE"},
+        {"mean_tolerance": 0.01, "lcb_z": float("inf"), "competence_mode": "OBSERVE"},
+        {"mean_tolerance": 0.01, "lcb_z": 1.645},
+        {"mean_tolerance": 0.01, "lcb_z": 1.645, "competence_mode": "OFF"},
+        {
+            "mean_tolerance": 0.01,
+            "lcb_z": 1.645,
+            "competence_mode": "OBSERVE",
+            "unknown": 1,
+        },
     ],
 )
 def test_source_championization_literals_fail_closed(source_championization) -> None:

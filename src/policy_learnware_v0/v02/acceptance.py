@@ -609,6 +609,7 @@ def _championization_digest(result: ChampionizationResult) -> str:
     return sha256_json(
         {
             "schema": "policy-learnware.v02-cpu-championization-result.v0",
+            "competence_mode": result.competence_mode,
             "selection_digest": result.selection_digest,
             "selected_by_anchor": dict(sorted(result.selected_by_anchor.items())),
             "competence_records": {
@@ -1117,6 +1118,7 @@ def run_cpu_acceptance_fixture(
         mean_tolerance=0.0,
         lcb_z=None,
         return_contract_id=_fixture_digest("dmc-normalized-return-contract"),
+        competence_mode="OBSERVE",
     )
     abi = _execution_abi()
     execution_abis = {
@@ -1508,11 +1510,16 @@ def run_cpu_acceptance_fixture(
         "attestation_environment_identity": True,
         "all_attestations_admitted": len(admitted) == 20,
         "ten_anchor_champions": len(championization.competence_records) == 10,
+        "competence_mode_is_observe": championization.competence_mode == "OBSERVE",
         "anonymous_market_has_10_entries": len(market.entries) == 10,
     }
     market_checks = {
         "engineering_prerequisite": all(engineering_checks.values()),
-        "all_specialists_above_absolute_floor": not championization.rejected_anchors,
+        "all_source_competence_attested": (
+            set(championization.competence_records)
+            == set(championization.selected_by_anchor)
+            and not championization.rejected_anchors
+        ),
         "development_selection_value": market_value,
         "two_task_two_axis_coverage": len({item.task_id for item in queries}) == 2
         and len({(item.task_id, item.axis_id) for item in queries}) == 4,

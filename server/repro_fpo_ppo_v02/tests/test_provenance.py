@@ -13,6 +13,7 @@ from repro_fpo_ppo_v02.provenance import (
     atomic_write_json,
     assert_finite_mapping,
     load_strict_json,
+    sha256_file,
     sha256_json,
     validate_success_record,
     validate_policy_bundle,
@@ -90,6 +91,13 @@ class ProvenanceTests(unittest.TestCase):
                     "implementation": implementation,
                     "execution_evidence_digest": "f" * 64,
                     "checkpoint_bundles": [checkpoint],
+                    "planned_outer_iterations": 1,
+                    "completed_outer_iterations": 1,
+                    "promoted_outer_iteration": 1,
+                    "planned_environment_steps": 128,
+                    "completed_environment_steps": 128,
+                    "promoted_environment_steps": 128,
+                    "terminal_failure": None,
                     "started_at": "synthetic-start",
                     "finished_at": "synthetic-finish",
                     "wall_seconds": 0.1,
@@ -108,6 +116,70 @@ class ProvenanceTests(unittest.TestCase):
             )
             atomic_write_json(path, forged)
             with self.assertRaisesRegex(ContractError, "golden_parity did not pass"):
+                validate_success_record(path, expected_job_digest="a" * 64)
+
+    def test_numerical_recovery_records_actual_prefix_budget_and_trace(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkpoint = make_bundle(root / "bundle")
+            implementation_files = {
+                label: {"bytes": 1, "sha256": sha256_json({"label": label})}
+                for label in sorted(IMPLEMENTATION_FILE_LABELS)
+            }
+            implementation_material = {
+                "schema": IMPLEMENTATION_PROVENANCE_SCHEMA,
+                "files": implementation_files,
+            }
+            implementation = {
+                **implementation_material,
+                "implementation_digest": sha256_json(implementation_material),
+            }
+            trace = root / "recovery_traceback.txt"
+            trace.write_text("synthetic numerical failure\n", encoding="utf-8")
+            record = with_self_digest(
+                {
+                    "schema": TRAINING_RECORD_SCHEMA,
+                    "state": "recovered",
+                    "config_digest": "0" * 64,
+                    "execution_purpose": "v02_freeze_ready",
+                    "job_digest": "a" * 64,
+                    "attempt_digest": "b" * 64,
+                    "anchor_manifest_digest": "c" * 64,
+                    "environment_instance_digest": "d" * 64,
+                    "training_protocol_digest": "e" * 64,
+                    "algorithm": "fpo",
+                    "seed": 0,
+                    "execution_mode": "formal_gpu",
+                    "formal_eligible": True,
+                    "implementation": implementation,
+                    "execution_evidence_digest": "f" * 64,
+                    "checkpoint_bundles": [checkpoint],
+                    "planned_outer_iterations": 3,
+                    "completed_outer_iterations": 2,
+                    "promoted_outer_iteration": 1,
+                    "planned_environment_steps": 384,
+                    "completed_environment_steps": 256,
+                    "promoted_environment_steps": 128,
+                    "terminal_failure": {
+                        "type": "NumericalIntegrityError",
+                        "message": "training_step contains non-finite values",
+                        "traceback_file": trace.name,
+                        "traceback_sha256": sha256_file(trace),
+                    },
+                    "started_at": "synthetic-start",
+                    "finished_at": "synthetic-finish",
+                    "wall_seconds": 0.1,
+                },
+                key="record_digest",
+            )
+            path = root / "training_record.json"
+            atomic_write_json(path, record, overwrite=False)
+            observed = validate_success_record(path, expected_job_digest="a" * 64)
+            self.assertEqual(observed["state"], "recovered")
+            self.assertEqual(observed["promoted_environment_steps"], 128)
+
+            trace.write_text("tampered\n", encoding="utf-8")
+            with self.assertRaisesRegex(ContractError, "trace digest mismatch"):
                 validate_success_record(path, expected_job_digest="a" * 64)
 
 

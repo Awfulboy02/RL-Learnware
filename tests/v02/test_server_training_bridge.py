@@ -21,6 +21,7 @@ from server.repro_fpo_ppo_v02.package_bridge import (
     derive_iterations_per_env,
     project_policy_training_plan,
 )
+from server.repro_fpo_ppo_v02.queue_master import validate_completed_attempt
 from server.repro_fpo_ppo_v02.implementation import inspect_implementation_inventory
 from server.repro_fpo_ppo_v02.provenance import (
     AUDIT_SMOKE_EXECUTION_MODE,
@@ -138,20 +139,21 @@ def _anchor(path: Path, *, nominal: bool = False) -> dict[str, Any]:
     return value
 
 
-def _protocol() -> dict[str, Any]:
+def _protocol(*, recovery_ladder: bool = False) -> dict[str, Any]:
+    maximum = 3 if recovery_ladder else 1
     return finalize_training_protocol(
         {
             "schema": TRAINING_PROTOCOL_SCHEMA,
             "algorithm": "ppo",
             "trainer_config": {
-                "num_timesteps": 128,
+                "num_timesteps": 128 * maximum,
                 "num_envs": 8,
                 "num_minibatches": 2,
                 "batch_size": 8,
                 "unroll_length": 8,
             },
-            "max_outer_iterations": 1,
-            "export_outer_iterations": [1],
+            "max_outer_iterations": maximum,
+            "export_outer_iterations": [1, 3] if recovery_ladder else [1],
             "evaluation": {"enabled": False, "num_envs": 1, "base_seed": 0},
             "parity": {
                 "atol": 1.0e-6,
@@ -159,7 +161,7 @@ def _protocol() -> dict[str, Any]:
                 "golden_sample_count": 8,
                 "compiled_sample_count": 2,
             },
-            "checkpoint_rule": "fixed_final",
+            "checkpoint_rule": "fixed_ladder" if recovery_ladder else "fixed_final",
         }
     )
 
@@ -175,8 +177,8 @@ def _package_job(anchor: dict[str, Any], protocol: dict[str, Any]) -> PolicyTrai
         algorithm="ppo",
         trainer_config=protocol["trainer_config"],
         seed=7,
-        environment_steps=128,
-        checkpoint_rule="fixed_final",
+        environment_steps=128 * protocol["max_outer_iterations"],
+        checkpoint_rule=protocol["checkpoint_rule"],
         trainer_commit=anchor["runtime"]["fpo_commit"],
         dependency_digest="d" * 64,
         runtime_digest=anchor["runtime_digest"],
@@ -184,7 +186,13 @@ def _package_job(anchor: dict[str, Any], protocol: dict[str, Any]) -> PolicyTrai
     )
 
 
-def _formal_binding(tmp_path: Path, anchor_id: str) -> dict[str, Any]:
+def _formal_binding(
+    tmp_path: Path,
+    anchor_id: str,
+    *,
+    training_steps: int = 128,
+    checkpoint_rule: str = "fixed_final",
+) -> dict[str, Any]:
     anchor_ids = [anchor_id]
     for index in range(29):
         candidate = sha256_json({"synthetic_formal_anchor": index})
@@ -196,8 +204,8 @@ def _formal_binding(tmp_path: Path, anchor_id: str) -> dict[str, Any]:
         seeds=[7, 8, 9],
         config_digest="0" * 64,
         algorithm="ppo",
-        training_steps=128,
-        checkpoint_rule="fixed_final",
+        training_steps=training_steps,
+        checkpoint_rule=checkpoint_rule,
     )
 
 
@@ -209,6 +217,8 @@ def _bundle(
     attempt: dict[str, Any],
     anchor: dict[str, Any],
     execution: dict[str, Any],
+    outer_iteration: int = 1,
+    environment_steps: int = 128,
 ) -> dict[str, Any]:
     root.mkdir(parents=True)
     np.savez(root / "actor.npz", layer=np.asarray([1.0, 2.0], dtype=np.float32))
@@ -273,8 +283,8 @@ def _bundle(
         "algorithm": "ppo",
         "task": anchor["task"],
         "seed": package_job.seed,
-        "outer_iteration": 1,
-        "environment_steps": package_job.environment_steps,
+        "outer_iteration": outer_iteration,
+        "environment_steps": environment_steps,
         "files": files,
     }
     atomic_write_json(root / "bundle_manifest.json", manifest, overwrite=False)
@@ -313,8 +323,8 @@ def _bundle(
         key="report_digest",
     )
     return {
-        "outer_iteration": 1,
-        "environment_steps": package_job.environment_steps,
+        "outer_iteration": outer_iteration,
+        "environment_steps": environment_steps,
         "path": str(root.resolve()),
         "bundle_manifest_sha256": manifest_file_digest,
         "bundle_manifest_digest": sha256_json(manifest),
@@ -335,6 +345,7 @@ def _evidence(
     tmp_path: Path,
     *,
     nominal: bool = False,
+    recovered: bool = False,
     execution_mode: str = FORMAL_GPU_EXECUTION_MODE,
     execution_purpose: str = FORMAL_EXECUTION_PURPOSE,
     jax_backend: str = "gpu",
@@ -342,11 +353,16 @@ def _evidence(
 ) -> dict[str, Any]:
     anchor_path = tmp_path / "anchor.json"
     anchor = _anchor(anchor_path, nominal=nominal)
-    protocol = _protocol()
+    protocol = _protocol(recovery_ladder=recovered)
     package_job = _package_job(anchor, protocol)
     package_job = replace(package_job, execution_purpose=execution_purpose)
     formal_freeze = (
-        _formal_binding(tmp_path, anchor["anchor_id"])
+        _formal_binding(
+            tmp_path,
+            anchor["anchor_id"],
+            training_steps=package_job.environment_steps,
+            checkpoint_rule=package_job.checkpoint_rule,
+        )
         if execution_purpose == FORMAL_EXECUTION_PURPOSE
         else None
     )
@@ -505,7 +521,7 @@ def _evidence(
             "num_envs": 8,
             "iterations_per_env": 16,
             "transitions_per_outer": 128,
-            "planned_environment_steps": 128,
+            "planned_environment_steps": package_job.environment_steps,
             "execution_mode": execution["execution_mode"],
             "formal_eligible": execution["formal_eligible"],
             "execution_evidence_digest": execution["execution_evidence_digest"],
@@ -521,11 +537,24 @@ def _evidence(
         attempt=attempt,
         anchor=anchor,
         execution=execution,
+        outer_iteration=1,
+        environment_steps=128,
     )
+    terminal_failure = None
+    if recovered:
+        trace_path = attempt_root / "recovery_traceback.txt"
+        trace_path.parent.mkdir(parents=True, exist_ok=True)
+        trace_path.write_text("synthetic NumericalIntegrityError\n", encoding="utf-8")
+        terminal_failure = {
+            "type": "NumericalIntegrityError",
+            "message": "training_step contains non-finite values",
+            "traceback_file": trace_path.name,
+            "traceback_sha256": sha256_file(trace_path),
+        }
     record = with_self_digest(
         {
             "schema": TRAINING_RECORD_SCHEMA,
-            "state": "succeeded",
+            "state": "recovered" if recovered else "succeeded",
             "config_digest": server_job["config_digest"],
             "execution_purpose": server_job["execution_purpose"],
             "job_digest": server_job["job_digest"],
@@ -540,6 +569,13 @@ def _evidence(
             "implementation": implementation,
             "execution_evidence_digest": execution["execution_evidence_digest"],
             "checkpoint_bundles": [checkpoint],
+            "planned_outer_iterations": protocol["max_outer_iterations"],
+            "completed_outer_iterations": 2 if recovered else 1,
+            "promoted_outer_iteration": 1,
+            "planned_environment_steps": package_job.environment_steps,
+            "completed_environment_steps": 256 if recovered else 128,
+            "promoted_environment_steps": 128,
+            "terminal_failure": terminal_failure,
             "started_at": "2026-08-24T00:00:01Z",
             "finished_at": "2026-08-24T00:00:02Z",
             "wall_seconds": 1.0,
@@ -549,6 +585,26 @@ def _evidence(
     atomic_write_json(attempt_root / "attempt_manifest.json", attempt, overwrite=False)
     atomic_write_json(attempt_root / "run_manifest.json", run_manifest, overwrite=False)
     atomic_write_json(attempt_root / "training_record.json", record, overwrite=False)
+    atomic_write_json(
+        attempt_root / "status.json",
+        {
+            "state": "recovered" if recovered else "completed",
+            "job_digest": server_job["job_digest"],
+            "attempt_digest": attempt["attempt_digest"],
+            "anchor_manifest_digest": anchor["manifest_digest"],
+            "environment_instance_digest": anchor["environment_instance_digest"],
+            "last_completed_outer": record["completed_outer_iterations"],
+            "environment_steps": record["completed_environment_steps"],
+            "planned_outer_iterations": record["planned_outer_iterations"],
+            "planned_environment_steps": record["planned_environment_steps"],
+            "promoted_outer_iteration": record["promoted_outer_iteration"],
+            "promoted_environment_steps": record["promoted_environment_steps"],
+            "terminal_failure": record["terminal_failure"],
+            "training_record_digest": record["record_digest"],
+            "exported_outer_iterations": [1],
+        },
+        overwrite=False,
+    )
     atomic_write_json(attempt_root.parent / "job_manifest.json", server_job, overwrite=False)
     queue_result = with_self_digest(
         {
@@ -609,6 +665,47 @@ def test_projection_and_success_bridge_bind_every_provenance_layer(tmp_path: Pat
     assert attestation.hardware_digest == evidence["run_manifest"]["runtime"]["hardware_digest"]
     assert attestation.model_diff_digest == evidence["anchor_manifest"]["model_diff_digest"]
     assert admit_server_success(**evidence).attestation == attestation
+
+
+def test_bridge_admits_last_validated_checkpoint_after_numerical_recovery(
+    tmp_path: Path,
+) -> None:
+    evidence = _evidence(tmp_path, recovered=True)
+    attestation = attestation_from_server_success(**evidence)
+    assert attestation.status == "recovered"
+    assert attestation.environment_steps == 128
+    assert attestation.planned_environment_steps == 384
+    assert attestation.completed_environment_steps == 256
+    assert attestation.promoted_outer_iteration == 1
+    assert attestation.failure_type == "NumericalIntegrityError"
+    assert admit_server_success(**evidence).attestation == attestation
+
+
+def test_queue_validator_accepts_exact_recovered_ladder_prefix(tmp_path: Path) -> None:
+    evidence = _evidence(tmp_path, recovered=True)
+    attempt_root = Path(
+        evidence["run_manifest"]["runtime"]["execution_evidence"]["attempt_root"]
+    )
+    record = validate_completed_attempt(
+        attempt_root,
+        evidence["server_plan"]["jobs"][0],
+        evidence["attempt_manifest"],
+        expected_vendor=evidence["run_manifest"]["runtime"]["vendor"],
+        expected_implementation=evidence["attempt_manifest"]["implementation"],
+    )
+    assert record["state"] == "recovered"
+    assert [row["outer_iteration"] for row in record["checkpoint_bundles"]] == [1]
+
+
+def test_bridge_never_recovers_contract_or_parity_failure(tmp_path: Path) -> None:
+    evidence = _evidence(tmp_path, recovered=True)
+    forged = dict(evidence["training_record"])
+    failure = dict(forged["terminal_failure"])
+    failure["type"] = "ContractError"
+    forged["terminal_failure"] = failure
+    evidence["training_record"] = _redigest(forged, "record_digest")
+    with pytest.raises(ContractError, match="only NumericalIntegrityError"):
+        attestation_from_server_success(**evidence)
 
 
 def test_formal_projection_requires_live_canonical_freeze(

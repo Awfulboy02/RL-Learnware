@@ -11,8 +11,13 @@ from unittest.mock import patch
 from repro_fpo_ppo_v02.provenance import (
     AUDIT_SMOKE_EXECUTION_MODE,
     ContractError,
+    NumericalIntegrityError,
 )
-from repro_fpo_ppo_v02.runner import _inspect_fpo_source, _runtime_provenance
+from repro_fpo_ppo_v02.runner import (
+    _inspect_fpo_source,
+    _is_recoverable_terminal_error,
+    _runtime_provenance,
+)
 
 
 class _FakeJax:
@@ -87,6 +92,37 @@ def _repository(root: Path) -> str:
 
 
 class RunnerProvenanceTests(unittest.TestCase):
+    def test_only_post_checkpoint_ladder_numerical_failure_is_recoverable(self) -> None:
+        numerical = NumericalIntegrityError("non-finite actor")
+        self.assertTrue(
+            _is_recoverable_terminal_error(
+                numerical,
+                checkpoint_rule="fixed_ladder",
+                validated_checkpoint_count=1,
+            )
+        )
+        self.assertFalse(
+            _is_recoverable_terminal_error(
+                numerical,
+                checkpoint_rule="fixed_final",
+                validated_checkpoint_count=1,
+            )
+        )
+        self.assertFalse(
+            _is_recoverable_terminal_error(
+                numerical,
+                checkpoint_rule="fixed_ladder",
+                validated_checkpoint_count=0,
+            )
+        )
+        self.assertFalse(
+            _is_recoverable_terminal_error(
+                ContractError("compiled parity failed"),
+                checkpoint_rule="fixed_ladder",
+                validated_checkpoint_count=1,
+            )
+        )
+
     def test_assume_unchanged_cannot_hide_modified_tracked_bytes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "fpo"

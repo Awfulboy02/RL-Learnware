@@ -7,6 +7,8 @@ implementations remain behind later v0.2 modules and explicit commands.
 from .config import (
     AxisConfig,
     BootstrapPlan,
+    COMPETENCE_MODES,
+    CompetenceMode,
     MultipleTestingPlan,
     SourceChampionizationConfig,
     SourceEvaluationConfig,
@@ -54,6 +56,8 @@ __all__ = [
     "AxisAnchorBinding",
     "AxisConfig",
     "BootstrapPlan",
+    "COMPETENCE_MODES",
+    "CompetenceMode",
     "EnvironmentInstanceRecord",
     "EnvironmentSpec",
     "ExecutionABIRecord",

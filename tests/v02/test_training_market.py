@@ -147,6 +147,7 @@ def test_championization_uses_disjoint_attestation_and_never_falls_back() -> Non
         mean_tolerance=0.0,
         lcb_z=None,
         return_contract_id="7" * 64,
+        competence_mode="ENFORCE",
     )
     assert result.selected_by_anchor[ANCHOR] == "candidate-a"
     assert ANCHOR in result.rejected_anchors
@@ -159,7 +160,53 @@ def test_championization_uses_disjoint_attestation_and_never_falls_back() -> Non
             mean_tolerance=0.0,
             lcb_z=None,
             return_contract_id="7" * 64,
+            competence_mode="ENFORCE",
         )
+
+
+def test_observe_keeps_low_competence_as_attested_market_metadata() -> None:
+    job = _job()
+    admitted = AdmittedTrainingRecord(job, _attestation(job))
+    selection = _rows("candidate-a", "source_selection", (1, 2), (0.9, 0.9))
+    attestation = _rows("candidate-a", "source_attestation", (101, 102), (0.2, 0.2))
+    result = championize_by_anchor(
+        selection,
+        attestation,
+        competence_floors={ANCHOR: 0.5},
+        mean_tolerance=0.0,
+        lcb_z=None,
+        return_contract_id="7" * 64,
+        competence_mode="OBSERVE",
+    )
+
+    record = result.competence_records[ANCHOR]
+    assert result.competence_mode == "OBSERVE"
+    assert not result.rejected_anchors
+    assert record.normalized_competence == pytest.approx(0.2)
+    assert record.passed is False
+
+    enforced = championize_by_anchor(
+        selection,
+        attestation,
+        competence_floors={ANCHOR: 0.5},
+        mean_tolerance=0.0,
+        lcb_z=None,
+        return_contract_id="7" * 64,
+        competence_mode="ENFORCE",
+    )
+    assert ANCHOR in enforced.rejected_anchors
+    assert result.selection_digest != enforced.selection_digest
+
+    market = build_policy_market(
+        {"candidate-a": admitted},
+        result,
+        {"candidate-a": _runtime()},
+        expected_anchor_count=1,
+        market_alias_nonce="a" * 64,
+        tie_break_nonce="b" * 64,
+    )
+    entry = next(iter(market.entries.values()))
+    assert entry.normalized_source_competence == pytest.approx(0.2)
 
 
 def test_market_has_exactly_one_public_entry_without_private_bundle_metadata() -> None:

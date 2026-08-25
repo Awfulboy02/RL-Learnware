@@ -131,6 +131,21 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _is_recoverable_terminal_error(
+    error: BaseException,
+    *,
+    checkpoint_rule: str,
+    validated_checkpoint_count: int,
+) -> bool:
+    """Only numerical collapse after an immutable ladder checkpoint is recoverable."""
+
+    return (
+        isinstance(error, NumericalIntegrityError)
+        and checkpoint_rule == "fixed_ladder"
+        and validated_checkpoint_count > 0
+    )
+
+
 def _trusted_git_executable() -> str:
     try:
         metadata = _TRUSTED_GIT.lstat()
@@ -1118,35 +1133,77 @@ def run(args: argparse.Namespace) -> None:
     started_at = utc_now()
     started = time.monotonic()
     latest_metrics: dict[str, Any] | None = None
+    last_completed_outer = 0
+    recovery_failure: dict[str, str] | None = None
+
+    def capture_numerical_recovery(
+        error: NumericalIntegrityError, *, failed_outer: int
+    ) -> dict[str, str]:
+        if not _is_recoverable_terminal_error(
+            error,
+            checkpoint_rule=protocol["checkpoint_rule"],
+            validated_checkpoint_count=len(checkpoints),
+        ):
+            raise error
+        trace_bytes = traceback.format_exc().encode("utf-8")
+        trace_path = args.run_dir / "recovery_traceback.txt"
+        atomic_write_bytes(trace_path, trace_bytes, overwrite=False)
+        failure = {
+            "type": "NumericalIntegrityError",
+            "message": str(error),
+            "traceback_file": trace_path.name,
+            "traceback_sha256": hashlib.sha256(trace_bytes).hexdigest(),
+        }
+        append_jsonl(
+            events_path,
+            {
+                "event": "numerical_failure_recovery_started",
+                "at": utc_now(),
+                "failed_outer_iteration": failed_outer,
+                "last_completed_outer": last_completed_outer,
+                "promoted_outer_iteration": checkpoints[-1]["outer_iteration"],
+                "failure_type": failure["type"],
+                "failure_message": failure["message"],
+                "failure_trace_digest": failure["traceback_sha256"],
+            },
+        )
+        return failure
+
     for index in range(maximum):
         outer = index + 1
         step_started = time.monotonic()
-        if rollout_state.env is not bound.env or agent_state.env is not bound.env:
-            raise AnchorBindingError("training state escaped the bound source-anchor env")
-        rollout_state, transitions = rollout_state.rollout(
-            agent_state,
-            episode_length=config.episode_length,
-            iterations_per_env=config.iterations_per_env,
-        )
-        if int(transitions.reward.size) != per_outer:
-            raise RuntimeError("native transition geometry drifted during training")
-        agent_state, optimizer_metrics = agent_state.training_step(transitions)
-        summary = _reduce_train_metrics(jax, jnp, transitions, optimizer_metrics)
-        _assert_policy_state_finite(jax, agent_state)
-        elapsed = time.monotonic() - step_started
-        if not math.isfinite(elapsed) or elapsed <= 0.0:
-            raise NumericalIntegrityError("outer elapsed time is invalid")
-        environment_steps = outer * per_outer
-        summary.update(
-            {
-                "outer_iteration": outer,
-                "environment_steps": environment_steps,
-                "optimizer_minibatch_steps": int(jax.device_get(agent_state.steps)),
-                "elapsed_seconds": elapsed,
-                "environment_steps_per_second": per_outer / elapsed,
-            }
-        )
-        assert_finite_mapping(summary, where="outer_summary")
+        try:
+            if rollout_state.env is not bound.env or agent_state.env is not bound.env:
+                raise AnchorBindingError("training state escaped the bound source-anchor env")
+            rollout_state, transitions = rollout_state.rollout(
+                agent_state,
+                episode_length=config.episode_length,
+                iterations_per_env=config.iterations_per_env,
+            )
+            if int(transitions.reward.size) != per_outer:
+                raise RuntimeError("native transition geometry drifted during training")
+            agent_state, optimizer_metrics = agent_state.training_step(transitions)
+            summary = _reduce_train_metrics(jax, jnp, transitions, optimizer_metrics)
+            _assert_policy_state_finite(jax, agent_state)
+            elapsed = time.monotonic() - step_started
+            if not math.isfinite(elapsed) or elapsed <= 0.0:
+                raise NumericalIntegrityError("outer elapsed time is invalid")
+            environment_steps = outer * per_outer
+            summary.update(
+                {
+                    "outer_iteration": outer,
+                    "environment_steps": environment_steps,
+                    "optimizer_minibatch_steps": int(jax.device_get(agent_state.steps)),
+                    "elapsed_seconds": elapsed,
+                    "environment_steps_per_second": per_outer / elapsed,
+                }
+            )
+            assert_finite_mapping(summary, where="outer_summary")
+        except NumericalIntegrityError as error:
+            recovery_failure = capture_numerical_recovery(
+                error, failed_outer=outer
+            )
+            break
         append_jsonl(events_path, {"event": "train_outer_completed", "at": utc_now(), **summary})
         latest_metrics = summary
         if outer in export_outers:
@@ -1155,13 +1212,21 @@ def run(args: argparse.Namespace) -> None:
             if eval_contract["enabled"]:
                 if agent_state.env is not bound.env:
                     raise AnchorBindingError("evaluator actor is not bound to source-anchor env")
-                outputs = rollouts.eval_policy(
-                    agent_state,
-                    prng=jax.random.fold_in(jax.random.key(eval_contract["base_seed"]), outer),
-                    num_envs=eval_contract["num_envs"],
-                    max_episode_length=config.episode_length,
-                )
-                evaluation = _reduce_eval_metrics(jax, outputs)
+                try:
+                    outputs = rollouts.eval_policy(
+                        agent_state,
+                        prng=jax.random.fold_in(
+                            jax.random.key(eval_contract["base_seed"]), outer
+                        ),
+                        num_envs=eval_contract["num_envs"],
+                        max_episode_length=config.episode_length,
+                    )
+                    evaluation = _reduce_eval_metrics(jax, outputs)
+                except NumericalIntegrityError as error:
+                    recovery_failure = capture_numerical_recovery(
+                        error, failed_outer=outer
+                    )
+                    break
                 append_jsonl(
                     events_path,
                     {
@@ -1181,32 +1246,39 @@ def run(args: argparse.Namespace) -> None:
                 )
             golden_observations = transitions.obs[0, :golden_batch]
             golden_seed = (1_000_003 + int(job["seed"]) * 10_007 + outer) % (2**31 - 1)
-            checkpoint = _publish_checkpoint(
-                args=args,
-                export_policy_bundle=export_policy_bundle,
-                job=job,
-                attempt=attempt,
-                anchor=anchor,
-                bound=bound,
-                runtime=runtime,
-                agent_state=agent_state,
-                config_payload=config_payload,
-                outer=outer,
-                environment_steps=environment_steps,
-                evaluation=evaluation,
-                golden_observations=golden_observations,
-                golden_seed=golden_seed,
-                jax=jax,
-                jdc=jdc,
-                jnp=jnp,
-                fpo=fpo,
-                ppo=ppo,
-            )
+            try:
+                checkpoint = _publish_checkpoint(
+                    args=args,
+                    export_policy_bundle=export_policy_bundle,
+                    job=job,
+                    attempt=attempt,
+                    anchor=anchor,
+                    bound=bound,
+                    runtime=runtime,
+                    agent_state=agent_state,
+                    config_payload=config_payload,
+                    outer=outer,
+                    environment_steps=environment_steps,
+                    evaluation=evaluation,
+                    golden_observations=golden_observations,
+                    golden_seed=golden_seed,
+                    jax=jax,
+                    jdc=jdc,
+                    jnp=jnp,
+                    fpo=fpo,
+                    ppo=ppo,
+                )
+            except NumericalIntegrityError as error:
+                recovery_failure = capture_numerical_recovery(
+                    error, failed_outer=outer
+                )
+                break
             checkpoints.append(checkpoint)
             append_jsonl(
                 events_path,
                 {"event": "checkpoint_published", "at": utc_now(), **checkpoint},
             )
+        last_completed_outer = outer
         atomic_write_json(
             status_path,
             {
@@ -1230,9 +1302,14 @@ def run(args: argparse.Namespace) -> None:
         )
     expected_exports = list(protocol["export_outer_iterations"])
     observed_exports = [item["outer_iteration"] for item in checkpoints]
-    if observed_exports != expected_exports:
+    expected_observed = (
+        expected_exports
+        if recovery_failure is None
+        else [item for item in expected_exports if item <= last_completed_outer]
+    )
+    if observed_exports != expected_observed:
         raise RuntimeError(
-            f"checkpoint export set mismatch: observed={observed_exports}, expected={expected_exports}"
+            f"checkpoint export set mismatch: observed={observed_exports}, expected={expected_observed}"
         )
     _assert_source_unchanged(
         args.fpo_root, anchor, runtime, where="before final success publication"
@@ -1240,10 +1317,12 @@ def run(args: argparse.Namespace) -> None:
     bound.verify()
     finished_at = utc_now()
     wall_seconds = time.monotonic() - started
+    promoted = checkpoints[-1]
+    terminal_state = "succeeded" if recovery_failure is None else "recovered"
     record = with_self_digest(
         {
             "schema": TRAINING_RECORD_SCHEMA,
-            "state": "succeeded",
+            "state": terminal_state,
             "config_digest": job["config_digest"],
             "execution_purpose": job["execution_purpose"],
             "job_digest": job["job_digest"],
@@ -1258,6 +1337,13 @@ def run(args: argparse.Namespace) -> None:
             "implementation": implementation,
             "execution_evidence_digest": execution["execution_evidence_digest"],
             "checkpoint_bundles": checkpoints,
+            "planned_outer_iterations": maximum,
+            "completed_outer_iterations": last_completed_outer,
+            "promoted_outer_iteration": promoted["outer_iteration"],
+            "planned_environment_steps": maximum * per_outer,
+            "completed_environment_steps": last_completed_outer * per_outer,
+            "promoted_environment_steps": promoted["environment_steps"],
+            "terminal_failure": recovery_failure,
             "started_at": started_at,
             "finished_at": finished_at,
             "wall_seconds": wall_seconds,
@@ -1266,20 +1352,26 @@ def run(args: argparse.Namespace) -> None:
     )
     atomic_write_json(args.run_dir / "training_record.json", record, overwrite=False)
     completed = {
-        "state": "completed",
+        "state": "completed" if recovery_failure is None else "recovered",
         "job_digest": job["job_digest"],
         "attempt_digest": attempt["attempt_digest"],
         "anchor_manifest_digest": anchor.manifest_digest,
         "environment_instance_digest": anchor.environment_instance_digest,
-        "last_completed_outer": maximum,
-        "environment_steps": maximum * per_outer,
+        "last_completed_outer": last_completed_outer,
+        "environment_steps": last_completed_outer * per_outer,
+        "planned_outer_iterations": maximum,
+        "planned_environment_steps": maximum * per_outer,
+        "promoted_outer_iteration": promoted["outer_iteration"],
+        "promoted_environment_steps": promoted["environment_steps"],
+        "terminal_failure": recovery_failure,
         "latest_metrics": latest_metrics,
         "exported_outer_iterations": observed_exports,
         "training_record_digest": record["record_digest"],
         "wall_seconds": wall_seconds,
         "updated_at": finished_at,
     }
-    append_jsonl(events_path, {"event": "run_completed", "at": finished_at, **completed})
+    terminal_event = "run_completed" if recovery_failure is None else "run_recovered"
+    append_jsonl(events_path, {"event": terminal_event, "at": finished_at, **completed})
     atomic_write_json(status_path, completed)
 
 

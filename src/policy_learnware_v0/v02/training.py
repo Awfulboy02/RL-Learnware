@@ -10,7 +10,7 @@ from typing import Any, Iterable, Literal, Mapping, Sequence
 from ..hashing import canonicalize, sha256_json
 
 
-TrainingStatus = Literal["planned", "running", "succeeded", "failed"]
+TrainingStatus = Literal["planned", "running", "succeeded", "recovered", "failed"]
 ExecutionPurpose = Literal[
     "audit_smoke", "development_discovery", "v02_freeze_ready"
 ]
@@ -180,6 +180,14 @@ class PolicyTrainingAttestation:
     server_attempt_digest: str | None = None
     server_run_manifest_digest: str | None = None
     server_training_record_digest: str | None = None
+    planned_outer_iterations: int | None = None
+    completed_outer_iterations: int | None = None
+    promoted_outer_iteration: int | None = None
+    planned_environment_steps: int | None = None
+    completed_environment_steps: int | None = None
+    promoted_environment_steps: int | None = None
+    failure_type: str | None = None
+    failure_trace_digest: str | None = None
 
     def __post_init__(self) -> None:
         for name in (
@@ -254,11 +262,79 @@ class PolicyTrainingAttestation:
         if not math.isfinite(elapsed) or elapsed < 0.0:
             raise ValueError("elapsed_seconds must be finite and non-negative")
         object.__setattr__(self, "elapsed_seconds", elapsed)
-        if self.status not in {"planned", "running", "succeeded", "failed"}:
+        if self.status not in {
+            "planned",
+            "running",
+            "succeeded",
+            "recovered",
+            "failed",
+        }:
             raise ValueError(f"invalid training status: {self.status!r}")
-        if self.status == "succeeded":
+        outer_values = (
+            self.planned_outer_iterations,
+            self.completed_outer_iterations,
+            self.promoted_outer_iteration,
+        )
+        step_values = (
+            self.planned_environment_steps,
+            self.completed_environment_steps,
+            self.promoted_environment_steps,
+        )
+        if any(value is not None for value in outer_values):
+            if not all(value is not None for value in outer_values):
+                raise ValueError("terminal outer-iteration provenance must be complete")
+            for name, value in zip(
+                (
+                    "planned_outer_iterations",
+                    "completed_outer_iterations",
+                    "promoted_outer_iteration",
+                ),
+                outer_values,
+                strict=True,
+            ):
+                object.__setattr__(self, name, _positive_int(value, name))
+        if any(value is not None for value in step_values):
+            if not all(value is not None for value in step_values):
+                raise ValueError("terminal environment-step provenance must be complete")
+            for name, value in zip(
+                (
+                    "planned_environment_steps",
+                    "completed_environment_steps",
+                    "promoted_environment_steps",
+                ),
+                step_values,
+                strict=True,
+            ):
+                object.__setattr__(self, name, _positive_int(value, name))
+        if (any(value is not None for value in outer_values)) is not (
+            any(value is not None for value in step_values)
+        ):
+            raise ValueError("outer and environment-step terminal provenance must travel together")
+        if outer_values[0] is not None:
+            if self.planned_environment_steps % self.planned_outer_iterations != 0:
+                raise ValueError("terminal training geometry must be integral")
+            steps_per_outer = (
+                self.planned_environment_steps // self.planned_outer_iterations
+            )
+            if (
+                self.completed_environment_steps
+                != self.completed_outer_iterations * steps_per_outer
+                or self.promoted_environment_steps
+                != self.promoted_outer_iteration * steps_per_outer
+            ):
+                raise ValueError("terminal outer/step provenance geometry is inconsistent")
+        if self.failure_type is not None:
+            object.__setattr__(self, "failure_type", _nonempty(self.failure_type, "failure_type"))
+        if self.failure_trace_digest is not None:
+            object.__setattr__(
+                self,
+                "failure_trace_digest",
+                _digest(self.failure_trace_digest, "failure_trace_digest"),
+            )
+        if self.status in {"succeeded", "recovered"}:
             if self.failure_reason is not None:
-                raise ValueError("succeeded training cannot have a failure_reason")
+                if self.status == "succeeded":
+                    raise ValueError("succeeded training cannot have a failure_reason")
             if not (
                 self.all_arrays_finite
                 and self.golden_parity_passed
@@ -272,6 +348,47 @@ class PolicyTrainingAttestation:
             }
             if len(identities) != 1:
                 raise ValueError("train/eval actual environment digest differs from the anchor")
+            if self.status == "succeeded":
+                if self.failure_type is not None or self.failure_trace_digest is not None:
+                    raise ValueError("succeeded training cannot retain recovery failure metadata")
+                if outer_values[0] is not None and not (
+                    self.planned_outer_iterations
+                    == self.completed_outer_iterations
+                    == self.promoted_outer_iteration
+                ):
+                    raise ValueError("succeeded training must promote the completed final outer")
+                if step_values[0] is not None and not (
+                    self.planned_environment_steps
+                    == self.completed_environment_steps
+                    == self.promoted_environment_steps
+                    == self.environment_steps
+                ):
+                    raise ValueError("succeeded training budget provenance is inconsistent")
+            else:
+                if not self.failure_reason:
+                    raise ValueError("recovered training must retain the numerical failure message")
+                if self.checkpoint_rule != "fixed_ladder":
+                    raise ValueError("recovered training requires a fixed_ladder checkpoint rule")
+                if self.failure_type != "NumericalIntegrityError":
+                    raise ValueError("only NumericalIntegrityError may produce a recovered attestation")
+                if self.failure_trace_digest is None:
+                    raise ValueError("recovered training must retain a failure trace digest")
+                if outer_values[0] is None or step_values[0] is None:
+                    raise ValueError("recovered training requires complete terminal budget provenance")
+                if not (
+                    self.promoted_outer_iteration
+                    <= self.completed_outer_iterations
+                    < self.planned_outer_iterations
+                ):
+                    raise ValueError("recovered outer iterations are inconsistent")
+                if not (
+                    self.promoted_environment_steps
+                    <= self.completed_environment_steps
+                    < self.planned_environment_steps
+                ):
+                    raise ValueError("recovered environment-step budgets are inconsistent")
+                if self.environment_steps != self.promoted_environment_steps:
+                    raise ValueError("recovered attestation environment_steps must be the promoted bundle budget")
         elif self.status == "failed" and not self.failure_reason:
             raise ValueError("failed training must retain a failure_reason")
         if self.bundle_path is not None:
@@ -296,7 +413,7 @@ class PolicyTrainingAttestation:
     def to_dict(self) -> dict[str, Any]:
         return canonicalize(
             {
-                "schema": "policy-learnware.v02-policy-training-attestation.v0",
+                "schema": "policy-learnware.v02-policy-training-attestation.v1",
                 **{name: getattr(self, name) for name in self.__dataclass_fields__},
             }
         )
@@ -308,8 +425,8 @@ class AdmittedTrainingRecord:
     attestation: PolicyTrainingAttestation
 
     def __post_init__(self) -> None:
-        if self.attestation.status != "succeeded":
-            raise ValueError("only succeeded attestations may be admitted")
+        if self.attestation.status not in {"succeeded", "recovered"}:
+            raise ValueError("only succeeded or numerically recovered attestations may be admitted")
         checks = {
             "job_id": self.job.job_id == self.attestation.job_id,
             "job_digest": self.job.digest == self.attestation.job_digest,
@@ -318,7 +435,12 @@ class AdmittedTrainingRecord:
             "environment_instance_digest": self.job.environment_instance_digest == self.attestation.declared_environment_instance_digest,
             "algorithm": self.job.algorithm == self.attestation.algorithm,
             "seed": self.job.seed == self.attestation.seed,
-            "environment_steps": self.job.environment_steps == self.attestation.environment_steps,
+            "environment_steps": (
+                self.job.environment_steps == self.attestation.environment_steps
+                if self.attestation.status == "succeeded"
+                else self.job.environment_steps
+                == self.attestation.planned_environment_steps
+            ),
             "checkpoint_rule": self.job.checkpoint_rule == self.attestation.checkpoint_rule,
             "trainer_commit": self.job.trainer_commit == self.attestation.trainer_commit,
             "dependency_digest": self.job.dependency_digest == self.attestation.dependency_digest,
