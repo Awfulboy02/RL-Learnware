@@ -118,6 +118,70 @@ def _write_smoke_config(tmp_path: Path) -> tuple[Path, object]:
     return path, candidate
 
 
+def test_verify_server_anchor_semantics_preserves_qualified_manifest_leaves(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    anchor_id = _d("qualified-leaf-anchor")
+    environment_digest = _d("qualified-leaf-environment")
+    manifest_digest = _d("qualified-leaf-manifest")
+    registry_digest = _d("qualified-leaf-registry")
+    binding_digest = _d("qualified-leaf-binding")
+    axis = SimpleNamespace(
+        axis_id="finger_joint_damping",
+        operator_id="scale_selected_model_leaf_v1",
+        leaf_allowlist=("_mjx_model.dof_damping",),
+    )
+    factor = SimpleNamespace(
+        source_anchor_id=anchor_id,
+        value=0.75,
+        is_nominal=False,
+        axis_binding_digest=binding_digest,
+    )
+    config = SimpleNamespace(
+        tasks=("FingerTurnEasy",),
+        dynamics_axes={"FingerTurnEasy": (axis,)},
+        source_factors={"FingerTurnEasy": {axis.axis_id: (factor,)}},
+    )
+    manifest = SimpleNamespace(
+        anchor_id=anchor_id,
+        task="FingerTurnEasy",
+        nominal=False,
+        factor=0.75,
+        environment_instance_digest=environment_digest,
+        manifest_digest=manifest_digest,
+        axis_binding_digest=binding_digest,
+        operator=SimpleNamespace(
+            axis_id=axis.axis_id,
+            operator_id=axis.operator_id,
+            axis_registry_digest=registry_digest,
+            mutations=(SimpleNamespace(leaf="_mjx_model.dof_damping"),),
+        ),
+    )
+
+    monkeypatch.setattr(cli, "_server_training_bridge", lambda: (None, None))
+    monkeypatch.setattr(cli, "_candidate_catalog_for_config", lambda _config: object())
+    monkeypatch.setattr(
+        cli,
+        "axis_registry_from_config",
+        lambda _config, _catalog: SimpleNamespace(digest=registry_digest),
+    )
+    from server.repro_fpo_ppo_v02.anchor_binding import AnchorManifest
+
+    monkeypatch.setattr(AnchorManifest, "from_path", lambda _path: manifest)
+
+    cli._verify_server_anchor_semantics(
+        config,
+        anchor_plan={
+            anchor_id: {
+                "environment_instance_digest": environment_digest,
+                "anchor_manifest_digest": manifest_digest,
+            }
+        },
+        anchor_paths={anchor_id: tmp_path / "anchor_manifest.json"},
+    )
+
+
 def _axis_manifest(config_path: Path) -> dict:
     config = load_v02_experiment_config(config_path)
     catalog, _ = build_candidate_axis_catalog((0.9, 1.0, 1.1))

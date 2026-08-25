@@ -396,8 +396,12 @@ def _verify_server_anchor_semantics(
             if len(rows) != 1 or manifest.operator is None:
                 raise V02CommandError("shifted source anchor must bind exactly one reviewed axis")
             _task, axis, factor = rows[0]
+            # AnchorManifest validates mutation leaves against the server's
+            # fully-qualified ``_mjx_model.*`` allowlist.  Preserve those
+            # canonical paths here; prefixing them again would make every
+            # valid shifted anchor fail the package/config semantic check.
             manifest_leaves = {
-                f"_mjx_model.{mutation.leaf}" for mutation in manifest.operator.mutations
+                mutation.leaf for mutation in manifest.operator.mutations
             }
             checks.update(
                 {
