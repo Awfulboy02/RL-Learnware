@@ -228,7 +228,12 @@ def _bundle(
         "environment_instance_digest": anchor["environment_instance_digest"],
         "operator_digest": anchor["operator_digest"],
         "model_diff_digest": anchor["model_diff_digest"],
-        "actual_bound_model_digest": anchor["expected_bound_model_digest"],
+            "actual_bound_model_digest": anchor["expected_bound_model_digest"],
+            "fpo_commit": package_job.trainer_commit,
+            "expected_fpo_commit": package_job.trainer_commit,
+            "fpo_commit_matches_expected": True,
+            "fpo_tracked_dirty": False,
+            "fpo_tracked_changes": [],
             "runtime_digest": package_job.runtime_digest,
             "implementation": attempt["implementation"],
             "execution_mode": execution["execution_mode"],
@@ -438,6 +443,10 @@ def _evidence(
         "runner_file": str(runner_path),
         "fpo_root": "/frozen/fpo",
         "fpo_commit": package_job.trainer_commit,
+        "expected_fpo_commit": package_job.trainer_commit,
+        "fpo_commit_matches_expected": True,
+        "fpo_tracked_dirty": False,
+        "fpo_tracked_changes": [],
         "runtime_contract": anchor["runtime"],
         "runtime_digest": package_job.runtime_digest,
         "vendor": vendor,
@@ -849,6 +858,18 @@ def test_bridge_rejects_hardware_and_bundle_path_drift(tmp_path: Path) -> None:
     evidence = _evidence(tmp_path / "second")
     evidence["checkpoint_paths"] = {1: tmp_path / "wrong-bundle"}
     with pytest.raises(ContractError, match="explicit checkpoint"):
+        attestation_from_server_success(**evidence)
+
+
+def test_bridge_rejects_rehashed_fpo_source_attestation_drift(tmp_path: Path) -> None:
+    evidence = _evidence(tmp_path)
+    run = dict(evidence["run_manifest"])
+    runtime = dict(run["runtime"])
+    runtime["fpo_tracked_dirty"] = True
+    runtime["fpo_tracked_changes"] = ["M tracked.py"]
+    run["runtime"] = runtime
+    evidence["run_manifest"] = _redigest(run, "run_manifest_digest")
+    with pytest.raises(ContractError, match="not clean and freeze-matched"):
         attestation_from_server_success(**evidence)
 
 

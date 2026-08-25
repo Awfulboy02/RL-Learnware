@@ -10,7 +10,12 @@ import unittest
 
 from repro_fpo_ppo_v02.generate_manifest import build_training_plan
 from repro_fpo_ppo_v02.implementation import inspect_implementation_inventory
-from repro_fpo_ppo_v02.provenance import ContractError, atomic_write_json, load_strict_json
+from repro_fpo_ppo_v02.provenance import (
+    ContractError,
+    atomic_write_json,
+    load_strict_json,
+    with_self_digest,
+)
 from repro_fpo_ppo_v02.queue_master import main as queue_main
 from repro_fpo_ppo_v02.tests.helpers import make_protocol, make_shifted_anchor
 from repro_fpo_ppo_v02.vendor import inspect_vendor_directory
@@ -111,6 +116,11 @@ run_manifest = with_self_digest(
         "implementation": implementation,
         "execution_evidence_digest": execution["execution_evidence_digest"],
         "runtime": {{
+            "fpo_commit": anchor.runtime["fpo_commit"],
+            "expected_fpo_commit": anchor.runtime["fpo_commit"],
+            "fpo_commit_matches_expected": True,
+            "fpo_tracked_dirty": False,
+            "fpo_tracked_changes": [],
             "hardware_digest": sha256_json(hardware),
             "command": sys.argv,
             "vendor": vendor,
@@ -143,6 +153,11 @@ bundle = make_bundle(
         "environment_instance_digest": anchor.environment_instance_digest,
         "operator_digest": anchor.operator_digest,
         "actual_bound_model_digest": anchor.expected_bound_model_digest,
+        "fpo_commit": anchor.runtime["fpo_commit"],
+        "expected_fpo_commit": anchor.runtime["fpo_commit"],
+        "fpo_commit_matches_expected": True,
+        "fpo_tracked_dirty": False,
+        "fpo_tracked_changes": [],
         "execution_mode": execution["execution_mode"],
         "formal_eligible": execution["formal_eligible"],
         "implementation": implementation,
@@ -335,6 +350,30 @@ class ManifestQueueTests(unittest.TestCase):
             # the immutable successful attempts rather than creating attempt_002.
             self.assertEqual(queue_main(arguments), 0)
             self.assertEqual(len(list(runs_root.glob("jobs/*/attempt_*"))), 2)
+
+            # Re-hashing a forged clean-tree claim cannot turn an old attempt
+            # into resumable success.
+            run_manifest_path = attempts[0] / "run_manifest.json"
+            original_run_manifest = run_manifest_path.read_bytes()
+            forged_run = load_strict_json(run_manifest_path)
+            forged_runtime = dict(forged_run["runtime"])
+            forged_runtime["fpo_tracked_dirty"] = True
+            forged_runtime["fpo_tracked_changes"] = ["M tracked.py"]
+            forged_run["runtime"] = forged_runtime
+            atomic_write_json(
+                run_manifest_path,
+                with_self_digest(
+                    {
+                        key: value
+                        for key, value in forged_run.items()
+                        if key != "run_manifest_digest"
+                    },
+                    key="run_manifest_digest",
+                ),
+            )
+            self.assertEqual(queue_main(arguments), 1)
+            self.assertEqual(len(list(runs_root.glob("jobs/*/attempt_*"))), 2)
+            run_manifest_path.write_bytes(original_run_manifest)
 
             exporter_bytes = legacy_policy_io.read_bytes()
             legacy_policy_io.write_text("def export_policy_bundle():\n    return 'drift'\n")

@@ -126,6 +126,33 @@ def _make_bundle(
 
 
 class BundleInventoryTest(unittest.TestCase):
+    def test_clean_fpo_attestation_is_fail_closed_field_by_field(self) -> None:
+        poisoned_values = {
+            "expected_fpo_commit": "b" * 40,
+            "fpo_commit_matches_expected": False,
+            "fpo_tracked_dirty": True,
+            "fpo_tracked_changes": ["M tracked.py"],
+        }
+        for field, poisoned in poisoned_values.items():
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as directory:
+                bundle = Path(directory) / "outer_000006"
+                _make_bundle(bundle)
+                provenance_path = bundle / "provenance.json"
+                provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+                provenance[field] = poisoned
+                _write_json(provenance_path, provenance)
+                manifest_path = bundle / "bundle_manifest.json"
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                manifest["files"]["provenance.json"] = {
+                    "bytes": provenance_path.stat().st_size,
+                    "sha256": _sha(provenance_path),
+                }
+                _write_json(manifest_path, manifest)
+                with self.assertRaisesRegex(
+                    BundleValidationError, "does not bind a clean FPO commit"
+                ):
+                    validate_bundle(bundle)
+
     def test_checksum_and_structural_validation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             bundle = Path(directory) / "outer_000006"

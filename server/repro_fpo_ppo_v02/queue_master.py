@@ -172,6 +172,17 @@ def validate_completed_attempt(
         raise ContractError("run manifest did not preserve WANDB_MODE=disabled")
     if runtime.get("python_dont_write_bytecode") != "1":
         raise ContractError("run manifest did not disable vendor bytecode writes")
+    expected_fpo_commit = anchor.runtime["fpo_commit"]
+    expected_source_attestation = {
+        "fpo_commit": expected_fpo_commit,
+        "expected_fpo_commit": expected_fpo_commit,
+        "fpo_commit_matches_expected": True,
+        "fpo_tracked_dirty": False,
+        "fpo_tracked_changes": [],
+    }
+    for key, expected in expected_source_attestation.items():
+        if runtime.get(key) != expected:
+            raise ContractError(f"run manifest FPO source attestation {key} mismatch")
     execution = runtime.get("execution_evidence")
     if not isinstance(execution, Mapping):
         raise ContractError("run manifest execution evidence is missing")
@@ -289,6 +300,7 @@ def validate_completed_attempt(
             "environment_instance_digest": anchor.environment_instance_digest,
             "operator_digest": anchor.operator_digest,
             "actual_bound_model_digest": anchor.expected_bound_model_digest,
+            **expected_source_attestation,
             "execution_mode": evidence["execution_mode"],
             "formal_eligible": evidence["formal_eligible"],
             "execution_evidence_digest": evidence["execution_evidence_digest"],

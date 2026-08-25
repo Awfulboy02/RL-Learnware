@@ -187,16 +187,35 @@ def _assert_clean_attempt_root(run_dir: Path, attempt_path: Path) -> None:
         )
 
 
-def _verify_source(fpo_root: Path, anchor: AnchorManifest) -> str:
-    dirty = _git(fpo_root, "status", "--porcelain", "--untracked-files=no")
-    if dirty is None:
+def _inspect_fpo_source(
+    fpo_root: Path, *, expected_commit: str
+) -> dict[str, Any]:
+    """Derive a consumer-compatible attestation from the live FPO checkout."""
+
+    status = _git(fpo_root, "status", "--porcelain", "--untracked-files=no")
+    if status is None:
         raise RuntimeError("cannot verify whether upstream FPO checkout is clean")
-    if dirty:
-        raise RuntimeError("upstream FPO tracked files are dirty; refusing provenance drift")
+    tracked_changes = [line for line in status.splitlines() if line]
     commit = _git(fpo_root, "rev-parse", "HEAD")
     if commit is None:
         raise RuntimeError("cannot resolve upstream FPO commit")
-    if commit != anchor.runtime["fpo_commit"]:
+    return {
+        "fpo_commit": commit,
+        "expected_fpo_commit": expected_commit,
+        "fpo_commit_matches_expected": commit == expected_commit,
+        "fpo_tracked_dirty": bool(tracked_changes),
+        "fpo_tracked_changes": tracked_changes,
+    }
+
+
+def _verify_source(fpo_root: Path, anchor: AnchorManifest) -> dict[str, Any]:
+    source = _inspect_fpo_source(
+        fpo_root, expected_commit=str(anchor.runtime["fpo_commit"])
+    )
+    if source["fpo_tracked_dirty"]:
+        raise RuntimeError("upstream FPO tracked files are dirty; refusing provenance drift")
+    commit = str(source["fpo_commit"])
+    if not source["fpo_commit_matches_expected"]:
         raise RuntimeError(
             f"upstream FPO commit mismatch: actual={commit}, frozen={anchor.runtime['fpo_commit']}"
         )
@@ -207,7 +226,7 @@ def _verify_source(fpo_root: Path, anchor: AnchorManifest) -> str:
         )
     if sha256_json(actual_runtime) != anchor.runtime_digest:
         raise RuntimeError("native runtime digest mismatch")
-    return commit
+    return source
 
 
 def _runtime_provenance(
@@ -216,10 +235,27 @@ def _runtime_provenance(
     attempt: Mapping[str, Any],
     anchor: AnchorManifest,
     jax: Any,
-    commit: str,
+    source: Mapping[str, Any],
     vendor: Mapping[str, Any],
     implementation: Mapping[str, Any],
 ) -> dict[str, Any]:
+    required_source = {
+        "fpo_commit",
+        "expected_fpo_commit",
+        "fpo_commit_matches_expected",
+        "fpo_tracked_dirty",
+        "fpo_tracked_changes",
+    }
+    if set(source) != required_source:
+        raise ContractError("FPO source attestation has an unexpected schema")
+    if (
+        source["fpo_commit"] != anchor.runtime["fpo_commit"]
+        or source["expected_fpo_commit"] != anchor.runtime["fpo_commit"]
+        or source["fpo_commit_matches_expected"] is not True
+        or source["fpo_tracked_dirty"] is not False
+        or source["fpo_tracked_changes"] != []
+    ):
+        raise ContractError("FPO source attestation is not clean and freeze-matched")
     hardware = {
         "host": socket.gethostname(),
         "platform": platform.platform(),
@@ -259,7 +295,7 @@ def _runtime_provenance(
         "runner_schema": "policy-learnware.v02-anchor-aware-runner.v0",
         "runner_file": str(Path(__file__).resolve()),
         "fpo_root": str(args.fpo_root),
-        "fpo_commit": commit,
+        **dict(source),
         "runtime_contract": dict(anchor.runtime),
         "runtime_digest": anchor.runtime_digest,
         "vendor": dict(vendor),
@@ -777,7 +813,7 @@ def run(args: argparse.Namespace) -> None:
         raise RuntimeError(
             f"non-smoke training requires GPU; backend={jax.default_backend()!r}"
         )
-    commit = _verify_source(args.fpo_root, anchor)
+    source = _verify_source(args.fpo_root, anchor)
     bound = load_and_bind_anchor(registry=registry, manifest=anchor)
     bound.verify()
     agent_state, rollout_state, config, config_payload = _build_agent_and_rollout(
@@ -804,7 +840,7 @@ def run(args: argparse.Namespace) -> None:
         attempt=attempt,
         anchor=anchor,
         jax=jax,
-        commit=commit,
+        source=source,
         vendor=vendor,
         implementation=implementation,
     )

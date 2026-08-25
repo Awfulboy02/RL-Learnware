@@ -607,6 +607,10 @@ def _validate_run_manifest(
             "runner_file",
             "fpo_root",
             "fpo_commit",
+            "expected_fpo_commit",
+            "fpo_commit_matches_expected",
+            "fpo_tracked_dirty",
+            "fpo_tracked_changes",
             "runtime_contract",
             "runtime_digest",
             "vendor",
@@ -662,6 +666,13 @@ def _validate_run_manifest(
         raise ContractError("run runtime digest differs from the package job")
     if runtime["fpo_commit"] != package_job.trainer_commit:
         raise ContractError("run trainer commit differs from the package job")
+    if (
+        runtime["expected_fpo_commit"] != package_job.trainer_commit
+        or runtime["fpo_commit_matches_expected"] is not True
+        or runtime["fpo_tracked_dirty"] is not False
+        or runtime["fpo_tracked_changes"] != []
+    ):
+        raise ContractError("run FPO source attestation is not clean and freeze-matched")
     if (
         attempt["execution_mode"] != FORMAL_GPU_EXECUTION_MODE
         or attempt["formal_eligible"] is not True
@@ -957,6 +968,11 @@ def _validate_checkpoint_bytes(
         "operator_digest": anchor.operator_digest,
         "model_diff_digest": anchor.model_diff_digest,
         "actual_bound_model_digest": anchor.expected_bound_model_digest,
+        "fpo_commit": anchor.runtime["fpo_commit"],
+        "expected_fpo_commit": anchor.runtime["fpo_commit"],
+        "fpo_commit_matches_expected": True,
+        "fpo_tracked_dirty": False,
+        "fpo_tracked_changes": [],
         "runtime_digest": anchor.runtime_digest,
         "implementation": attempt["implementation"],
         "execution_mode": execution["execution_mode"],
