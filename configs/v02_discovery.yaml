@@ -9,7 +9,7 @@ tasks:
   - CheetahRun
   - FingerTurnEasy
   - FishSwim
-  - HopperHop
+  - ReacherEasy
   - WalkerWalk
 dynamics_axes: {}
 source_factors: {}

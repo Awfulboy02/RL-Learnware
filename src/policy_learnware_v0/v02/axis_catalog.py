@@ -38,7 +38,7 @@ V02_TASKS = (
     "CheetahRun",
     "FingerTurnEasy",
     "FishSwim",
-    "HopperHop",
+    "ReacherEasy",
     "WalkerWalk",
 )
 BACKEND_ID = "mujoco_playground.registry"
@@ -344,35 +344,35 @@ def build_candidate_axis_catalog(
 
     add(
         _mass_entry(
-            axis_id="hopper_mass_inertia",
-            task_id="HopperHop",
-            indices=(1, 2, 3, 4, 5),
+            axis_id="reacher_arm_mass_inertia",
+            task_id="ReacherEasy",
+            indices=(1, 2, 3),
             factors=factors,
         ),
-        label="all articulated hopper bodies coupled mass/inertia",
-        names=("torso", "pelvis", "thigh", "calf", "foot"),
+        label="reacher arm, hand, and finger coupled mass/inertia",
+        names=("arm", "hand", "finger"),
         position="recommended axis A",
     )
     add(
         _gain_entry(
-            axis_id="hopper_actuator_gain",
-            task_id="HopperHop",
-            indices=(0, 1, 2, 3),
+            axis_id="reacher_actuator_gain",
+            task_id="ReacherEasy",
+            indices=(0, 1),
             factors=factors,
         ),
-        label="all hopper actuator gains",
-        names=("waist", "hip", "knee", "ankle"),
+        label="shoulder and wrist actuator gains",
+        names=("shoulder", "wrist"),
         position="candidate axis B",
     )
     add(
-        _friction_entry(
-            axis_id="hopper_ground_contact_friction",
-            task_id="HopperHop",
-            indices=(0, 6),
+        _damping_entry(
+            axis_id="reacher_joint_damping",
+            task_id="ReacherEasy",
+            indices=(0, 1),
             factors=factors,
         ),
-        label="floor and foot contact friction",
-        names=("floor", "foot"),
+        label="shoulder and wrist joint damping",
+        names=("shoulder", "wrist"),
         position="candidate axis B fallback",
     )
 

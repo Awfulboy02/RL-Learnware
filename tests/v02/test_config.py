@@ -22,7 +22,7 @@ TASKS = (
     "CheetahRun",
     "FingerTurnEasy",
     "FishSwim",
-    "HopperHop",
+    "ReacherEasy",
     "WalkerWalk",
 )
 

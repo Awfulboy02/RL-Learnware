@@ -29,6 +29,31 @@ def test_candidate_catalog_retains_review_alternatives_and_exact_names() -> None
         5,
         6,
     )
+    reacher_mass = registry.entries["reacher_arm_mass_inertia"]
+    assert evidence["reacher_arm_mass_inertia"].selected_names == (
+        "arm",
+        "hand",
+        "finger",
+    )
+    assert tuple(selection.leaf for selection in reacher_mass.selections) == (
+        "body_mass",
+        "body_inertia",
+    )
+    assert all(selection.indices == (1, 2, 3) for selection in reacher_mass.selections)
+
+    reacher_gain = registry.entries["reacher_actuator_gain"]
+    assert evidence["reacher_actuator_gain"].selected_names == ("shoulder", "wrist")
+    assert len(reacher_gain.selections) == 1
+    assert reacher_gain.selections[0].leaf == "actuator_gainprm"
+    assert reacher_gain.selections[0].indices == (0, 1)
+    assert reacher_gain.selections[0].components == (0,)
+
+    reacher_damping = registry.entries["reacher_joint_damping"]
+    assert evidence["reacher_joint_damping"].selected_names == ("shoulder", "wrist")
+    assert len(reacher_damping.selections) == 1
+    assert reacher_damping.selections[0].leaf == "dof_damping"
+    assert reacher_damping.selections[0].indices == (0, 1)
+    assert "HopperHop" not in {entry.task_id for entry in registry.entries.values()}
     assert all(make_operator(entry).supports(entry.task_id, entry.backend_id) for entry in registry.entries.values())
     # A candidate catalog is not a formal two-axis-per-task registry.
     with pytest.raises(ValueError):
@@ -42,7 +67,7 @@ def test_reviewed_subset_is_exactly_two_axes_per_task() -> None:
         "CheetahRun": ("cheetah_mass_inertia", "cheetah_actuator_gain"),
         "FingerTurnEasy": ("finger_spinner_mass_inertia", "finger_joint_damping"),
         "FishSwim": ("fish_body_mass_inertia", "fish_actuator_gain"),
-        "HopperHop": ("hopper_mass_inertia", "hopper_actuator_gain"),
+        "ReacherEasy": ("reacher_arm_mass_inertia", "reacher_actuator_gain"),
         "WalkerWalk": ("walker_mass_inertia", "walker_actuator_gain"),
     }
     formal = reviewed_axis_subset(candidates, selected)

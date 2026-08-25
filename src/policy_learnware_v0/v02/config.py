@@ -32,7 +32,7 @@ FORMAL_V02_TASKS = frozenset(
         "CheetahRun",
         "FingerTurnEasy",
         "FishSwim",
-        "HopperHop",
+        "ReacherEasy",
         "WalkerWalk",
     }
 )
