@@ -1,0 +1,30 @@
+# Formal v0.2 template. This intentionally fails until every scientific
+# REVIEW_REQUIRED/null field is human-reviewed. Paper-I sealed target IDs,
+# nonces, transitions, rankings, and oracle artifacts must remain absent.
+schema: policy-learnware.v02-experiment-config.v0
+experiment_id: null
+stage: v02_freeze_ready
+protocol_family_id: continuous-vector-mdp-v02
+tasks: []
+dynamics_axes: {}
+source_factors: {}
+development_targets: []
+confirmatory_targets: []
+safety_exact_targets: []
+primary_algorithm: null
+training_steps: null
+training_seeds: []
+checkpoint_rule: null
+source_eval_episodes: null
+competence_floor: {}
+probe_protocol_id: null
+probe_prefixes: REVIEW_REQUIRED
+encoder_eval_prefixes: REVIEW_REQUIRED
+representation_ids: REVIEW_REQUIRED
+method_ids: []
+primary_endpoint: null
+noninferiority_margin: null
+minimum_effect: null
+bootstrap_plan: null
+multiple_testing_plan: null
+artifact_root: null

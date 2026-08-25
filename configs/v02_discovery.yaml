@@ -1,0 +1,39 @@
+# RFC-only discovery scaffold.  REVIEW_REQUIRED values are intentionally not
+# executable; fill them through the audited selection ledger before running.
+schema: policy-learnware.v02-experiment-config.v0
+experiment_id: v02-development-discovery-draft
+stage: development_discovery
+protocol_family_id: continuous-vector-mdp-v02
+tasks:
+  - CartpoleSwingup
+  - CheetahRun
+  - FingerTurnEasy
+  - FishSwim
+  - HopperHop
+  - WalkerWalk
+dynamics_axes: {}
+source_factors: {}
+development_targets: []
+confirmatory_targets: []
+safety_exact_targets: []
+primary_algorithm: REVIEW_REQUIRED
+training_steps: REVIEW_REQUIRED
+training_seeds: []
+checkpoint_rule: REVIEW_REQUIRED
+source_eval_episodes: REVIEW_REQUIRED
+competence_floor: {}
+probe_protocol_id: REVIEW_REQUIRED
+probe_prefixes: [1, 2, 4, 8, 16, 32]
+encoder_eval_prefixes: [1, 2, 4, 8, 16, 32, 64]
+representation_ids:
+  - raw_transition_v02
+  - corro_v0_frozen
+  - corro_task_supcon_v02
+  - corro_anchor_supcon_v02
+method_ids: []
+primary_endpoint: REVIEW_REQUIRED
+noninferiority_margin: REVIEW_REQUIRED
+minimum_effect: REVIEW_REQUIRED
+bootstrap_plan: REVIEW_REQUIRED
+multiple_testing_plan: REVIEW_REQUIRED
+artifact_root: REVIEW_REQUIRED

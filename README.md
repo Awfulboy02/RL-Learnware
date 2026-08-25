@@ -1,4 +1,63 @@
-# Policy Learnware v0 / v0.1
+# Policy Learnware v0 / v0.1 / v0.2
+
+## v0.2：source-anchor frozen market 与 L-min sidecar
+
+v0.2 在独立 `v02` 分支上实现 dynamics-axis/anchor 环境、source-specialist
+训练 provenance、匿名全市场、replaceable `EnvironmentSpec` 表征、L-min、B0–B5
+baselines、development P/private O/reference E tables、return/regret/ranking metrics、
+hierarchical bootstrap、max-T/Holm/non-inferiority、cold/warm cost、information isolation、
+independent recompute 与不可覆写 completion。正式 v0.2 终点是
+`READY_FOR_V03_JOINT_CONFIRMATORY`，不是 Paper-I held-out 实证结论。
+
+关键边界：
+
+- public market 只有 opaque learnware ID、source competence 与独立
+  `tie_break_token`；task/reward/axis/factor/seed/bundle/runtime/ABI 均不可见；
+- 所有 selector 排完整匿名池，不按 source task 或 runtime 预筛；选择发布后，私有部署
+  才用 task-anonymous minimum `ExecutionABIRecord` 判断是否可执行；
+- source/development probe 可用于冻结 scorer 与 conventional incumbent；v0.2 CLI
+  不能实例化或读取 Paper-I sealed target、ranking 或 confirmatory oracle；
+- dynamics operator 只接受 reviewed registry 的 `axis_id + factor_id`，在 fresh native
+  environment 上做 allowlisted model mutation，并验证 identity、isolation、finite/JIT 和
+  mass–inertia coupling；
+- 服务器训练由 `server/repro_fpo_ppo_v02/` 的 digest-bound queue 执行。它没有任何
+  task/axis/factor/algorithm/seed/budget 默认值；只有 reviewed anchor manifests、training
+  protocol 与 seeds 均冻结后才会生成或启动真实 jobs。`config_digest` 与
+  `execution_purpose` 贯穿 job、attempt、checkpoint、bundle、record 与 queue result；只有
+  `v02_freeze_ready + GPU` 可以进入 formal admission，development GPU 和 CPU/debug smoke
+  均不能升级。
+- 正式 championization 精确复核 config 派生的 `30 anchors × 3 seeds` admitted grid、
+  selection/attestation episode 数和三方 bundle digest；market 数量与 ID 集合均不能由
+  调用方缩减。
+- 正式 protocol freeze 同时绑定 config 原始 bytes、四类 config projection、Git clean
+  commit 和 v0.2 package/server implementation tree；所有后续正式命令都会重验该 freeze。
+- 正式 gate/recompute 使用不可序列化的进程内 authority；裸 `true` JSON、手写 digest 或
+  重新加载的归档 report 都不能生成正式 completion。当前 formal gate evaluator registry
+  为 `0/35`、formal recompute authority loader 为 `0/8`；其中 5 个纯数据 section 已有严格
+  structural inverse，但在科学协议与 frozen runtime registry 接通前不授予 authority。因此
+  formal `READY` **明确 fail closed、不可达**，不能用 checksum-only CLI 或 development
+  adapter 冒充完成。
+- `evaluate-source-competence` 的 JSON 数值行、预计算 `EnvironmentSpec`、直接 selector
+  index/query、上传 value map 和上传 information audit 均只允许 development/audit；正式
+  路径必须等待 evaluator-owned raw episode/probe receipts 与已评审统计 literals。
+
+依赖较轻的代码验收：
+
+```bash
+PYTHONPATH=src:. pytest tests/v02 -q
+PYTHONPATH=src:. pytest server/repro_fpo_ppo_v02/tests tests/v02/test_server_training_bridge.py -q
+PYTHONPATH=src:. python scripts/run_v02_cpu_acceptance.py
+```
+
+CPU acceptance 会真实跑通 2 tasks × 5 shared-nominal anchors × 2 seeds、9 methods、
+full-pool private development oracle、metrics/cost/report，并覆盖 scientific-pass、market
+No-Go、CORRO No-Go 与 engineering-blocked 四种终态；它始终带
+`formal_completion_claimed=false`，只验代码链路，不替代六任务正式实验。
+
+`configs/v02_discovery.yaml` 与 `configs/v02_freeze_ready.yaml` 是 fail-closed RFC
+模板；其中 `REVIEW_REQUIRED/null` 字段未经过研究者冻结时，`validate-config`、
+`freeze-run` 和 `plan-training` 必须拒绝执行。`configs/paper1_joint_confirmatory.yaml`
+属于后续唯一 joint orchestrator 的 schema 草案，不由 v0.2 CLI 执行。
 
 ## v0.1：dynamics-shift diagnostic
 

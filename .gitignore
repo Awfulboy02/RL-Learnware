@@ -26,8 +26,12 @@ dist/
 /artifacts/
 /artifacts_retry_roundoff/
 /artifacts_v01*/
+/artifacts_v02*/
+/artifacts_paper1_joint*/
 /datasets/
 /runs/
+/server/repro_fpo_ppo_v02/runs/
+/server/repro_fpo_ppo_v02/*.log
 /checkpoints/
 /policy_bundles/
 /frozen_policies/

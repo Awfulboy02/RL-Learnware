@@ -1,0 +1,17 @@
+# Joint v0.2/v0.3 RFC template. This file is not executable by the v0.2 CLI.
+# The single Paper-I orchestrator may instantiate it only after both freeze
+# references and the complete method/representation set exist.
+schema: policy-learnware.paper1-joint-config.v0
+stage: paper1_joint_confirmatory
+joint_experiment_id: null
+v02_freeze_ready_ref: null
+v03_representation_freeze_ref: null
+joint_nonce_ref: null
+confirmatory_targets: []
+safety_exact_targets: []
+representation_ids: []
+method_ids: []
+primary_endpoint: null
+statistics_protocol_id: null
+cost_contract_digest: null
+artifact_root: null
