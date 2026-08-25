@@ -161,6 +161,8 @@ class BundleInventoryTest(unittest.TestCase):
             provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
             provenance["fpo_commit"] = "b" * 40
             provenance["expected_fpo_commit"] = "b" * 40
+            provenance["formal_eligible"] = True
+            provenance["runtime_digest"] = "c" * 64
             _write_json(provenance_path, provenance)
             manifest_path = bundle / "bundle_manifest.json"
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -170,11 +172,23 @@ class BundleInventoryTest(unittest.TestCase):
             }
             _write_json(manifest_path, manifest)
 
-            validate_bundle(bundle)
+            with self.assertRaisesRegex(
+                BundleValidationError, "requires external commit and runtime authority"
+            ):
+                validate_bundle(bundle)
             with self.assertRaisesRegex(
                 BundleValidationError, "differs from external runtime authority"
             ):
-                validate_bundle(bundle, expected_fpo_commit="a" * 40)
+                validate_bundle(
+                    bundle,
+                    expected_fpo_commit="a" * 40,
+                    expected_runtime_digest="c" * 64,
+                )
+            validate_bundle(
+                bundle,
+                expected_fpo_commit="b" * 40,
+                expected_runtime_digest="c" * 64,
+            )
 
     def test_checksum_and_structural_validation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

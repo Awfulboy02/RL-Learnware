@@ -37,7 +37,7 @@ from .provenance import (
     validate_implementation_provenance,
     validate_policy_bundle,
     validate_queue_result,
-    validate_run_manifest_envelope,
+    validate_run_manifest_server_binding,
     validate_self_digest,
     validate_training_job,
     validate_training_plan,
@@ -493,7 +493,12 @@ def _validate_run_manifest(
     anchor: AnchorManifest,
     package_job: Any,
 ) -> dict[str, Any]:
-    value = validate_run_manifest_envelope(value)
+    value = validate_run_manifest_server_binding(
+        value,
+        job=server_job,
+        attempt=attempt,
+        anchor=anchor.to_dict(),
+    )
     expected = {
         "job": server_job,
         "job_digest": server_job["job_digest"],

@@ -290,6 +290,23 @@ def validate_bundle(
         or provenance.get("fpo_tracked_changes") != []
     ):
         raise BundleValidationError("bundle provenance does not bind a clean FPO commit")
+    formal_eligible = provenance.get("formal_eligible")
+    if formal_eligible not in {None, False, True}:
+        raise BundleValidationError("bundle formal_eligible must be boolean when present")
+    if formal_eligible is True and (
+        expected_fpo_commit is None or expected_runtime_digest is None
+    ):
+        raise BundleValidationError(
+            "formal bundle validation requires external commit and runtime authority"
+        )
+    if expected_fpo_commit is not None and re.fullmatch(
+        r"(?:[0-9a-f]{40}|[0-9a-f]{64})", expected_fpo_commit
+    ) is None:
+        raise BundleValidationError("external FPO commit authority is malformed")
+    if expected_runtime_digest is not None and re.fullmatch(
+        r"[0-9a-f]{64}", expected_runtime_digest
+    ) is None:
+        raise BundleValidationError("external runtime digest authority is malformed")
     if expected_fpo_commit is not None and fpo_commit != expected_fpo_commit:
         raise BundleValidationError(
             "bundle FPO commit differs from external runtime authority"

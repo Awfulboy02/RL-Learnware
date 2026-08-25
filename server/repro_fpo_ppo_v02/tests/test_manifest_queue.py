@@ -390,6 +390,23 @@ class ManifestQueueTests(unittest.TestCase):
             # into resumable success.
             run_manifest_path = attempts[0] / "run_manifest.json"
             original_run_manifest = run_manifest_path.read_bytes()
+            forged_binding = load_strict_json(run_manifest_path)
+            forged_binding["job_digest"] = "0" * 64
+            atomic_write_json(
+                run_manifest_path,
+                with_self_digest(
+                    {
+                        key: value
+                        for key, value in forged_binding.items()
+                        if key != "run_manifest_digest"
+                    },
+                    key="run_manifest_digest",
+                ),
+            )
+            self.assertEqual(queue_main(arguments), 1)
+            self.assertEqual(len(list(runs_root.glob("jobs/*/attempt_*"))), 2)
+            run_manifest_path.write_bytes(original_run_manifest)
+
             forged_run = load_strict_json(run_manifest_path)
             forged_runtime = dict(forged_run["runtime"])
             forged_runtime["fpo_tracked_dirty"] = True

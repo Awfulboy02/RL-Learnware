@@ -823,7 +823,7 @@ def test_bridge_rejects_rehashed_cross_object_poisoning(tmp_path: Path) -> None:
     run = dict(evidence["run_manifest"])
     run["model_diff_digest"] = "f" * 64
     evidence["run_manifest"] = _redigest(run, "run_manifest_digest")
-    with pytest.raises(ContractError, match="run manifest drifted"):
+    with pytest.raises(ContractError, match="run manifest (?:drifted|server binding mismatch)"):
         attestation_from_server_success(**evidence)
 
     evidence = _evidence(tmp_path / "geometry")
@@ -831,7 +831,7 @@ def test_bridge_rejects_rehashed_cross_object_poisoning(tmp_path: Path) -> None:
     run["num_envs"] = 16
     run["iterations_per_env"] = 8
     evidence["run_manifest"] = _redigest(run, "run_manifest_digest")
-    with pytest.raises(ContractError, match="geometry drifted from native config"):
+    with pytest.raises(ContractError, match="(?:geometry drifted from native config|geometry mismatch)"):
         attestation_from_server_success(**evidence)
 
 

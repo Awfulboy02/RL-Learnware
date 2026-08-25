@@ -528,13 +528,21 @@ class LegacyPpoFpoRuntimePlugin:
         fpo_root: str | Path,
         runtime_factory: RuntimeFactory | None = None,
         runtime_contract_factory: RuntimeContractFactory | None = None,
+        expected_fpo_commit: str | None = None,
+        expected_runtime_digest: str | None = None,
     ) -> None:
         self._fpo_root = Path(fpo_root).expanduser().resolve()
         self._runtime_factory = runtime_factory
         self._contract_factory = runtime_contract_factory
+        self._expected_fpo_commit = expected_fpo_commit
+        self._expected_runtime_digest = expected_runtime_digest
 
     def validate(self, bundle: Path) -> ValidatedPolicyBundle:
-        metadata = validate_bundle(bundle)
+        metadata = validate_bundle(
+            bundle,
+            expected_fpo_commit=self._expected_fpo_commit,
+            expected_runtime_digest=self._expected_runtime_digest,
+        )
         contract = (
             self._contract_factory(metadata)
             if self._contract_factory is not None

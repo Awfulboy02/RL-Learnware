@@ -119,6 +119,8 @@ def scan_policy_inventory(
     parity_verifier: Callable[[PolicyBundleMetadata], Any] | None = None,
     require_parity: bool = False,
     expected_job_ids: Iterable[str] | None = None,
+    expected_fpo_commit: str | None = None,
+    expected_runtime_digest: str | None = None,
 ) -> InventoryReport:
     """Scan only the queue's ``full`` phase and resolve each successful attempt.
 
@@ -175,6 +177,8 @@ def scan_policy_inventory(
                 expected_seed=seed,
                 expected_outer=checkpoint_outer,
                 expected_environment_steps=expected_environment_steps,
+                expected_fpo_commit=expected_fpo_commit,
+                expected_runtime_digest=expected_runtime_digest,
             )
             parity_passed: bool | None = None
             if parity_verifier is not None:

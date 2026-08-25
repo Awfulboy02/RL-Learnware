@@ -129,6 +129,10 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def _git(root: Path, *args: str) -> str | None:
+    environment = {
+        key: value for key, value in os.environ.items() if not key.startswith("GIT_")
+    }
+    environment["GIT_NO_REPLACE_OBJECTS"] = "1"
     try:
         result = subprocess.run(
             ["git", "-C", str(root), *args],
@@ -136,6 +140,7 @@ def _git(root: Path, *args: str) -> str | None:
             capture_output=True,
             text=True,
             timeout=20,
+            env=environment,
         )
     except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
         return None
@@ -143,12 +148,17 @@ def _git(root: Path, *args: str) -> str | None:
 
 
 def _git_raw(root: Path, *args: str) -> bytes:
+    environment = {
+        key: value for key, value in os.environ.items() if not key.startswith("GIT_")
+    }
+    environment["GIT_NO_REPLACE_OBJECTS"] = "1"
     try:
         result = subprocess.run(
             ["git", "-C", str(root), *args],
             check=True,
             capture_output=True,
             timeout=60,
+            env=environment,
         )
     except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
         raise RuntimeError(f"cannot inspect upstream FPO checkout with git {args}") from error
@@ -181,13 +191,18 @@ def _blob_object_id(data: bytes, *, object_format: str) -> str:
     return digest.hexdigest()
 
 
-def _snapshot_fpo_tree(fpo_root: Path) -> dict[str, Any]:
+def _snapshot_fpo_tree(fpo_root: Path, *, commit: str) -> dict[str, Any]:
     """Hash every tracked execution byte and expose Git status bypasses."""
 
     object_format = _git(fpo_root, "rev-parse", "--show-object-format")
     if object_format is None:
         raise RuntimeError("cannot resolve upstream FPO Git object format")
-    tree = _git_raw(fpo_root, "ls-tree", "-rz", "--full-tree", "HEAD")
+    replacement_refs = _git_raw(
+        fpo_root, "for-each-ref", "--format=%(refname)", "refs/replace"
+    ).strip()
+    if replacement_refs:
+        raise RuntimeError("upstream FPO checkout contains forbidden Git replace refs")
+    tree = _git_raw(fpo_root, "ls-tree", "-rz", "--full-tree", commit)
     head_entries: list[dict[str, Any]] = []
     worktree_entries: list[dict[str, Any]] = []
     execution_entries: list[dict[str, Any]] = []
@@ -353,12 +368,15 @@ def _inspect_fpo_source(
     commit = _git(fpo_root, "rev-parse", "HEAD")
     if commit is None:
         raise RuntimeError("cannot resolve upstream FPO commit")
-    return {
+    result = {
         "fpo_commit": commit,
         "expected_fpo_commit": expected_commit,
         "fpo_commit_matches_expected": commit == expected_commit,
-        **_snapshot_fpo_tree(fpo_root),
+        **_snapshot_fpo_tree(fpo_root, commit=commit),
     }
+    if _git(fpo_root, "rev-parse", "HEAD") != commit:
+        raise RuntimeError("upstream FPO HEAD changed during source attestation")
+    return result
 
 
 def _verify_source(fpo_root: Path, anchor: AnchorManifest) -> dict[str, Any]:

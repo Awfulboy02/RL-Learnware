@@ -291,6 +291,112 @@ def validate_run_manifest_envelope(value: Mapping[str, Any]) -> dict[str, Any]:
     return dict(value)
 
 
+def validate_run_manifest_server_binding(
+    value: Mapping[str, Any],
+    *,
+    job: Mapping[str, Any],
+    attempt: Mapping[str, Any],
+    anchor: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Bind a run envelope to its server job, attempt, anchor, and geometry."""
+
+    run = validate_run_manifest_envelope(value)
+    frozen_job = validate_training_job(job)
+    frozen_attempt = validate_attempt(attempt)
+    if frozen_attempt["job"] != frozen_job:
+        raise ContractError("run attempt embeds a different server job")
+    expected = {
+        "job": frozen_job,
+        "job_digest": frozen_job["job_digest"],
+        "attempt_digest": frozen_attempt["attempt_digest"],
+        "config_digest": frozen_job["config_digest"],
+        "execution_purpose": frozen_job["execution_purpose"],
+        "anchor_manifest": dict(anchor),
+        "anchor_manifest_digest": anchor.get("manifest_digest"),
+        "environment_instance_digest": anchor.get("environment_instance_digest"),
+        "model_diff_digest": anchor.get("model_diff_digest"),
+        "training_protocol_digest": frozen_job["training_protocol_digest"],
+        "config": frozen_job["training_protocol"]["trainer_config"],
+        "execution_mode": frozen_attempt["execution_mode"],
+        "formal_eligible": frozen_attempt["formal_eligible"],
+    }
+    failed = [key for key, item in expected.items() if run[key] != item]
+    if failed:
+        raise ContractError(f"run manifest server binding mismatch: {failed}")
+
+    operator = anchor.get("operator")
+    if operator is None:
+        changed_leaves: list[str] = []
+    elif isinstance(operator, Mapping) and isinstance(operator.get("mutations"), list):
+        changed_leaves = sorted(str(row["leaf"]) for row in operator["mutations"])
+    else:
+        raise ContractError("anchor operator is malformed in run binding")
+    audit = run["binding_audit"]
+    if not isinstance(audit, Mapping):
+        raise ContractError("run manifest binding_audit must be an object")
+    require_exact_keys(
+        audit,
+        {
+            "anchor_id",
+            "environment_instance_digest",
+            "nominal_model_digest",
+            "bound_model_digest",
+            "changed_leaves",
+            "model_diff_digest",
+            "source_unchanged",
+            "operator_digest",
+            "manifest_digest",
+        },
+        "run manifest binding audit",
+    )
+    expected_audit = {
+        "anchor_id": anchor.get("anchor_id"),
+        "environment_instance_digest": anchor.get("environment_instance_digest"),
+        "nominal_model_digest": anchor.get("expected_nominal_model_digest"),
+        "bound_model_digest": anchor.get("expected_bound_model_digest"),
+        "changed_leaves": changed_leaves,
+        "model_diff_digest": anchor.get("model_diff_digest"),
+        "source_unchanged": True,
+        "operator_digest": anchor.get("operator_digest"),
+        "manifest_digest": anchor.get("manifest_digest"),
+    }
+    failed_audit = [key for key, item in expected_audit.items() if audit[key] != item]
+    if failed_audit:
+        raise ContractError(
+            f"run manifest binding audit mismatch: {failed_audit}"
+        )
+
+    config = frozen_job["training_protocol"]["trainer_config"]
+    num_envs = _positive_int(config.get("num_envs"), "trainer_config.num_envs")
+    num_minibatches = _positive_int(
+        config.get("num_minibatches"), "trainer_config.num_minibatches"
+    )
+    batch_size = _positive_int(config.get("batch_size"), "trainer_config.batch_size")
+    unroll_length = _positive_int(
+        config.get("unroll_length"), "trainer_config.unroll_length"
+    )
+    transitions = num_minibatches * batch_size * unroll_length
+    if transitions % num_envs:
+        raise ContractError("trainer transition geometry does not divide num_envs")
+    iterations = transitions // num_envs
+    maximum = _positive_int(
+        frozen_job["training_protocol"]["max_outer_iterations"],
+        "training protocol max_outer_iterations",
+    )
+    expected_geometry = {
+        "num_envs": num_envs,
+        "iterations_per_env": iterations,
+        "transitions_per_outer": transitions,
+        "planned_environment_steps": transitions * maximum,
+    }
+    failed_geometry = [
+        key for key, item in expected_geometry.items() if run[key] != item
+    ]
+    if failed_geometry:
+        raise ContractError(f"run manifest geometry mismatch: {failed_geometry}")
+    return run
+
+
 def validate_fpo_source_attestation(
     value: Mapping[str, Any],
     *,
@@ -1784,6 +1890,7 @@ __all__ = [
     "validate_policy_bundle",
     "validate_queue_result",
     "validate_run_manifest_envelope",
+    "validate_run_manifest_server_binding",
     "validate_self_digest",
     "validate_success_record",
     "validate_training_job",

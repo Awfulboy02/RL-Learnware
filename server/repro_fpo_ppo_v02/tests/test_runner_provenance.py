@@ -110,6 +110,21 @@ class RunnerProvenanceTests(unittest.TestCase):
             observed = _inspect_fpo_source(root, expected_commit=commit)
         self.assertEqual(observed["fpo_untracked_paths"], ["untracked_runtime.py"])
 
+    def test_git_replace_ref_cannot_redirect_frozen_commit_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "fpo"
+            frozen = _repository(root)
+            (root / "tracked.py").write_text("VALUE = 'malicious'\n", encoding="utf-8")
+            _git(root, "add", "tracked.py")
+            _git(root, "commit", "-qm", "replacement")
+            replacement = _git(root, "rev-parse", "HEAD")
+            _git(root, "replace", frozen, replacement)
+            _git(root, "reset", "--hard", frozen)
+            self.assertIn("malicious", (root / "tracked.py").read_text(encoding="utf-8"))
+
+            with self.assertRaisesRegex(RuntimeError, "forbidden Git replace refs"):
+                _inspect_fpo_source(root, expected_commit=frozen)
+
     def test_runtime_provenance_carries_clean_freeze_matched_attestation(self) -> None:
         source = _clean_source()
         with tempfile.TemporaryDirectory() as directory:

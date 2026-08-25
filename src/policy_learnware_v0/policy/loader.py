@@ -278,10 +278,20 @@ def load_policy(
     *,
     fpo_root: str | Path,
     runtime_factory: RuntimeFactory | None = None,
+    expected_fpo_commit: str | None = None,
+    expected_runtime_digest: str | None = None,
 ) -> FrozenPolicy:
     """Validate a bundle and reconstruct its native upstream inference state."""
 
-    metadata = bundle if isinstance(bundle, PolicyBundleMetadata) else validate_bundle(bundle)
+    metadata = (
+        bundle
+        if isinstance(bundle, PolicyBundleMetadata)
+        else validate_bundle(
+            bundle,
+            expected_fpo_commit=expected_fpo_commit,
+            expected_runtime_digest=expected_runtime_digest,
+        )
+    )
     actor = _arrays(metadata.bundle_dir / "actor.npz")
     obs_stats = _arrays(metadata.bundle_dir / "obs_stats.npz")
     factory = runtime_factory or _default_runtime_factory

@@ -41,7 +41,7 @@ try:  # Package import for tests/``python -m``; fallback for direct script use.
         validate_implementation_provenance,
         validate_policy_bundle,
         validate_queue_result,
-        validate_run_manifest_envelope,
+        validate_run_manifest_server_binding,
         validate_success_record,
         validate_training_job,
         validate_training_plan,
@@ -74,7 +74,7 @@ except ImportError:  # pragma: no cover - exercised by executable entry points
         validate_implementation_provenance,
         validate_policy_bundle,
         validate_queue_result,
-        validate_run_manifest_envelope,
+        validate_run_manifest_server_binding,
         validate_success_record,
         validate_training_job,
         validate_training_plan,
@@ -156,8 +156,11 @@ def validate_completed_attempt(
     ):
         if record[key] != attempt[key]:
             raise ContractError(f"training record {key} drifted from the attempt")
-    run_manifest = validate_run_manifest_envelope(
-        load_strict_json(attempt_dir / "run_manifest.json")
+    run_manifest = validate_run_manifest_server_binding(
+        load_strict_json(attempt_dir / "run_manifest.json"),
+        job=job,
+        attempt=attempt,
+        anchor=anchor.to_dict(),
     )
     runtime = run_manifest.get("runtime")
     if not isinstance(runtime, Mapping):
