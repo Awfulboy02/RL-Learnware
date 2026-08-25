@@ -11,11 +11,17 @@ The live checkout/runtime are verified before the native registry is touched.
 from __future__ import annotations
 
 import argparse
+import importlib.metadata
 import math
 from pathlib import Path
 import subprocess
 import sys
 from typing import Any, Callable, Mapping, Sequence
+
+try:  # Python >=3.11; the fallback keeps dependency-light local CI usable.
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - Python 3.10 test interpreter
+    import tomli as tomllib
 
 import numpy as np
 
@@ -519,14 +525,44 @@ def _checkout_resolver(fpo_root: Path) -> CommitResolver:
     return resolve
 
 
+def verify_pinned_playground_dependency(fpo_root: Path) -> str:
+    """Require the checkout to pin the exact installed registry distribution."""
+
+    pyproject = fpo_root / "playground" / "pyproject.toml"
+    if pyproject.is_symlink() or not pyproject.is_file():
+        raise ContractError(f"FPO checkout lacks a regular playground/pyproject.toml: {fpo_root}")
+    try:
+        payload = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+        dependencies = payload["project"]["dependencies"]
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError, KeyError, TypeError) as error:
+        raise ContractError(f"cannot read FPO playground dependency pin: {error}") from error
+    if not isinstance(dependencies, list) or any(
+        not isinstance(item, str) for item in dependencies
+    ):
+        raise ContractError("FPO playground dependencies must be a TOML string array")
+    try:
+        installed = importlib.metadata.version("playground")
+    except importlib.metadata.PackageNotFoundError as error:
+        raise ContractError("installed playground distribution is unavailable") from error
+    exact = f"playground=={installed}"
+    if exact not in dependencies:
+        raise ContractError(
+            "FPO checkout does not pin the exact installed playground version: "
+            f"expected {exact!r}"
+        )
+    return installed
+
+
 def _load_native_registry(fpo_root: Path) -> Any:
     source_dir = fpo_root / "playground" / "src"
-    if not (source_dir / "mujoco_playground").is_dir():
+    if not (source_dir / "flow_policy").is_dir():
         raise ContractError(f"not a pinned FPO/GoRL checkout: {fpo_root}")
+    verify_pinned_playground_dependency(fpo_root)
     source_text = str(source_dir)
     if source_text not in sys.path:
         sys.path.insert(0, source_text)
-    # Importing the suite performs its native task registrations.
+    # The FPO commit pins ``playground==X`` while the distribution supplies the
+    # registry package; importing the suite performs its native registrations.
     from mujoco_playground import dm_control_suite, registry
 
     del dm_control_suite

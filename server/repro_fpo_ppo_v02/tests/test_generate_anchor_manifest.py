@@ -22,6 +22,7 @@ from repro_fpo_ppo_v02.generate_anchor_manifest import (
     materialize_anchor_manifest,
     materialize_anchor_manifest_file,
     validate_reviewed_anchor_spec,
+    verify_pinned_playground_dependency,
 )
 from repro_fpo_ppo_v02.provenance import ContractError, sha256_json
 
@@ -102,6 +103,47 @@ class FakeRegistry:
                 dof_damping=self.model.dof_damping.copy(),
             )
         )
+
+
+class NativeRegistryDependencyTests(unittest.TestCase):
+    def test_exact_installed_playground_pin_is_required(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "playground" / "pyproject.toml"
+            project.parent.mkdir()
+            project.write_text(
+                '[project]\nname = "fixture"\ndependencies = ["playground==0.0.5"]\n',
+                encoding="utf-8",
+            )
+            with patch(
+                "repro_fpo_ppo_v02.generate_anchor_manifest.importlib.metadata.version",
+                return_value="0.0.5",
+            ):
+                self.assertEqual(verify_pinned_playground_dependency(root), "0.0.5")
+
+            project.write_text(
+                '[project]\nname = "fixture"\ndependencies = ["playground>=0.0.5"]\n',
+                encoding="utf-8",
+            )
+            with patch(
+                "repro_fpo_ppo_v02.generate_anchor_manifest.importlib.metadata.version",
+                return_value="0.0.5",
+            ), self.assertRaisesRegex(ContractError, "does not pin the exact"):
+                verify_pinned_playground_dependency(root)
+
+    def test_playground_pin_file_must_not_be_a_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            external = root / "external.toml"
+            external.write_text(
+                '[project]\nname = "fixture"\ndependencies = ["playground==0.0.5"]\n',
+                encoding="utf-8",
+            )
+            project = root / "playground" / "pyproject.toml"
+            project.parent.mkdir()
+            project.symlink_to(external)
+            with self.assertRaisesRegex(ContractError, "regular playground"):
+                verify_pinned_playground_dependency(root)
 
 
 def model(*, poison: bool = False) -> CoupledModel:

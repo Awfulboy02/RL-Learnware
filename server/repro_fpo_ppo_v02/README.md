@@ -62,6 +62,11 @@ python -m repro_fpo_ppo_v02.generate_anchor_manifest \
   --output /absolute/immutable/source-anchor-manifest.json
 ```
 
+The FPO checkout may provide `flow_policy` while the GoRL environment provides
+the `mujoco_playground` module. In that layout the materializer parses the
+tracked `playground/pyproject.toml` and requires its exact `playground==X` pin
+to equal the installed distribution version before importing the registry.
+
 For shifted anchors the reviewed specification must contain the exact model
 leaf/flat-index allowlist and a package-side axis-binding digest. The
 materializer opens a fresh native environment, mutates only those elements,
