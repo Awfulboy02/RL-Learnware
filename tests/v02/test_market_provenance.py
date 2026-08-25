@@ -152,8 +152,8 @@ def test_formal_championization_binds_config_grid_episodes_floors_and_bundles() 
         admitted,
         selection,
         attestation,
-        mean_tolerance=0.0,
-        lcb_z=None,
+        mean_tolerance=config.source_championization.mean_tolerance,
+        lcb_z=config.source_championization.lcb_z,
         return_contract_id=_d("return-contract"),
     )
     binding = result.formal_admission
@@ -181,6 +181,32 @@ def test_formal_championization_binds_config_grid_episodes_floors_and_bundles() 
     assert set(market.anchor_to_opaque_id) == set(config.source_anchor_ids)
 
 
+@pytest.mark.parametrize(
+    ("mean_tolerance", "lcb_z", "match"),
+    [
+        (0.02, 1.645, "mean_tolerance differs"),
+        (0.01, 1.96, "lcb_z differs"),
+        (0.01, None, "lcb_z differs"),
+    ],
+)
+def test_formal_championization_rejects_protocol_override(
+    mean_tolerance: float,
+    lcb_z: float | None,
+    match: str,
+) -> None:
+    config, admitted, selection, attestation = _formal_case()
+    with pytest.raises(ValueError, match=match):
+        admit_formal_championization(
+            config,
+            admitted,
+            selection,
+            attestation,
+            mean_tolerance=mean_tolerance,
+            lcb_z=lcb_z,
+            return_contract_id=_d("return-contract"),
+        )
+
+
 @pytest.mark.parametrize("poison", ["unadmitted_candidate", "selection_bundle", "episode_count"])
 def test_formal_championization_rejects_candidate_bundle_and_count_poison(poison: str) -> None:
     config, admitted, selection, attestation = _formal_case()
@@ -199,8 +225,8 @@ def test_formal_championization_rejects_candidate_bundle_and_count_poison(poison
             admitted,
             selection,
             attestation,
-            mean_tolerance=0.0,
-            lcb_z=None,
+            mean_tolerance=config.source_championization.mean_tolerance,
+            lcb_z=config.source_championization.lcb_z,
             return_contract_id=_d("return-contract"),
         )
 
@@ -253,8 +279,8 @@ def test_formal_championization_rejects_nonformal_training_provenance(
             admitted,
             selection,
             attestation,
-            mean_tolerance=0.0,
-            lcb_z=None,
+            mean_tolerance=config.source_championization.mean_tolerance,
+            lcb_z=config.source_championization.lcb_z,
             return_contract_id=_d("return-contract"),
         )
 
@@ -266,8 +292,8 @@ def test_market_rejects_post_championization_training_and_anchor_poison() -> Non
         admitted,
         selection,
         attestation,
-        mean_tolerance=0.0,
-        lcb_z=None,
+        mean_tolerance=config.source_championization.mean_tolerance,
+        lcb_z=config.source_championization.lcb_z,
         return_contract_id=_d("return-contract"),
     )
     abis = {candidate: _runtime() for candidate in result.selected_by_anchor.values()}
@@ -307,7 +333,7 @@ def test_attestation_bundle_poison_is_rejected_before_market_publication() -> No
             admitted,
             selection,
             attestation,
-            mean_tolerance=0.0,
-            lcb_z=None,
+            mean_tolerance=config.source_championization.mean_tolerance,
+            lcb_z=config.source_championization.lcb_z,
             return_contract_id=_d("return-contract"),
         )

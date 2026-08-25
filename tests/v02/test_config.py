@@ -13,6 +13,7 @@ from policy_learnware_v0.v02.config import (
     load_v02_config_draft,
     load_v02_formal_config,
 )
+from policy_learnware_v0.hashing import sha256_json
 
 
 PROJECT = Path(__file__).resolve().parents[2]
@@ -141,6 +142,7 @@ def _formal_payload() -> dict:
         "checkpoint_rule": "fixed_final_checkpoint",
         "source_eval_episodes": {"selection": 2, "attestation": 3},
         "competence_floor": {task: 0.5 for task in TASKS},
+        "source_championization": {"mean_tolerance": 0.01, "lcb_z": 1.645},
         "probe_protocol_id": _d("probe"),
         "probe_prefixes": [1, 2, 4, 8, 16, 32],
         "encoder_eval_prefixes": [1, 2, 4, 8, 16, 32, 64],
@@ -194,6 +196,44 @@ def test_complete_config_is_strict_immutable_and_has_separate_projections() -> N
         config.stage = "audit_smoke"  # type: ignore[misc]
     with pytest.raises(TypeError):
         config.competence_floor[config.tasks[0]] = 0.0  # type: ignore[index]
+
+
+def test_formal_source_championization_is_required_and_digest_bound() -> None:
+    payload = _formal_payload()
+    payload.pop("source_championization")
+    with pytest.raises(V02ConfigError, match="requires reviewed source_championization"):
+        V02ExperimentConfig.from_dict(payload)
+
+    baseline = V02ExperimentConfig.from_dict(_formal_payload())
+    baseline_training_digest = sha256_json(baseline.training_projection)
+    mutations = (
+        lambda value: value["source_championization"].update(mean_tolerance=0.02),
+        lambda value: value["source_championization"].update(lcb_z=1.96),
+        lambda value: value["source_eval_episodes"].update(selection=25),
+        lambda value: value["competence_floor"].update({TASKS[0]: 0.51}),
+    )
+    for mutate in mutations:
+        changed_payload = _formal_payload()
+        mutate(changed_payload)
+        changed = V02ExperimentConfig.from_dict(changed_payload)
+        assert changed.config_digest != baseline.config_digest
+        assert sha256_json(changed.training_projection) != baseline_training_digest
+
+
+@pytest.mark.parametrize(
+    "source_championization",
+    [
+        {"mean_tolerance": -0.01, "lcb_z": 1.645},
+        {"mean_tolerance": 0.01, "lcb_z": float("inf")},
+        {"mean_tolerance": 0.01},
+        {"mean_tolerance": 0.01, "lcb_z": 1.645, "unknown": 1},
+    ],
+)
+def test_source_championization_literals_fail_closed(source_championization) -> None:
+    payload = _formal_payload()
+    payload["source_championization"] = source_championization
+    with pytest.raises(V02ConfigError):
+        V02ExperimentConfig.from_dict(payload)
 
 
 @pytest.mark.parametrize(

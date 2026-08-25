@@ -17,6 +17,9 @@ training_seeds: []
 checkpoint_rule: null
 source_eval_episodes: null
 competence_floor: {}
+source_championization:
+  mean_tolerance: 0.01
+  lcb_z: 1.645
 probe_protocol_id: null
 probe_prefixes: REVIEW_REQUIRED
 encoder_eval_prefixes: REVIEW_REQUIRED

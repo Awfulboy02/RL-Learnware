@@ -70,6 +70,7 @@ _TOP_LEVEL_FIELDS = {
     "checkpoint_rule",
     "source_eval_episodes",
     "competence_floor",
+    "source_championization",
     "probe_protocol_id",
     "probe_prefixes",
     "encoder_eval_prefixes",
@@ -82,6 +83,7 @@ _TOP_LEVEL_FIELDS = {
     "multiple_testing_plan",
     "artifact_root",
 }
+_OPTIONAL_TOP_LEVEL_FIELDS = frozenset({"source_championization"})
 
 
 class V02ConfigError(ValueError):
@@ -100,6 +102,24 @@ def _strict(value: Mapping[str, Any], expected: set[str], where: str) -> None:
     data = _mapping(value, where)
     missing = expected - set(data)
     unknown = set(data) - expected
+    if missing or unknown:
+        raise V02ConfigError(
+            f"invalid {where} keys; missing={sorted(missing)}, unknown={sorted(unknown)}"
+        )
+
+
+def _strict_top_level(value: Mapping[str, Any], where: str) -> None:
+    """Validate the additive v0.2 top-level schema.
+
+    ``source_championization`` is optional only so existing audit/development
+    configs retain their exact serialized form and digest.  The executable
+    formal loader requires it after parsing ``stage`` below.
+    """
+
+    data = _mapping(value, where)
+    required = _TOP_LEVEL_FIELDS - set(_OPTIONAL_TOP_LEVEL_FIELDS)
+    missing = required - set(data)
+    unknown = set(data) - _TOP_LEVEL_FIELDS
     if missing or unknown:
         raise V02ConfigError(
             f"invalid {where} keys; missing={sorted(missing)}, unknown={sorted(unknown)}"
@@ -394,6 +414,34 @@ class SourceEvaluationConfig:
 
 
 @dataclass(frozen=True)
+class SourceChampionizationConfig:
+    """Reviewed source-only champion selection and admission statistics."""
+
+    mean_tolerance: float
+    lcb_z: float
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "SourceChampionizationConfig":
+        data = _mapping(value, "source_championization")
+        _strict(data, {"mean_tolerance", "lcb_z"}, "source_championization")
+        return cls(
+            mean_tolerance=_float(
+                data["mean_tolerance"],
+                "source_championization.mean_tolerance",
+                minimum=0.0,
+            ),
+            lcb_z=_float(
+                data["lcb_z"],
+                "source_championization.lcb_z",
+                minimum=0.0,
+            ),
+        )
+
+    def to_dict(self) -> dict[str, float]:
+        return {"mean_tolerance": self.mean_tolerance, "lcb_z": self.lcb_z}
+
+
+@dataclass(frozen=True)
 class BootstrapPlan:
     resamples: int
     confidence: float
@@ -486,6 +534,7 @@ class V02ExperimentConfig:
     checkpoint_rule: str
     source_eval_episodes: SourceEvaluationConfig
     competence_floor: Mapping[str, float]
+    source_championization: SourceChampionizationConfig | None
     probe_protocol_id: str
     probe_prefixes: tuple[int, ...]
     encoder_eval_prefixes: tuple[int, ...]
@@ -502,7 +551,7 @@ class V02ExperimentConfig:
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "V02ExperimentConfig":
         data = _mapping(value, "v0.2 config")
-        _strict(data, _TOP_LEVEL_FIELDS, "v0.2 config")
+        _strict_top_level(data, "v0.2 config")
         if data["schema"] != V02_EXPERIMENT_CONFIG_SCHEMA:
             raise V02ConfigError(f"unsupported v0.2 config schema: {data['schema']!r}")
         if _find_unresolved(data):
@@ -518,6 +567,10 @@ class V02ExperimentConfig:
         stage = _string(data["stage"], "stage", safe=True)
         if stage not in V02_STAGES:
             raise V02ConfigError(f"unsupported v0.2 stage: {stage!r}")
+        if stage == "v02_freeze_ready" and "source_championization" not in data:
+            raise V02ConfigError(
+                "v02_freeze_ready requires reviewed source_championization"
+            )
         family = _string(data["protocol_family_id"], "protocol_family_id", safe=True)
         if family != V02_PROTOCOL_FAMILY_ID:
             raise V02ConfigError(f"protocol_family_id must be {V02_PROTOCOL_FAMILY_ID!r}")
@@ -624,6 +677,11 @@ class V02ExperimentConfig:
         if stage == "development_discovery" and len(seeds) != 1:
             raise V02ConfigError("development discovery requires exactly one training seed")
         source_eval = SourceEvaluationConfig.from_dict(data["source_eval_episodes"])
+        source_championization = (
+            None
+            if "source_championization" not in data
+            else SourceChampionizationConfig.from_dict(data["source_championization"])
+        )
 
         raw_floor = _mapping(data["competence_floor"], "competence_floor")
         if set(raw_floor) != set(tasks):
@@ -679,6 +737,7 @@ class V02ExperimentConfig:
             checkpoint_rule=_string(data["checkpoint_rule"], "checkpoint_rule", safe=True),
             source_eval_episodes=source_eval,
             competence_floor=MappingProxyType(floor),
+            source_championization=source_championization,
             probe_protocol_id=_digest(data["probe_protocol_id"], "probe_protocol_id"),
             probe_prefixes=probe_prefixes,
             encoder_eval_prefixes=encoder_prefixes,
@@ -696,7 +755,7 @@ class V02ExperimentConfig:
         return result
 
     def to_dict(self) -> dict[str, Any]:
-        return canonicalize({
+        payload = {
             "schema": self.schema,
             "experiment_id": self.experiment_id,
             "stage": self.stage,
@@ -734,7 +793,10 @@ class V02ExperimentConfig:
             "bootstrap_plan": self.bootstrap_plan.to_dict(),
             "multiple_testing_plan": self.multiple_testing_plan.to_dict(),
             "artifact_root": self.artifact_root,
-        })
+        }
+        if self.source_championization is not None:
+            payload["source_championization"] = self.source_championization.to_dict()
+        return canonicalize(payload)
 
     @property
     def config_digest(self) -> str:
@@ -786,6 +848,8 @@ class V02ExperimentConfig:
             "primary_algorithm", "training_steps", "training_seeds", "checkpoint_rule",
             "source_eval_episodes", "competence_floor",
         }
+        if self.source_championization is not None:
+            keys.add("source_championization")
         return _deep_freeze({key: payload[key] for key in keys})
 
     @property
@@ -929,7 +993,7 @@ class V02ConfigDraft:
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "V02ConfigDraft":
         data = _mapping(value, "v0.2 config draft")
-        _strict(data, _TOP_LEVEL_FIELDS, "v0.2 config draft")
+        _strict_top_level(data, "v0.2 config draft")
         if data["schema"] != V02_EXPERIMENT_CONFIG_SCHEMA:
             raise V02ConfigError(f"unsupported v0.2 config schema: {data['schema']!r}")
         if not _is_review_marker(data["stage"]) and data["stage"] not in V02_STAGES:
@@ -985,6 +1049,7 @@ __all__ = [
     "MultipleTestingPlan",
     "REVIEW_MARKERS",
     "SourceEvaluationConfig",
+    "SourceChampionizationConfig",
     "SourceFactorConfig",
     "TargetFactorConfig",
     "V02ConfigDraft",

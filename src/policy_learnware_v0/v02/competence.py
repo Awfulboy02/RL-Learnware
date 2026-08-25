@@ -463,6 +463,15 @@ def admit_formal_championization(
         raise ValueError("formal championization requires a typed v0.2 config")
     if config.stage != "v02_freeze_ready":
         raise ValueError("formal championization requires stage v02_freeze_ready")
+    protocol = config.source_championization
+    if protocol is None:  # defensive: the formal config loader already rejects this
+        raise ValueError("formal config lacks reviewed source championization")
+    if float(mean_tolerance) != protocol.mean_tolerance:
+        raise ValueError("mean_tolerance differs from the reviewed formal config")
+    if lcb_z is None or float(lcb_z) != protocol.lcb_z:
+        raise ValueError("lcb_z differs from the reviewed formal config")
+    reviewed_mean_tolerance = protocol.mean_tolerance
+    reviewed_lcb_z = protocol.lcb_z
     expected_anchors = config.source_anchor_ids
     candidates_by_anchor = validate_admitted_training_grid(
         admitted_records,
@@ -525,8 +534,8 @@ def admit_formal_championization(
         selection,
         attestation,
         competence_floors=floors,
-        mean_tolerance=mean_tolerance,
-        lcb_z=lcb_z,
+        mean_tolerance=reviewed_mean_tolerance,
+        lcb_z=reviewed_lcb_z,
         return_contract_id=return_contract_id,
     )
     attestation_groups: dict[str, list[SourceEpisodeRow]] = {}
@@ -550,8 +559,8 @@ def admit_formal_championization(
     protocol_digest = sha256_json(
         {
             "schema": "policy-learnware.v02-championization-protocol.v0",
-            "mean_tolerance": float(mean_tolerance),
-            "lcb_z": None if lcb_z is None else float(lcb_z),
+            "mean_tolerance": reviewed_mean_tolerance,
+            "lcb_z": reviewed_lcb_z,
             "return_contract_id": return_digest,
             "selection_episodes_per_candidate": config.source_eval_episodes.selection_episodes,
             "attestation_episodes_per_champion": config.source_eval_episodes.attestation_episodes,

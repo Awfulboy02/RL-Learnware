@@ -1069,7 +1069,7 @@ def _championize_anchors(args: argparse.Namespace) -> Mapping[str, Any]:
     if config.stage == "v02_freeze_ready":
         raise V02CommandError(
             "formal championization is blocked until source evaluator-owned raw "
-            "episode receipts and reviewed LCB/tolerance literals are admitted"
+            "episode receipts are admitted"
         )
     payload = _strict_keys(
         _load_json(args.manifest, "championization inputs"),
@@ -1114,13 +1114,24 @@ def _championize_anchors(args: argparse.Namespace) -> Mapping[str, Any]:
             raise V02CommandError(
                 "formal competence floors must be derived from the reviewed config"
             )
+        reviewed = config.source_championization
+        if reviewed is None:  # defensive: formal config parsing already rejects this
+            raise V02CommandError(
+                "formal config lacks reviewed source championization"
+            )
+        if float(payload["mean_tolerance"]) != reviewed.mean_tolerance:
+            raise V02CommandError(
+                "formal mean_tolerance must equal the reviewed config"
+            )
+        if payload["lcb_z"] is None or float(payload["lcb_z"]) != reviewed.lcb_z:
+            raise V02CommandError("formal lcb_z must equal the reviewed config")
         result_typed = admit_formal_championization(
             config,
             admitted,
             selection,
             attestation,
-            mean_tolerance=payload["mean_tolerance"],
-            lcb_z=payload["lcb_z"],
+            mean_tolerance=reviewed.mean_tolerance,
+            lcb_z=reviewed.lcb_z,
             return_contract_id=payload["return_contract_id"],
         )
     else:
