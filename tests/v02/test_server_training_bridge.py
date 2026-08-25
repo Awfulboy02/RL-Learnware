@@ -53,6 +53,22 @@ _REAL_VALIDATE_FORMAL_PROJECTION = (
 )
 
 
+def _source_proof(commit: str) -> dict[str, Any]:
+    return {
+        "fpo_commit": commit,
+        "expected_fpo_commit": commit,
+        "fpo_commit_matches_expected": True,
+        "fpo_tracked_dirty": False,
+        "fpo_tracked_changes": [],
+        "fpo_head_tree_digest": "8" * 64,
+        "fpo_worktree_tree_digest": "8" * 64,
+        "fpo_execution_tree_digest": "9" * 64,
+        "fpo_source_file_count": 12,
+        "fpo_index_flags": [],
+        "fpo_untracked_paths": [],
+    }
+
+
 @pytest.fixture(autouse=True)
 def _synthetic_formal_authority(monkeypatch: pytest.MonkeyPatch) -> None:
     """Let one-job fixtures exercise evidence below the formal authority gate."""
@@ -229,11 +245,7 @@ def _bundle(
         "operator_digest": anchor["operator_digest"],
         "model_diff_digest": anchor["model_diff_digest"],
             "actual_bound_model_digest": anchor["expected_bound_model_digest"],
-            "fpo_commit": package_job.trainer_commit,
-            "expected_fpo_commit": package_job.trainer_commit,
-            "fpo_commit_matches_expected": True,
-            "fpo_tracked_dirty": False,
-            "fpo_tracked_changes": [],
+            **_source_proof(package_job.trainer_commit),
             "runtime_digest": package_job.runtime_digest,
             "implementation": attempt["implementation"],
             "execution_mode": execution["execution_mode"],
@@ -442,11 +454,7 @@ def _evidence(
         "runner_schema": "policy-learnware.v02-anchor-aware-runner.v0",
         "runner_file": str(runner_path),
         "fpo_root": "/frozen/fpo",
-        "fpo_commit": package_job.trainer_commit,
-        "expected_fpo_commit": package_job.trainer_commit,
-        "fpo_commit_matches_expected": True,
-        "fpo_tracked_dirty": False,
-        "fpo_tracked_changes": [],
+        **_source_proof(package_job.trainer_commit),
         "runtime_contract": anchor["runtime"],
         "runtime_digest": package_job.runtime_digest,
         "vendor": vendor,

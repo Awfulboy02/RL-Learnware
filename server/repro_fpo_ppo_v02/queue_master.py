@@ -37,9 +37,11 @@ try:  # Package import for tests/``python -m``; fallback for direct script use.
         utc_now,
         validate_attempt,
         validate_execution_evidence,
+        validate_fpo_source_attestation,
         validate_implementation_provenance,
         validate_policy_bundle,
         validate_queue_result,
+        validate_run_manifest_envelope,
         validate_success_record,
         validate_training_job,
         validate_training_plan,
@@ -68,9 +70,11 @@ except ImportError:  # pragma: no cover - exercised by executable entry points
         utc_now,
         validate_attempt,
         validate_execution_evidence,
+        validate_fpo_source_attestation,
         validate_implementation_provenance,
         validate_policy_bundle,
         validate_queue_result,
+        validate_run_manifest_envelope,
         validate_success_record,
         validate_training_job,
         validate_training_plan,
@@ -152,7 +156,9 @@ def validate_completed_attempt(
     ):
         if record[key] != attempt[key]:
             raise ContractError(f"training record {key} drifted from the attempt")
-    run_manifest = load_strict_json(attempt_dir / "run_manifest.json")
+    run_manifest = validate_run_manifest_envelope(
+        load_strict_json(attempt_dir / "run_manifest.json")
+    )
     runtime = run_manifest.get("runtime")
     if not isinstance(runtime, Mapping):
         raise ContractError("run manifest runtime evidence is missing")
@@ -172,17 +178,9 @@ def validate_completed_attempt(
         raise ContractError("run manifest did not preserve WANDB_MODE=disabled")
     if runtime.get("python_dont_write_bytecode") != "1":
         raise ContractError("run manifest did not disable vendor bytecode writes")
-    expected_fpo_commit = anchor.runtime["fpo_commit"]
-    expected_source_attestation = {
-        "fpo_commit": expected_fpo_commit,
-        "expected_fpo_commit": expected_fpo_commit,
-        "fpo_commit_matches_expected": True,
-        "fpo_tracked_dirty": False,
-        "fpo_tracked_changes": [],
-    }
-    for key, expected in expected_source_attestation.items():
-        if runtime.get(key) != expected:
-            raise ContractError(f"run manifest FPO source attestation {key} mismatch")
+    source_attestation = validate_fpo_source_attestation(
+        runtime, expected_commit=str(anchor.runtime["fpo_commit"])
+    )
     execution = runtime.get("execution_evidence")
     if not isinstance(execution, Mapping):
         raise ContractError("run manifest execution evidence is missing")
@@ -299,8 +297,10 @@ def validate_completed_attempt(
             "anchor_manifest_digest": anchor.manifest_digest,
             "environment_instance_digest": anchor.environment_instance_digest,
             "operator_digest": anchor.operator_digest,
+            "model_diff_digest": anchor.model_diff_digest,
             "actual_bound_model_digest": anchor.expected_bound_model_digest,
-            **expected_source_attestation,
+            "runtime_digest": anchor.runtime_digest,
+            **source_attestation,
             "execution_mode": evidence["execution_mode"],
             "formal_eligible": evidence["formal_eligible"],
             "execution_evidence_digest": evidence["execution_evidence_digest"],

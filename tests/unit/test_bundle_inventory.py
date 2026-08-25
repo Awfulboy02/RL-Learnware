@@ -153,6 +153,29 @@ class BundleInventoryTest(unittest.TestCase):
                 ):
                     validate_bundle(bundle)
 
+    def test_external_commit_authority_rejects_coordinated_self_claim(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bundle = Path(directory) / "outer_000006"
+            _make_bundle(bundle)
+            provenance_path = bundle / "provenance.json"
+            provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+            provenance["fpo_commit"] = "b" * 40
+            provenance["expected_fpo_commit"] = "b" * 40
+            _write_json(provenance_path, provenance)
+            manifest_path = bundle / "bundle_manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["files"]["provenance.json"] = {
+                "bytes": provenance_path.stat().st_size,
+                "sha256": _sha(provenance_path),
+            }
+            _write_json(manifest_path, manifest)
+
+            validate_bundle(bundle)
+            with self.assertRaisesRegex(
+                BundleValidationError, "differs from external runtime authority"
+            ):
+                validate_bundle(bundle, expected_fpo_commit="a" * 40)
+
     def test_checksum_and_structural_validation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             bundle = Path(directory) / "outer_000006"

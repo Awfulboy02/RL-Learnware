@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
-from unittest.mock import patch
 
 from repro_fpo_ppo_v02.provenance import (
     AUDIT_SMOKE_EXECUTION_MODE,
@@ -48,32 +48,70 @@ def _attempt() -> dict[str, object]:
     }
 
 
-class RunnerProvenanceTests(unittest.TestCase):
-    def test_source_attestation_is_derived_from_live_git_checks(self) -> None:
-        with patch(
-            "repro_fpo_ppo_v02.runner._git",
-            side_effect=[" M tracked.py\nD  removed.py", "b" * 40],
-        ):
-            observed = _inspect_fpo_source(
-                Path("/synthetic/fpo"), expected_commit="a" * 40
-            )
+def _clean_source() -> dict[str, object]:
+    return {
+        "fpo_commit": "a" * 40,
+        "expected_fpo_commit": "a" * 40,
+        "fpo_commit_matches_expected": True,
+        "fpo_tracked_dirty": False,
+        "fpo_tracked_changes": [],
+        "fpo_head_tree_digest": "1" * 64,
+        "fpo_worktree_tree_digest": "1" * 64,
+        "fpo_execution_tree_digest": "2" * 64,
+        "fpo_source_file_count": 1,
+        "fpo_index_flags": [],
+        "fpo_untracked_paths": [],
+    }
 
-        self.assertEqual(observed["fpo_commit"], "b" * 40)
-        self.assertEqual(observed["expected_fpo_commit"], "a" * 40)
-        self.assertFalse(observed["fpo_commit_matches_expected"])
+
+def _git(root: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", "-C", str(root), *args],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+def _repository(root: Path) -> str:
+    root.mkdir()
+    _git(root, "init", "-q")
+    _git(root, "config", "user.email", "audit@example.invalid")
+    _git(root, "config", "user.name", "Audit Test")
+    (root / "tracked.py").write_text("VALUE = 1\n", encoding="utf-8")
+    _git(root, "add", "tracked.py")
+    _git(root, "commit", "-qm", "fixture")
+    return _git(root, "rev-parse", "HEAD")
+
+
+class RunnerProvenanceTests(unittest.TestCase):
+    def test_assume_unchanged_cannot_hide_modified_tracked_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "fpo"
+            commit = _repository(root)
+            clean = _inspect_fpo_source(root, expected_commit=commit)
+            self.assertFalse(clean["fpo_tracked_dirty"])
+
+            _git(root, "update-index", "--assume-unchanged", "tracked.py")
+            (root / "tracked.py").write_text("VALUE = 2\n", encoding="utf-8")
+            observed = _inspect_fpo_source(root, expected_commit=commit)
+
+        self.assertEqual(observed["fpo_commit"], commit)
+        self.assertTrue(observed["fpo_commit_matches_expected"])
         self.assertTrue(observed["fpo_tracked_dirty"])
-        self.assertEqual(
-            observed["fpo_tracked_changes"], [" M tracked.py", "D  removed.py"]
-        )
+        self.assertIn("tracked.py", observed["fpo_tracked_changes"])
+        self.assertEqual(observed["fpo_index_flags"], ["h tracked.py"])
+
+    def test_untracked_source_is_explicitly_rejected_by_attestation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "fpo"
+            commit = _repository(root)
+            (root / "untracked_runtime.py").write_text("VALUE = 9\n", encoding="utf-8")
+            observed = _inspect_fpo_source(root, expected_commit=commit)
+        self.assertEqual(observed["fpo_untracked_paths"], ["untracked_runtime.py"])
 
     def test_runtime_provenance_carries_clean_freeze_matched_attestation(self) -> None:
-        source = {
-            "fpo_commit": "a" * 40,
-            "expected_fpo_commit": "a" * 40,
-            "fpo_commit_matches_expected": True,
-            "fpo_tracked_dirty": False,
-            "fpo_tracked_changes": [],
-        }
+        source = _clean_source()
         with tempfile.TemporaryDirectory() as directory:
             observed = _runtime_provenance(
                 args=_args(Path(directory)),
@@ -89,13 +127,8 @@ class RunnerProvenanceTests(unittest.TestCase):
             self.assertEqual(observed[key], value)
 
     def test_runtime_provenance_rejects_forged_clean_attestation(self) -> None:
-        forged = {
-            "fpo_commit": "a" * 40,
-            "expected_fpo_commit": "a" * 40,
-            "fpo_commit_matches_expected": True,
-            "fpo_tracked_dirty": False,
-            "fpo_tracked_changes": ["M tracked.py"],
-        }
+        forged = _clean_source()
+        forged["fpo_tracked_changes"] = ["M tracked.py"]
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaisesRegex(
                 ContractError, "not clean and freeze-matched"

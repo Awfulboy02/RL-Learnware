@@ -5,14 +5,16 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import asdict
+import hashlib
 import importlib.metadata
 import importlib.util
 import json
 import math
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import platform
 import socket
+import stat
 import subprocess
 import sys
 import time
@@ -35,6 +37,7 @@ try:  # Package import for tests/``python -m``; fallback for direct script use.
         ContractError,
         EXECUTION_EVIDENCE_SCHEMA,
         EXECUTION_PURPOSES,
+        FPO_SOURCE_ATTESTATION_KEYS,
         FORMAL_EXECUTION_PURPOSE,
         FORMAL_GPU_EXECUTION_MODE,
         NumericalIntegrityError,
@@ -51,6 +54,7 @@ try:  # Package import for tests/``python -m``; fallback for direct script use.
         utc_now,
         validate_attempt,
         validate_execution_evidence,
+        validate_fpo_source_attestation,
         validate_policy_bundle,
         with_self_digest,
     )
@@ -69,6 +73,7 @@ except ImportError:  # pragma: no cover - exercised by executable entry points
         ContractError,
         EXECUTION_EVIDENCE_SCHEMA,
         EXECUTION_PURPOSES,
+        FPO_SOURCE_ATTESTATION_KEYS,
         FORMAL_EXECUTION_PURPOSE,
         FORMAL_GPU_EXECUTION_MODE,
         NumericalIntegrityError,
@@ -85,6 +90,7 @@ except ImportError:  # pragma: no cover - exercised by executable entry points
         utc_now,
         validate_attempt,
         validate_execution_evidence,
+        validate_fpo_source_attestation,
         validate_policy_bundle,
         with_self_digest,
     )
@@ -134,6 +140,158 @@ def _git(root: Path, *args: str) -> str | None:
     except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
         return None
     return result.stdout.strip()
+
+
+def _git_raw(root: Path, *args: str) -> bytes:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), *args],
+            check=True,
+            capture_output=True,
+            timeout=60,
+        )
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+        raise RuntimeError(f"cannot inspect upstream FPO checkout with git {args}") from error
+    return result.stdout
+
+
+def _git_path(value: bytes, *, where: str) -> str:
+    try:
+        path = value.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise RuntimeError(f"{where} is not UTF-8") from error
+    pure = PurePosixPath(path)
+    if (
+        not path
+        or pure.is_absolute()
+        or ".." in pure.parts
+        or "\n" in path
+        or "\r" in path
+    ):
+        raise RuntimeError(f"unsafe {where}: {path!r}")
+    return path
+
+
+def _blob_object_id(data: bytes, *, object_format: str) -> str:
+    if object_format not in {"sha1", "sha256"}:
+        raise RuntimeError(f"unsupported Git object format: {object_format!r}")
+    digest = hashlib.new(object_format)
+    digest.update(f"blob {len(data)}\0".encode("ascii"))
+    digest.update(data)
+    return digest.hexdigest()
+
+
+def _snapshot_fpo_tree(fpo_root: Path) -> dict[str, Any]:
+    """Hash every tracked execution byte and expose Git status bypasses."""
+
+    object_format = _git(fpo_root, "rev-parse", "--show-object-format")
+    if object_format is None:
+        raise RuntimeError("cannot resolve upstream FPO Git object format")
+    tree = _git_raw(fpo_root, "ls-tree", "-rz", "--full-tree", "HEAD")
+    head_entries: list[dict[str, Any]] = []
+    worktree_entries: list[dict[str, Any]] = []
+    execution_entries: list[dict[str, Any]] = []
+    content_changes: list[str] = []
+    for raw in tree.split(b"\0"):
+        if not raw:
+            continue
+        try:
+            header, raw_path = raw.split(b"\t", 1)
+            mode, kind, object_id = header.decode("ascii").split(" ")
+        except (ValueError, UnicodeDecodeError) as error:
+            raise RuntimeError("cannot parse upstream FPO HEAD tree") from error
+        path = _git_path(raw_path, where="tracked FPO path")
+        if kind != "blob" or mode not in {"100644", "100755"}:
+            raise RuntimeError(
+                f"FPO source proof rejects non-regular tracked entry {path!r}: "
+                f"mode={mode!r}, kind={kind!r}"
+            )
+        absolute = fpo_root.joinpath(*PurePosixPath(path).parts)
+        actual_object: str | None = None
+        actual_mode: str | None = None
+        raw_sha256: str | None = None
+        byte_count: int | None = None
+        try:
+            metadata = absolute.lstat()
+            if absolute.is_symlink() or not stat.S_ISREG(metadata.st_mode):
+                raise RuntimeError(f"tracked FPO entry is not a regular file: {path}")
+            data = absolute.read_bytes()
+            actual_mode = "100755" if metadata.st_mode & 0o111 else "100644"
+            actual_object = _blob_object_id(data, object_format=object_format)
+            raw_sha256 = hashlib.sha256(data).hexdigest()
+            byte_count = len(data)
+        except FileNotFoundError:
+            pass
+        head_entries.append({"mode": mode, "object": object_id, "path": path})
+        worktree_entries.append(
+            {"mode": actual_mode, "object": actual_object, "path": path}
+        )
+        execution_entries.append(
+            {
+                "bytes": byte_count,
+                "mode": actual_mode,
+                "path": path,
+                "sha256": raw_sha256,
+            }
+        )
+        if actual_mode != mode or actual_object != object_id:
+            content_changes.append(path)
+    if not head_entries:
+        raise RuntimeError("upstream FPO HEAD tree has no regular files")
+
+    untracked = sorted(
+        _git_path(raw, where="untracked FPO path")
+        for raw in _git_raw(
+            # Include ignored files too: a stale/forged ``__pycache__`` can be
+            # imported even when porcelain status reports a clean checkout.
+            fpo_root,
+            "ls-files",
+            "--others",
+            "-z",
+        ).split(b"\0")
+        if raw
+    )
+    index_flags: list[str] = []
+    for raw in _git_raw(fpo_root, "ls-files", "-v", "-z").split(b"\0"):
+        if not raw:
+            continue
+        if len(raw) < 3 or raw[1:2] != b" ":
+            raise RuntimeError("cannot parse upstream FPO index flags")
+        tag = chr(raw[0])
+        path = _git_path(raw[2:], where="indexed FPO path")
+        if tag == "S" or tag.islower():
+            index_flags.append(f"{tag} {path}")
+
+    status_records = [
+        raw
+        for raw in _git_raw(
+            fpo_root,
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+        ).split(b"\0")
+        if raw
+    ]
+    tracked_status = []
+    for raw in status_records:
+        if raw.startswith(b"?? "):
+            continue
+        try:
+            tracked_status.append(raw.decode("utf-8"))
+        except UnicodeDecodeError as error:
+            raise RuntimeError("upstream FPO status contains a non-UTF-8 path") from error
+    tracked_changes = sorted(set(content_changes + tracked_status))
+    return {
+        "fpo_tracked_dirty": bool(tracked_changes),
+        "fpo_tracked_changes": tracked_changes,
+        "fpo_head_tree_digest": sha256_json(head_entries),
+        "fpo_worktree_tree_digest": sha256_json(worktree_entries),
+        "fpo_execution_tree_digest": sha256_json(execution_entries),
+        "fpo_source_file_count": len(head_entries),
+        "fpo_index_flags": sorted(index_flags),
+        "fpo_untracked_paths": untracked,
+    }
 
 
 def _load_upstream(fpo_root: Path) -> tuple[Any, ...]:
@@ -192,10 +350,6 @@ def _inspect_fpo_source(
 ) -> dict[str, Any]:
     """Derive a consumer-compatible attestation from the live FPO checkout."""
 
-    status = _git(fpo_root, "status", "--porcelain", "--untracked-files=no")
-    if status is None:
-        raise RuntimeError("cannot verify whether upstream FPO checkout is clean")
-    tracked_changes = [line for line in status.splitlines() if line]
     commit = _git(fpo_root, "rev-parse", "HEAD")
     if commit is None:
         raise RuntimeError("cannot resolve upstream FPO commit")
@@ -203,8 +357,7 @@ def _inspect_fpo_source(
         "fpo_commit": commit,
         "expected_fpo_commit": expected_commit,
         "fpo_commit_matches_expected": commit == expected_commit,
-        "fpo_tracked_dirty": bool(tracked_changes),
-        "fpo_tracked_changes": tracked_changes,
+        **_snapshot_fpo_tree(fpo_root),
     }
 
 
@@ -212,13 +365,17 @@ def _verify_source(fpo_root: Path, anchor: AnchorManifest) -> dict[str, Any]:
     source = _inspect_fpo_source(
         fpo_root, expected_commit=str(anchor.runtime["fpo_commit"])
     )
-    if source["fpo_tracked_dirty"]:
-        raise RuntimeError("upstream FPO tracked files are dirty; refusing provenance drift")
-    commit = str(source["fpo_commit"])
-    if not source["fpo_commit_matches_expected"]:
-        raise RuntimeError(
-            f"upstream FPO commit mismatch: actual={commit}, frozen={anchor.runtime['fpo_commit']}"
+    try:
+        validated = validate_fpo_source_attestation(
+            source,
+            expected_commit=str(anchor.runtime["fpo_commit"]),
+            require_exact=True,
         )
+    except ContractError as error:
+        raise RuntimeError(
+            f"upstream FPO source proof failed; refusing provenance drift: {error}"
+        ) from error
+    commit = str(source["fpo_commit"])
     actual_runtime = runtime_contract_projection(fpo_commit=commit)
     if actual_runtime != anchor.runtime:
         raise RuntimeError(
@@ -226,7 +383,20 @@ def _verify_source(fpo_root: Path, anchor: AnchorManifest) -> dict[str, Any]:
         )
     if sha256_json(actual_runtime) != anchor.runtime_digest:
         raise RuntimeError("native runtime digest mismatch")
-    return source
+    return validated
+
+
+def _assert_source_unchanged(
+    fpo_root: Path,
+    anchor: AnchorManifest,
+    expected: Mapping[str, Any],
+    *,
+    where: str,
+) -> None:
+    observed = _verify_source(fpo_root, anchor)
+    frozen = {key: expected.get(key) for key in FPO_SOURCE_ATTESTATION_KEYS}
+    if observed != frozen:
+        raise RuntimeError(f"upstream FPO source changed {where}")
 
 
 def _runtime_provenance(
@@ -239,23 +409,11 @@ def _runtime_provenance(
     vendor: Mapping[str, Any],
     implementation: Mapping[str, Any],
 ) -> dict[str, Any]:
-    required_source = {
-        "fpo_commit",
-        "expected_fpo_commit",
-        "fpo_commit_matches_expected",
-        "fpo_tracked_dirty",
-        "fpo_tracked_changes",
-    }
-    if set(source) != required_source:
-        raise ContractError("FPO source attestation has an unexpected schema")
-    if (
-        source["fpo_commit"] != anchor.runtime["fpo_commit"]
-        or source["expected_fpo_commit"] != anchor.runtime["fpo_commit"]
-        or source["fpo_commit_matches_expected"] is not True
-        or source["fpo_tracked_dirty"] is not False
-        or source["fpo_tracked_changes"] != []
-    ):
-        raise ContractError("FPO source attestation is not clean and freeze-matched")
+    source = validate_fpo_source_attestation(
+        source,
+        expected_commit=str(anchor.runtime["fpo_commit"]),
+        require_exact=True,
+    )
     hardware = {
         "host": socket.gethostname(),
         "platform": platform.platform(),
@@ -537,6 +695,8 @@ def _verify_reloaded_checkpoint(
         expected_seed=job["seed"],
         expected_outer=outer,
         expected_environment_steps=environment_steps,
+        expected_fpo_commit=str(anchor.runtime["fpo_commit"]),
+        expected_runtime_digest=anchor.runtime_digest,
     )
 
     def restore_runtime(
@@ -636,6 +796,12 @@ def _publish_checkpoint(
     fpo: Any,
     ppo: Any,
 ) -> dict[str, Any]:
+    _assert_source_unchanged(
+        args.fpo_root,
+        anchor,
+        runtime,
+        where=f"before checkpoint outer={outer}",
+    )
     bound.verify()
     if agent_state.env is not bound.env:
         raise AnchorBindingError("checkpoint actor is no longer bound to the source-anchor env")
@@ -705,6 +871,12 @@ def _publish_checkpoint(
         integrity=integrity,
         environment_steps=environment_steps,
         outer=outer,
+    )
+    _assert_source_unchanged(
+        args.fpo_root,
+        anchor,
+        runtime,
+        where=f"during checkpoint outer={outer}",
     )
     os.rename(temporary, final)
     return {
@@ -797,6 +969,7 @@ def run(args: argparse.Namespace) -> None:
         },
     )
     os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+    source = _verify_source(args.fpo_root, anchor)
     (
         jax,
         jdc,
@@ -807,13 +980,15 @@ def run(args: argparse.Namespace) -> None:
         ppo,
         rollouts,
     ) = _load_upstream(args.fpo_root)
+    _assert_source_unchanged(
+        args.fpo_root, anchor, source, where="while importing the native runtime"
+    )
     if anchor.task not in dm_control_suite.ALL_ENVS:
         raise ContractError(f"anchor task is not a registered DMC environment: {anchor.task}")
     if not args.allow_non_gpu and jax.default_backend() != "gpu":
         raise RuntimeError(
             f"non-smoke training requires GPU; backend={jax.default_backend()!r}"
         )
-    source = _verify_source(args.fpo_root, anchor)
     bound = load_and_bind_anchor(registry=registry, manifest=anchor)
     bound.verify()
     agent_state, rollout_state, config, config_payload = _build_agent_and_rollout(
@@ -1022,6 +1197,9 @@ def run(args: argparse.Namespace) -> None:
         raise RuntimeError(
             f"checkpoint export set mismatch: observed={observed_exports}, expected={expected_exports}"
         )
+    _assert_source_unchanged(
+        args.fpo_root, anchor, runtime, where="before final success publication"
+    )
     bound.verify()
     finished_at = utc_now()
     wall_seconds = time.monotonic() - started

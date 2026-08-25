@@ -212,6 +212,8 @@ def validate_bundle(
     expected_seed: int | None = None,
     expected_outer: int | None = None,
     expected_environment_steps: int | None = None,
+    expected_fpo_commit: str | None = None,
+    expected_runtime_digest: str | None = None,
 ) -> PolicyBundleMetadata:
     """Fail-closed validation of one immutable exported policy bundle."""
 
@@ -288,6 +290,17 @@ def validate_bundle(
         or provenance.get("fpo_tracked_changes") != []
     ):
         raise BundleValidationError("bundle provenance does not bind a clean FPO commit")
+    if expected_fpo_commit is not None and fpo_commit != expected_fpo_commit:
+        raise BundleValidationError(
+            "bundle FPO commit differs from external runtime authority"
+        )
+    if (
+        expected_runtime_digest is not None
+        and provenance.get("runtime_digest") != expected_runtime_digest
+    ):
+        raise BundleValidationError(
+            "bundle runtime digest differs from external runtime authority"
+        )
     training_config = spec.get("training_config")
     if not isinstance(training_config, Mapping):
         raise BundleValidationError("policy_spec.training_config must be an object")

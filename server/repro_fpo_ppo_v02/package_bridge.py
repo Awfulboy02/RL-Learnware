@@ -17,10 +17,12 @@ from .formal_plan import validate_formal_training_projection
 from .implementation import inspect_implementation_inventory
 from .provenance import (
     ContractError,
+    FPO_SOURCE_ATTESTATION_KEYS,
     FORMAL_EXECUTION_PURPOSE,
     FORMAL_GPU_EXECUTION_MODE,
     TRAINING_JOB_SCHEMA,
     TRAINING_RECORD_SCHEMA,
+    RUN_MANIFEST_SCHEMA,
     assert_finite_mapping,
     finalize_training_job,
     finalize_training_plan,
@@ -31,9 +33,11 @@ from .provenance import (
     sha256_json,
     validate_attempt,
     validate_execution_evidence,
+    validate_fpo_source_attestation,
     validate_implementation_provenance,
     validate_policy_bundle,
     validate_queue_result,
+    validate_run_manifest_envelope,
     validate_self_digest,
     validate_training_job,
     validate_training_plan,
@@ -81,8 +85,6 @@ PolicyTrainingJob, PolicyTrainingAttestation, AdmittedTrainingRecord = (
 
 PLAN_BINDING_SCHEMA = "policy-learnware.v02-package-server-training-plan-binding.v0"
 PACKAGE_PLAN_SCHEMA = "policy-learnware.v02-policy-training-job-set.v0"
-RUN_MANIFEST_SCHEMA = "policy-learnware.v02-anchor-training-run.v0"
-
 _BINDING_ROW_KEYS = {
     "package_job_id",
     "package_job_digest",
@@ -491,36 +493,7 @@ def _validate_run_manifest(
     anchor: AnchorManifest,
     package_job: Any,
 ) -> dict[str, Any]:
-    require_exact_keys(
-        value,
-        {
-            "schema",
-            "job",
-            "job_digest",
-            "attempt_digest",
-            "config_digest",
-            "execution_purpose",
-            "anchor_manifest",
-            "anchor_manifest_digest",
-            "environment_instance_digest",
-            "model_diff_digest",
-            "binding_audit",
-            "training_protocol_digest",
-            "config",
-            "num_envs",
-            "iterations_per_env",
-            "transitions_per_outer",
-            "planned_environment_steps",
-            "execution_mode",
-            "formal_eligible",
-            "execution_evidence_digest",
-            "runtime",
-            "run_manifest_digest",
-        },
-        "anchor training run manifest",
-    )
-    if value["schema"] != RUN_MANIFEST_SCHEMA:
-        raise ContractError("unsupported anchor training run manifest schema")
+    value = validate_run_manifest_envelope(value)
     expected = {
         "job": server_job,
         "job_digest": server_job["job_digest"],
@@ -606,11 +579,7 @@ def _validate_run_manifest(
             "runner_schema",
             "runner_file",
             "fpo_root",
-            "fpo_commit",
-            "expected_fpo_commit",
-            "fpo_commit_matches_expected",
-            "fpo_tracked_dirty",
-            "fpo_tracked_changes",
+            *FPO_SOURCE_ATTESTATION_KEYS,
             "runtime_contract",
             "runtime_digest",
             "vendor",
@@ -664,15 +633,9 @@ def _validate_run_manifest(
         raise ContractError("run runtime contract differs from the anchor")
     if runtime["runtime_digest"] != package_job.runtime_digest:
         raise ContractError("run runtime digest differs from the package job")
-    if runtime["fpo_commit"] != package_job.trainer_commit:
-        raise ContractError("run trainer commit differs from the package job")
-    if (
-        runtime["expected_fpo_commit"] != package_job.trainer_commit
-        or runtime["fpo_commit_matches_expected"] is not True
-        or runtime["fpo_tracked_dirty"] is not False
-        or runtime["fpo_tracked_changes"] != []
-    ):
-        raise ContractError("run FPO source attestation is not clean and freeze-matched")
+    source_attestation = validate_fpo_source_attestation(
+        runtime, expected_commit=package_job.trainer_commit
+    )
     if (
         attempt["execution_mode"] != FORMAL_GPU_EXECUTION_MODE
         or attempt["formal_eligible"] is not True
@@ -768,7 +731,6 @@ def _validate_run_manifest(
         or Path(runner_file).parent.name != "repro_fpo_ppo_v02"
     ):
         raise ContractError("formal evidence did not name the versioned v0.2 runner")
-    validate_self_digest(value, key="run_manifest_digest", where="run manifest")
     return dict(value)
 
 
@@ -930,6 +892,7 @@ def _validate_checkpoint_bytes(
     attempt: Mapping[str, Any],
     anchor: AnchorManifest,
     execution: Mapping[str, Any],
+    source_attestation: Mapping[str, Any],
     attempt_root: Path,
 ) -> Path:
     path = Path(explicit_path).resolve()
@@ -968,11 +931,7 @@ def _validate_checkpoint_bytes(
         "operator_digest": anchor.operator_digest,
         "model_diff_digest": anchor.model_diff_digest,
         "actual_bound_model_digest": anchor.expected_bound_model_digest,
-        "fpo_commit": anchor.runtime["fpo_commit"],
-        "expected_fpo_commit": anchor.runtime["fpo_commit"],
-        "fpo_commit_matches_expected": True,
-        "fpo_tracked_dirty": False,
-        "fpo_tracked_changes": [],
+        **dict(source_attestation),
         "runtime_digest": anchor.runtime_digest,
         "implementation": attempt["implementation"],
         "execution_mode": execution["execution_mode"],
@@ -1145,6 +1104,9 @@ def attestation_from_server_success(
         package_job=package_job,
     )
     execution = run["runtime"]["execution_evidence"]
+    source_attestation = validate_fpo_source_attestation(
+        run["runtime"], expected_commit=package_job.trainer_commit
+    )
     record = _validate_success_record_mapping(
         training_record,
         server_job=server_job,
@@ -1173,6 +1135,7 @@ def attestation_from_server_success(
             attempt=attempt,
             anchor=anchor,
             execution=execution,
+            source_attestation=source_attestation,
             attempt_root=attempt_root,
         )
     final = record["checkpoint_bundles"][-1]

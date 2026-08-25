@@ -37,6 +37,50 @@ VENDOR_PROVENANCE_SCHEMA = "policy-learnware.v02-vendor-directory.v0"
 IMPLEMENTATION_PROVENANCE_SCHEMA = "policy-learnware.v02-implementation-inventory.v0"
 FORMAL_FREEZE_BINDING_SCHEMA = "policy-learnware.v02-formal-freeze-binding.v0"
 FORMAL_TRAINING_CONTRACT_SCHEMA = "policy-learnware.v02-formal-training-contract.v0"
+RUN_MANIFEST_SCHEMA = "policy-learnware.v02-anchor-training-run.v0"
+
+FPO_SOURCE_ATTESTATION_KEYS = frozenset(
+    {
+        "fpo_commit",
+        "expected_fpo_commit",
+        "fpo_commit_matches_expected",
+        "fpo_tracked_dirty",
+        "fpo_tracked_changes",
+        "fpo_head_tree_digest",
+        "fpo_worktree_tree_digest",
+        "fpo_execution_tree_digest",
+        "fpo_source_file_count",
+        "fpo_index_flags",
+        "fpo_untracked_paths",
+    }
+)
+
+RUN_MANIFEST_KEYS = frozenset(
+    {
+        "schema",
+        "job",
+        "job_digest",
+        "attempt_digest",
+        "config_digest",
+        "execution_purpose",
+        "anchor_manifest",
+        "anchor_manifest_digest",
+        "environment_instance_digest",
+        "model_diff_digest",
+        "binding_audit",
+        "training_protocol_digest",
+        "config",
+        "num_envs",
+        "iterations_per_env",
+        "transitions_per_outer",
+        "planned_environment_steps",
+        "execution_mode",
+        "formal_eligible",
+        "execution_evidence_digest",
+        "runtime",
+        "run_manifest_digest",
+    }
+)
 
 IMPLEMENTATION_FILE_LABELS = frozenset(
     {
@@ -235,6 +279,64 @@ def validate_self_digest(
     if digest != expected:
         raise ContractError(f"{where}.{key} mismatch: {digest} != {expected}")
     return digest
+
+
+def validate_run_manifest_envelope(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate the strict, self-digested runner envelope shared by all consumers."""
+
+    require_exact_keys(value, RUN_MANIFEST_KEYS, "anchor training run manifest")
+    if value["schema"] != RUN_MANIFEST_SCHEMA:
+        raise ContractError("unsupported anchor training run manifest schema")
+    validate_self_digest(value, key="run_manifest_digest", where="run manifest")
+    return dict(value)
+
+
+def validate_fpo_source_attestation(
+    value: Mapping[str, Any],
+    *,
+    expected_commit: str,
+    require_exact: bool = False,
+) -> dict[str, Any]:
+    """Validate a live, externally anchored, byte-level FPO source proof."""
+
+    if require_exact:
+        require_exact_keys(
+            value, FPO_SOURCE_ATTESTATION_KEYS, "FPO source attestation"
+        )
+    missing = FPO_SOURCE_ATTESTATION_KEYS - set(value)
+    if missing:
+        raise ContractError(
+            f"FPO source attestation misses fields: {sorted(missing)}"
+        )
+    result = {key: value[key] for key in FPO_SOURCE_ATTESTATION_KEYS}
+    frozen = require_git_commit(expected_commit, "expected FPO commit")
+    actual = require_git_commit(result["fpo_commit"], "FPO source commit")
+    claimed = require_git_commit(
+        result["expected_fpo_commit"], "FPO source expected commit"
+    )
+    if (
+        actual != frozen
+        or claimed != frozen
+        or result["fpo_commit_matches_expected"] is not True
+        or result["fpo_tracked_dirty"] is not False
+        or result["fpo_tracked_changes"] != []
+        or result["fpo_index_flags"] != []
+        or result["fpo_untracked_paths"] != []
+    ):
+        raise ContractError("FPO source attestation is not clean and freeze-matched")
+    head = require_digest(
+        result["fpo_head_tree_digest"], "FPO source HEAD tree digest"
+    )
+    worktree = require_digest(
+        result["fpo_worktree_tree_digest"], "FPO source worktree tree digest"
+    )
+    require_digest(
+        result["fpo_execution_tree_digest"], "FPO source execution tree digest"
+    )
+    if head != worktree:
+        raise ContractError("FPO source worktree bytes differ from HEAD")
+    _positive_int(result["fpo_source_file_count"], "FPO source file count")
+    return result
 
 
 def with_self_digest(value: Mapping[str, Any], *, key: str) -> dict[str, Any]:
@@ -1642,10 +1744,13 @@ __all__ = [
     "EXECUTION_PURPOSES",
     "FORMAL_GPU_EXECUTION_MODE",
     "FORMAL_EXECUTION_PURPOSE",
+    "FPO_SOURCE_ATTESTATION_KEYS",
     "IMPLEMENTATION_FILE_LABELS",
     "IMPLEMENTATION_PROVENANCE_SCHEMA",
     "NumericalIntegrityError",
     "QUEUE_RESULT_SCHEMA",
+    "RUN_MANIFEST_KEYS",
+    "RUN_MANIFEST_SCHEMA",
     "TRAINING_JOB_SCHEMA",
     "TRAINING_PLAN_SCHEMA",
     "TRAINING_PROTOCOL_SCHEMA",
@@ -1674,9 +1779,11 @@ __all__ = [
     "utc_now",
     "validate_attempt",
     "validate_execution_evidence",
+    "validate_fpo_source_attestation",
     "validate_implementation_provenance",
     "validate_policy_bundle",
     "validate_queue_result",
+    "validate_run_manifest_envelope",
     "validate_self_digest",
     "validate_success_record",
     "validate_training_job",
