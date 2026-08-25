@@ -569,6 +569,10 @@ def command_environment(
 ) -> dict[str, str]:
     return {
         **base,
+        # The formal freeze verifier rejects local bytecode because Python may
+        # import it instead of the attested source bytes.  The waiter execs the
+        # queue interpreter directly, so preserve this constraint across exec.
+        "PYTHONDONTWRITEBYTECODE": "1",
         "PLW_V02_WAITER_HOST": config.host_id,
         "PLW_V02_WAITER_CLAIM_TOKEN": ownership.token,
         "PLW_V02_WAITER_CLAIM_DIR": str(ownership.path),

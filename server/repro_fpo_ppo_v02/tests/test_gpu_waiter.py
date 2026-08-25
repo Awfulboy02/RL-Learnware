@@ -260,6 +260,7 @@ class WaiterFlowTests(unittest.TestCase):
             assert isinstance(environment, dict)
             self.assertEqual(environment["PLW_V02_WAITER_ELIGIBLE_GPUS"], "0")
             self.assertEqual(environment["PLW_V02_WAITER_HOST"], "host-a")
+            self.assertEqual(environment["PYTHONDONTWRITEBYTECODE"], "1")
             claim = load_json_object(config.claim_dir / "claim.json")
             self.assertEqual(claim["state"], "launch_exec_pending")
             self.assertEqual(
