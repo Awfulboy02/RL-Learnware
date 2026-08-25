@@ -55,6 +55,36 @@ FPO_SOURCE_ATTESTATION_KEYS = frozenset(
     }
 )
 
+RUN_RUNTIME_KEYS = frozenset(
+    {
+        "runner_schema",
+        "runner_file",
+        "fpo_root",
+        *FPO_SOURCE_ATTESTATION_KEYS,
+        "runtime_contract",
+        "runtime_digest",
+        "vendor",
+        "implementation",
+        "legacy_policy_io_path",
+        "pythonpath_vendor_precedence_verified",
+        "wandb_mode",
+        "python_dont_write_bytecode",
+        "host",
+        "pid",
+        "platform",
+        "python",
+        "cuda_visible_devices",
+        "xla_python_client_preallocate",
+        "jax_backend",
+        "jax_devices",
+        "hardware_contract",
+        "hardware_digest",
+        "execution_evidence",
+        "command",
+        "started_at",
+    }
+)
+
 RUN_MANIFEST_KEYS = frozenset(
     {
         "schema",
@@ -291,6 +321,11 @@ def validate_run_manifest_envelope(value: Mapping[str, Any]) -> dict[str, Any]:
     return dict(value)
 
 
+def validate_run_runtime_envelope(value: Mapping[str, Any]) -> dict[str, Any]:
+    require_exact_keys(value, RUN_RUNTIME_KEYS, "run manifest runtime")
+    return dict(value)
+
+
 def validate_run_manifest_server_binding(
     value: Mapping[str, Any],
     *,
@@ -301,6 +336,9 @@ def validate_run_manifest_server_binding(
     """Bind a run envelope to its server job, attempt, anchor, and geometry."""
 
     run = validate_run_manifest_envelope(value)
+    if not isinstance(run["runtime"], Mapping):
+        raise ContractError("run manifest runtime must be an object")
+    validate_run_runtime_envelope(run["runtime"])
     frozen_job = validate_training_job(job)
     frozen_attempt = validate_attempt(attempt)
     if frozen_attempt["job"] != frozen_job:
@@ -1857,6 +1895,7 @@ __all__ = [
     "QUEUE_RESULT_SCHEMA",
     "RUN_MANIFEST_KEYS",
     "RUN_MANIFEST_SCHEMA",
+    "RUN_RUNTIME_KEYS",
     "TRAINING_JOB_SCHEMA",
     "TRAINING_PLAN_SCHEMA",
     "TRAINING_PROTOCOL_SCHEMA",
@@ -1891,6 +1930,7 @@ __all__ = [
     "validate_queue_result",
     "validate_run_manifest_envelope",
     "validate_run_manifest_server_binding",
+    "validate_run_runtime_envelope",
     "validate_self_digest",
     "validate_success_record",
     "validate_training_job",

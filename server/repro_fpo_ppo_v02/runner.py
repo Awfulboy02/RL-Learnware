@@ -24,6 +24,9 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
+
+_TRUSTED_GIT = Path("/usr/bin/git")
+
 try:  # Package import for tests/``python -m``; fallback for direct script use.
     from .anchor_binding import (
         AnchorBindingError,
@@ -128,6 +131,22 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _trusted_git_executable() -> str:
+    try:
+        metadata = _TRUSTED_GIT.lstat()
+    except OSError as error:
+        raise RuntimeError(f"trusted Git executable is unavailable: {_TRUSTED_GIT}") from error
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != 0
+        or metadata.st_mode & 0o022
+    ):
+        raise RuntimeError(
+            "trusted Git executable must be a root-owned, non-writable regular file"
+        )
+    return str(_TRUSTED_GIT)
+
+
 def _git(root: Path, *args: str) -> str | None:
     environment = {
         key: value for key, value in os.environ.items() if not key.startswith("GIT_")
@@ -135,7 +154,7 @@ def _git(root: Path, *args: str) -> str | None:
     environment["GIT_NO_REPLACE_OBJECTS"] = "1"
     try:
         result = subprocess.run(
-            ["git", "-C", str(root), *args],
+            [_trusted_git_executable(), "-C", str(root), *args],
             check=True,
             capture_output=True,
             text=True,
@@ -154,7 +173,7 @@ def _git_raw(root: Path, *args: str) -> bytes:
     environment["GIT_NO_REPLACE_OBJECTS"] = "1"
     try:
         result = subprocess.run(
-            ["git", "-C", str(root), *args],
+            [_trusted_git_executable(), "-C", str(root), *args],
             check=True,
             capture_output=True,
             timeout=60,

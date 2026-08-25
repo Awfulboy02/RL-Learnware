@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from repro_fpo_ppo_v02.provenance import (
     AUDIT_SMOKE_EXECUTION_MODE,
@@ -124,6 +126,28 @@ class RunnerProvenanceTests(unittest.TestCase):
 
             with self.assertRaisesRegex(RuntimeError, "forbidden Git replace refs"):
                 _inspect_fpo_source(root, expected_commit=frozen)
+
+    def test_path_precedence_cannot_replace_trusted_git_binary(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            root = base / "fpo"
+            commit = _repository(root)
+            wrapper_root = base / "bin"
+            wrapper_root.mkdir()
+            marker = base / "wrapper-was-run"
+            wrapper = wrapper_root / "git"
+            wrapper.write_text(
+                f"#!/bin/sh\ntouch {marker}\nexec /usr/bin/git \"$@\"\n",
+                encoding="utf-8",
+            )
+            wrapper.chmod(0o755)
+            with patch.dict(
+                os.environ,
+                {"PATH": f"{wrapper_root}:{os.environ.get('PATH', '')}"},
+            ):
+                observed = _inspect_fpo_source(root, expected_commit=commit)
+            self.assertTrue(observed["fpo_commit_matches_expected"])
+            self.assertFalse(marker.exists())
 
     def test_runtime_provenance_carries_clean_freeze_matched_attestation(self) -> None:
         source = _clean_source()

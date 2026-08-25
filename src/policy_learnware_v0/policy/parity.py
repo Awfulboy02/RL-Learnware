@@ -46,15 +46,17 @@ def verify_golden_parity(
 ) -> ParityReport:
     """Replay exported observations and key, comparing raw and env actions."""
 
-    metadata = (
-        bundle
-        if isinstance(bundle, PolicyBundleMetadata)
-        else validate_bundle(
-            bundle,
+    if isinstance(bundle, PolicyBundleMetadata) and (
+        expected_fpo_commit is None and expected_runtime_digest is None
+    ):
+        metadata = bundle
+    else:
+        source = bundle.bundle_dir if isinstance(bundle, PolicyBundleMetadata) else bundle
+        metadata = validate_bundle(
+            source,
             expected_fpo_commit=expected_fpo_commit,
             expected_runtime_digest=expected_runtime_digest,
         )
-    )
     with np.load(metadata.bundle_dir / "golden_io.npz", allow_pickle=False) as archive:
         observation = np.asarray(archive["observation"])
         key = _restore_key(np.asarray(archive["prng_key_data"]))

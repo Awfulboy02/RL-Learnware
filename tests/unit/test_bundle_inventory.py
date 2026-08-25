@@ -126,6 +126,27 @@ def _make_bundle(
 
 
 class BundleInventoryTest(unittest.TestCase):
+    def test_numeric_formal_eligible_cannot_bypass_external_authority(self) -> None:
+        for numeric in (0, 1):
+            with self.subTest(numeric=numeric), tempfile.TemporaryDirectory() as directory:
+                bundle = Path(directory) / "outer_000006"
+                _make_bundle(bundle)
+                provenance_path = bundle / "provenance.json"
+                provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+                provenance["formal_eligible"] = numeric
+                _write_json(provenance_path, provenance)
+                manifest_path = bundle / "bundle_manifest.json"
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                manifest["files"]["provenance.json"] = {
+                    "bytes": provenance_path.stat().st_size,
+                    "sha256": _sha(provenance_path),
+                }
+                _write_json(manifest_path, manifest)
+                with self.assertRaisesRegex(
+                    BundleValidationError, "formal_eligible must be boolean"
+                ):
+                    validate_bundle(bundle)
+
     def test_clean_fpo_attestation_is_fail_closed_field_by_field(self) -> None:
         poisoned_values = {
             "expected_fpo_commit": "b" * 40,

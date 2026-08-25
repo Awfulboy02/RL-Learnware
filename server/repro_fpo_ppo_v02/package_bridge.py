@@ -17,7 +17,6 @@ from .formal_plan import validate_formal_training_projection
 from .implementation import inspect_implementation_inventory
 from .provenance import (
     ContractError,
-    FPO_SOURCE_ATTESTATION_KEYS,
     FORMAL_EXECUTION_PURPOSE,
     FORMAL_GPU_EXECUTION_MODE,
     TRAINING_JOB_SCHEMA,
@@ -38,6 +37,7 @@ from .provenance import (
     validate_policy_bundle,
     validate_queue_result,
     validate_run_manifest_server_binding,
+    validate_run_runtime_envelope,
     validate_self_digest,
     validate_training_job,
     validate_training_plan,
@@ -578,37 +578,7 @@ def _validate_run_manifest(
     runtime = value["runtime"]
     if not isinstance(runtime, Mapping):
         raise ContractError("run manifest runtime must be an object")
-    require_exact_keys(
-        runtime,
-        {
-            "runner_schema",
-            "runner_file",
-            "fpo_root",
-            *FPO_SOURCE_ATTESTATION_KEYS,
-            "runtime_contract",
-            "runtime_digest",
-            "vendor",
-            "implementation",
-            "legacy_policy_io_path",
-            "pythonpath_vendor_precedence_verified",
-            "wandb_mode",
-            "python_dont_write_bytecode",
-            "host",
-            "pid",
-            "platform",
-            "python",
-            "cuda_visible_devices",
-            "xla_python_client_preallocate",
-            "jax_backend",
-            "jax_devices",
-            "hardware_contract",
-            "hardware_digest",
-            "execution_evidence",
-            "command",
-            "started_at",
-        },
-        "run manifest runtime",
-    )
+    runtime = validate_run_runtime_envelope(runtime)
     vendor = validate_vendor_provenance(runtime["vendor"])
     implementation = validate_implementation_provenance(
         runtime["implementation"], expected=attempt["implementation"]

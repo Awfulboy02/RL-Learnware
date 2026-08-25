@@ -157,16 +157,33 @@ run_manifest = with_self_digest(
         "formal_eligible": execution["formal_eligible"],
         "execution_evidence_digest": execution["execution_evidence_digest"],
         "runtime": {{
+            "runner_schema": "policy-learnware.v02-anchor-aware-runner.v0",
+            "runner_file": str(Path(__file__).resolve()),
+            "fpo_root": str(args.fpo_root.resolve()),
             **source_proof,
-            "hardware_digest": sha256_json(hardware),
-            "command": sys.argv,
+            "runtime_contract": dict(anchor.runtime),
+            "runtime_digest": anchor.runtime_digest,
             "vendor": vendor,
             "implementation": implementation,
             "legacy_policy_io_path": str(args.legacy_policy_io.resolve()),
             "pythonpath_vendor_precedence_verified": True,
             "wandb_mode": os.environ.get("WANDB_MODE"),
             "python_dont_write_bytecode": os.environ.get("PYTHONDONTWRITEBYTECODE"),
+            "host": hardware["host"],
+            "pid": os.getpid(),
+            "platform": hardware["platform"],
+            "python": sys.version,
+            "cuda_visible_devices": hardware["cuda_visible_devices"],
+            "xla_python_client_preallocate": os.environ.get(
+                "XLA_PYTHON_CLIENT_PREALLOCATE"
+            ),
+            "jax_backend": hardware["jax_backend"],
+            "jax_devices": hardware["jax_devices"],
+            "hardware_contract": hardware,
+            "hardware_digest": sha256_json(hardware),
             "execution_evidence": execution,
+            "command": sys.argv,
+            "started_at": "synthetic-start",
         }},
     }},
     key="run_manifest_digest",
@@ -398,6 +415,25 @@ class ManifestQueueTests(unittest.TestCase):
                     {
                         key: value
                         for key, value in forged_binding.items()
+                        if key != "run_manifest_digest"
+                    },
+                    key="run_manifest_digest",
+                ),
+            )
+            self.assertEqual(queue_main(arguments), 1)
+            self.assertEqual(len(list(runs_root.glob("jobs/*/attempt_*"))), 2)
+            run_manifest_path.write_bytes(original_run_manifest)
+
+            forged_runtime_schema = load_strict_json(run_manifest_path)
+            unknown_runtime = dict(forged_runtime_schema["runtime"])
+            unknown_runtime["unbound_debug_field"] = "forged"
+            forged_runtime_schema["runtime"] = unknown_runtime
+            atomic_write_json(
+                run_manifest_path,
+                with_self_digest(
+                    {
+                        key: value
+                        for key, value in forged_runtime_schema.items()
                         if key != "run_manifest_digest"
                     },
                     key="run_manifest_digest",

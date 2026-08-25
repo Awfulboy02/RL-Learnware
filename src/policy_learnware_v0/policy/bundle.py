@@ -283,7 +283,7 @@ def validate_bundle(
     expected_commit = provenance.get("expected_fpo_commit")
     if (
         not isinstance(fpo_commit, str)
-        or len(fpo_commit) != 40
+        or len(fpo_commit) not in {40, 64}
         or fpo_commit != expected_commit
         or provenance.get("fpo_commit_matches_expected") is not True
         or provenance.get("fpo_tracked_dirty") is not False
@@ -291,7 +291,7 @@ def validate_bundle(
     ):
         raise BundleValidationError("bundle provenance does not bind a clean FPO commit")
     formal_eligible = provenance.get("formal_eligible")
-    if formal_eligible not in {None, False, True}:
+    if formal_eligible is not None and not isinstance(formal_eligible, bool):
         raise BundleValidationError("bundle formal_eligible must be boolean when present")
     if formal_eligible is True and (
         expected_fpo_commit is None or expected_runtime_digest is None
