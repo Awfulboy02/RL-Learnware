@@ -17,6 +17,7 @@ dependencies = [
 policy-learnware-v0 = "policy_learnware_v0.cli:main"
 policy-learnware-v01 = "policy_learnware_v0.v01.cli:main"
 policy-learnware-v02 = "policy_learnware_v0.v02.cli:main"
+policy-learnware-v03 = "policy_learnware_v0.v03.acceptance:main"
 
 [project.optional-dependencies]
 research = [
