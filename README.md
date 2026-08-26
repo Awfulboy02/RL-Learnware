@@ -98,6 +98,39 @@ v03 fit-baselines --dry-run
 `large_experiment_executed=false`，不会训练、读取 confirmatory oracle 或生成 formal
 科学结论。
 
+### 服务器最小实验入口
+
+开源复现只需把现有资产路径传给三个薄 runner，无需重建 11-stage
+manifest 树。三个入口都支持不可覆写的原子产物和 `--resume`：
+
+```bash
+PYTHONPATH=src:. python -B -m server.repro_fpo_ppo_v03.signal_fit_runner \
+  --legacy-v0-root /absolute/frozen_v0_artifacts \
+  --output-dir /absolute/new_v03_run/signal_fits \
+  --shard-index 0 --shard-count 1 --train-steps 20000
+
+PYTHONPATH=/absolute/vendor:src:. python -B \
+  -m server.repro_fpo_ppo_v03.source_market_runner \
+  --binding-dir /absolute/production_asset_bindings \
+  --output-dir /absolute/new_v03_run/source_market \
+  --fpo-root /absolute/frozen_fpo_checkout \
+  --vendor-dir /absolute/vendor \
+  --market-alias-private-nonce-file /absolute/private/alias.nonce \
+  --tie-break-private-nonce-file /absolute/private/tie.nonce
+
+PYTHONPATH=src:. python -B -m server.repro_fpo_ppo_v03.baseline_runner \
+  --legacy-v0-root /absolute/frozen_v0_artifacts \
+  --output-dir /absolute/new_v03_run/legacy_baseline
+```
+
+`signal_fit_runner` 执行 36 个 R5 + 9 个 R5L 真实 fits；
+`source_market_runner` 执行 90 selection + 30 attestation 并发布 30-entry market。
+默认 baseline 入口是可立即复算的历史六任务 M02/B5 development replay，
+不冒充 P6 formal exact-nine；真实 30-market/24-context prepared inputs 到位后，
+用 `--prepared-input-factory module:callable` 在同一入口运行现有 exact-nine 科学实现。
+`--max-jobs 1 --train-steps 2`、`--max-selection 1` 和 `--max-queries 1`
+仅用于隔离的资产对接 smoke，不得写入正式产物根。
+
 v0.2 exact-90 handoff 使用只读 production intake；路径必须指向已冻结且受信的服务器
 资产，不能用 synthetic fixture 代替：
 
