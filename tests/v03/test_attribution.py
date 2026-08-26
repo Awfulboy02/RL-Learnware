@@ -10,7 +10,9 @@ from policy_learnware_v0.v03.attribution import (
     AttributionError,
     AttributionGateEvidence,
     AttributionMeasurement,
+    AttributionPrefixSchedule,
     CallableLegacyReplayAdapter,
+    FORMAL_ATTRIBUTION_PREFIX_EPISODE_COUNTS,
     run_attribution_replay,
 )
 from policy_learnware_v0.v03.transition_views import (
@@ -136,6 +138,11 @@ def test_all_views_replay_with_paired_reports_and_no_raw_mutation() -> None:
     assert suite.gate_evidence.controls_fail_closed_pass
     assert not suite.gate_evidence.independently_recomputable_pass
     assert suite.gate_evidence.dynamics_interpretation == "LEGACY_ENCODER_DYNAMICS_SENSITIVE"
+    assert suite.prefix_schedule.scope == "DEVELOPMENT"
+    assert all(
+        report.prefix_schedule_digest == suite.prefix_schedule.schedule_digest
+        for report in suite.reports
+    )
     assert len(suite.reports) > 10
     assert all(report.paired_deltas_vs_full_legacy for report in suite.reports)
     assert all(report.shuffled_control_deltas for report in suite.reports)
@@ -261,4 +268,42 @@ def test_gate_record_cannot_claim_pass_with_failed_checks() -> None:
             dynamics_interpretation="UNASSESSED",
             maximum_legacy_replay_error=0.0,
             failure_reasons=(),
+        )
+
+
+def test_formal_attribution_prefix_schedule_is_exact_and_digest_bound() -> None:
+    formal = AttributionPrefixSchedule.formal()
+    assert formal.prefix_episode_counts == FORMAL_ATTRIBUTION_PREFIX_EPISODE_COUNTS
+    assert formal.formal_eligible
+    assert formal.to_dict()["formal_eligible"] is True
+    with pytest.raises(AttributionError, match="formal attribution requires"):
+        AttributionPrefixSchedule((1, 2, 4, 8, 16, 32), "FORMAL")
+
+
+def test_adapter_must_return_every_frozen_prefix() -> None:
+    bank = _bank()
+    adapter = _LegacyAdapter()
+
+    class _MissingPrefix(_LegacyAdapter):
+        def replay(self, view, *, prefix_episode_counts):
+            measurement = super().replay(
+                view, prefix_episode_counts=prefix_episode_counts
+            )
+            return AttributionMeasurement(
+                view_id=measurement.view_id,
+                task_group=measurement.task_group,
+                shared_schema_group=measurement.shared_schema_group,
+                retrieval_metrics=measurement.retrieval_metrics,
+                between_within_mmd_summaries=measurement.between_within_mmd_summaries,
+                prefix_curves={"task_top1": {1: 0.5}},
+                failure_identifiability_notes=measurement.failure_identifiability_notes,
+            )
+
+    missing = _MissingPrefix()
+    with pytest.raises(AttributionError, match="frozen schedule"):
+        run_attribution_replay(
+            bank,
+            missing,
+            _reference(adapter, bank),
+            prefix_schedule=AttributionPrefixSchedule.development((1, 2)),
         )

@@ -23,11 +23,12 @@ from .probes import (
     registered_probe,
     validate_cp2_holdout,
 )
+from .representation_ladder import R0_PADDED_RAW
 
 
 PROBE_AUDIT_PROTOCOL_ID = sha256_json(
     {
-        "schema": "policy-learnware.v03-probe-audit-protocol.v1",
+        "schema": "policy-learnware.v03-probe-audit-protocol.v2",
         "saturation_threshold": 0.98,
         "state_coverage": "mean-per-dimension-standard-deviation",
         "raw_signal": "median-l2-next-minus-current",
@@ -411,6 +412,9 @@ def summarize_probe_bank(
 @dataclass(frozen=True)
 class ProbeDistanceEvidence:
     task_id: str
+    axis_id: str
+    representation_id: str
+    representation_protocol_digest: str
     semantic_bank_digests: Mapping[str, str]
     encoder_checkpoint_digest: str
     distance_matrix_digest: str
@@ -421,12 +425,18 @@ class ProbeDistanceEvidence:
     probe_style_classifier_accuracy: float
 
     def __post_init__(self) -> None:
-        if (
-            not isinstance(self.task_id, str)
-            or not self.task_id
-            or self.task_id.strip() != self.task_id
-        ):
-            raise ProbeAuditError("task_id must be a canonical non-empty string")
+        for name in ("task_id", "axis_id"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value or value.strip() != value:
+                raise ProbeAuditError(f"{name} must be a canonical non-empty string")
+        if self.representation_id != R0_PADDED_RAW:
+            raise ProbeAuditError(
+                "probe distance evidence must use the frozen R0 padded-Raw representation"
+            )
+        _digest(
+            self.representation_protocol_digest,
+            "representation_protocol_digest",
+        )
         if not isinstance(self.semantic_bank_digests, Mapping):
             raise ProbeAuditError("semantic_bank_digests must be a mapping")
         banks: dict[str, str] = {}
@@ -496,8 +506,11 @@ class ProbeDistanceEvidence:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "schema": "policy-learnware.v03-probe-distance-evidence.v1",
+            "schema": "policy-learnware.v03-probe-distance-evidence.v2",
             "task_id": self.task_id,
+            "axis_id": self.axis_id,
+            "representation_id": self.representation_id,
+            "representation_protocol_digest": self.representation_protocol_digest,
             "semantic_bank_digests": dict(self.semantic_bank_digests),
             "encoder_checkpoint_digest": self.encoder_checkpoint_digest,
             "distance_matrix_digest": self.distance_matrix_digest,
@@ -575,6 +588,7 @@ class ProbeGateFreezeDecision:
     """A development freeze; formal G03-Probe authority is intentionally absent."""
 
     required_task_ids: tuple[str, ...]
+    required_task_axis_pairs: tuple[tuple[str, str], ...]
     training_manifest_digest: str
     thresholds_digest: str
     decision_authority: str
@@ -597,6 +611,35 @@ class ProbeGateFreezeDecision:
                 "freeze decision task IDs must be unique canonical strings"
             )
         object.__setattr__(self, "required_task_ids", tasks)
+        pairs = tuple(tuple(pair) for pair in self.required_task_axis_pairs)
+        if (
+            not pairs
+            or any(
+                len(pair) != 2
+                or any(
+                    not isinstance(item, str)
+                    or not item
+                    or item.strip() != item
+                    for item in pair
+                )
+                for pair in pairs
+            )
+            or len(set(pairs)) != len(pairs)
+        ):
+            raise ProbeAuditError(
+                "required task/axis pairs must be unique canonical pairs"
+            )
+        if {task for task, _axis in pairs} != set(tasks):
+            raise ProbeAuditError(
+                "required task/axis pairs must cover exactly the frozen tasks"
+            )
+        if len({task for task, _axis in pairs}) < 2 or len(
+            {_axis for _task, _axis in pairs}
+        ) < 2:
+            raise ProbeAuditError(
+                "G03-Probe requires at least two tasks and two dynamics axes"
+            )
+        object.__setattr__(self, "required_task_axis_pairs", tuple(sorted(pairs)))
         _digest(self.training_manifest_digest, "training_manifest_digest")
         _digest(self.thresholds_digest, "thresholds_digest")
         if (
@@ -622,6 +665,7 @@ class ProbeGateFreezeDecision:
         return {
             "schema": "policy-learnware.v03-probe-gate-freeze-decision.v0",
             "required_task_ids": list(self.required_task_ids),
+            "required_task_axis_pairs": [list(pair) for pair in self.required_task_axis_pairs],
             "training_manifest_digest": self.training_manifest_digest,
             "thresholds_digest": self.thresholds_digest,
             "decision_authority": self.decision_authority,
@@ -831,41 +875,63 @@ def evaluate_probe_gate(
                 reasons.append(f"SAFETY_FAILURE:{task_id}:{record.probe_style_id}")
             if not record.semantic_style_hidden:
                 reasons.append(f"STYLE_LABEL_LEAKAGE:{task_id}:{record.probe_style_id}")
-        task_evidence = [row for row in evidence_tuple if row.task_id == task_id]
-        if len(task_evidence) != 1:
-            reasons.append(f"MISSING_DYNAMICS_EVIDENCE:{task_id}")
-        else:
+        task_axes = tuple(
+            axis_id
+            for registered_task, axis_id in freeze_decision.required_task_axis_pairs
+            if registered_task == task_id
+        )
+        for axis_id in task_axes:
+            task_evidence = [
+                row
+                for row in evidence_tuple
+                if row.task_id == task_id and row.axis_id == axis_id
+            ]
+            if len(task_evidence) != 1:
+                reasons.append(f"MISSING_DYNAMICS_EVIDENCE:{task_id}:{axis_id}")
+                continue
             evidence = task_evidence[0]
             if (
                 evidence.median_dynamics_distance
                 < thresholds.min_different_dynamics_distance
             ):
-                reasons.append(f"SEMANTIC_BANK_COLLAPSE:{task_id}")
+                reasons.append(f"SEMANTIC_BANK_COLLAPSE:{task_id}:{axis_id}")
             if (
                 evidence.signal_to_noise_ratio
                 < thresholds.minimum_signal_to_noise_ratio
             ):
-                reasons.append(f"RAW_DYNAMICS_BELOW_BANK_NOISE:{task_id}")
+                reasons.append(
+                    f"RAW_DYNAMICS_BELOW_BANK_NOISE:{task_id}:{axis_id}"
+                )
             if evidence.invariance_ratio > thresholds.maximum_invariance_ratio:
-                reasons.append(f"PROBE_INVARIANCE_FAILURE:{task_id}")
+                reasons.append(f"PROBE_INVARIANCE_FAILURE:{task_id}:{axis_id}")
             if (
                 evidence.probe_style_classifier_accuracy
                 > thresholds.maximum_probe_style_classifier_accuracy
             ):
-                reasons.append(f"PROBE_STYLE_CLASSIFIER_TOO_ACCURATE:{task_id}")
+                reasons.append(
+                    f"PROBE_STYLE_CLASSIFIER_TOO_ACCURATE:{task_id}:{axis_id}"
+                )
             shared_task_digest = next(
                 iter(target_bank_bindings_by_encoder.values()), {}
             ).get(task_id)
             if shared_task_digest not in set(evidence.semantic_bank_digests.values()):
-                reasons.append(f"DISTANCE_EVIDENCE_MISSING_TARGET_BANK:{task_id}")
+                reasons.append(
+                    f"DISTANCE_EVIDENCE_MISSING_TARGET_BANK:{task_id}:{axis_id}"
+                )
     unknown_summaries = {record.task_id for record in summary_tuple} - set(tasks)
     if unknown_summaries:
         reasons.append("UNREGISTERED_TASK_EVIDENCE:" + ",".join(sorted(unknown_summaries)))
-    unknown_distance_tasks = {record.task_id for record in evidence_tuple} - set(tasks)
-    if unknown_distance_tasks:
+    registered_pairs = set(freeze_decision.required_task_axis_pairs)
+    unknown_distance_pairs = {
+        (record.task_id, record.axis_id) for record in evidence_tuple
+    } - registered_pairs
+    if unknown_distance_pairs:
         reasons.append(
             "UNREGISTERED_DISTANCE_EVIDENCE:"
-            + ",".join(sorted(unknown_distance_tasks))
+            + ",".join(
+                f"{task_id}/{axis_id}"
+                for task_id, axis_id in sorted(unknown_distance_pairs)
+            )
         )
     unique_reasons = tuple(dict.fromkeys(reasons))
     if unique_reasons:

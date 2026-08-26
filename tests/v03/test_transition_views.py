@@ -12,6 +12,8 @@ from policy_learnware_v0.v03.transition_views import (
     V_NO_MASK,
     V_RANDOM_ENCODER,
     V_REWARD_FREE_TRANSITION,
+    V_STATE_ACTION,
+    V_STATE_ONLY,
     V_SHUFFLED_NEXT,
     V_SHUFFLED_REWARD,
     V_TEMPORAL_SHUFFLE,
@@ -99,6 +101,20 @@ def test_shortcut_and_reward_free_views_do_not_expose_forbidden_values() -> None
     assert no_mask.padding_value == 0.0
     assert no_mask.padding_identity_audit["dimension_identity_inferable"]
     assert no_mask.padding_identity_audit["stable_action_padding_slots"] == (1,)
+    state_only = apply_transition_view(bank, V_STATE_ONLY)
+    assert state_only.padding_identity_audit["dimension_identity_inferable"]
+    assert state_only.padding_identity_audit["unmasked_padding_channels"] == (
+        "observation",
+    )
+    state_action = apply_transition_view(bank, V_STATE_ACTION)
+    assert set(state_action.padding_identity_audit["unmasked_padding_channels"]) == {
+        "action",
+        "observation",
+    }
+    action_with_mask = apply_transition_view(bank, "V_ACTION_ONLY")
+    assert not action_with_mask.padding_identity_audit[
+        "dimension_identity_inferable"
+    ]
 
 
 def test_shuffle_controls_preserve_marginals_and_destroy_only_pairing() -> None:

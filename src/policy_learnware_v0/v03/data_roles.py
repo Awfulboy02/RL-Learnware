@@ -1,4 +1,9 @@
-"""Physical/logical dataset-role separation and strict LOTO leakage guards."""
+"""Physical/logical dataset-role separation for v0.3.
+
+The ``source_encoder_*`` names are retained only for archived v0.3-foundation
+and v0.4-interface conformance records.  The active v0.3 representation ladder
+uses ``source_representation_*`` and never requires a LOTO fold.
+"""
 
 from __future__ import annotations
 
@@ -20,6 +25,9 @@ DATA_ROLE_RECORD_SCHEMA = "policy-learnware.v03-data-role-record.v0"
 DATA_ROLE_MANIFEST_SCHEMA = "policy-learnware.v03-data-role-manifest.v0"
 
 DatasetRole = Literal[
+    "archived_legacy_replay",
+    "source_representation_train",
+    "source_representation_validation",
     "source_encoder_train",
     "source_encoder_validation",
     "source_reference_spec",
@@ -30,6 +38,9 @@ DatasetRole = Literal[
 ]
 DATASET_ROLES = frozenset(
     {
+        "archived_legacy_replay",
+        "source_representation_train",
+        "source_representation_validation",
         "source_encoder_train",
         "source_encoder_validation",
         "source_reference_spec",
@@ -41,6 +52,13 @@ DATASET_ROLES = frozenset(
 )
 
 PROCESS_ROLE_READS: Mapping[str, frozenset[str]] = {
+    "legacy_replay": frozenset({"archived_legacy_replay"}),
+    "representation_trainer": frozenset(
+        {"source_representation_train", "source_representation_validation"}
+    ),
+    "canonicalizer_fitter": frozenset(
+        {"source_representation_train", "source_representation_validation"}
+    ),
     "encoder_trainer": frozenset(
         {"source_encoder_train", "source_encoder_validation"}
     ),
@@ -184,10 +202,21 @@ class DataRoleManifest:
                 "source encoder train and validation seed tokens overlap: "
                 f"{sorted(train_validation_overlap)}"
             )
+        representation_overlap = (
+            by_role["source_representation_train"]
+            & by_role["source_representation_validation"]
+        )
+        if representation_overlap:
+            raise DataRoleError(
+                "source representation train and validation seed tokens overlap: "
+                f"{sorted(representation_overlap)}"
+            )
         reference = by_role["source_reference_spec"]
         encoder_fit_seeds = (
             by_role["source_encoder_train"]
             | by_role["source_encoder_validation"]
+            | by_role["source_representation_train"]
+            | by_role["source_representation_validation"]
         )
         fit_reference_overlap = encoder_fit_seeds & reference
         if fit_reference_overlap:
@@ -313,6 +342,36 @@ def validate_loto_isolation(
         raise DataRoleError("LOTO split nonce mismatch")
 
 
+def validate_representation_isolation(manifest: DataRoleManifest) -> None:
+    """Validate the non-LOTO v0.3 source-fit/query separation.
+
+    This is intentionally smaller than :func:`validate_loto_isolation`: the
+    v0.3 CORRO-style ladder may train on all registered source tasks, but its
+    fit rows, reference rows and target-query rows must remain physically and
+    seed-wise disjoint.
+    """
+
+    train = manifest.records_for("source_representation_train")
+    validation = manifest.records_for("source_representation_validation")
+    reference = manifest.records_for("source_reference_spec")
+    queries = (
+        *manifest.records_for("development_query"),
+        *manifest.records_for("confirmatory_query"),
+    )
+    if not train or not validation or not reference or not queries:
+        raise DataRoleError(
+            "representation manifest requires train, validation, reference and query roles"
+        )
+    fit_tasks = {task for record in (*train, *validation) for task in record.task_private_ids}
+    if not fit_tasks:
+        raise DataRoleError("representation fit task set cannot be empty")
+    reference_tasks = {task for record in reference for task in record.task_private_ids}
+    if not fit_tasks.issubset(reference_tasks):
+        raise DataRoleError(
+            "source reference tasks must cover every representation-fit task"
+        )
+
+
 def assert_confirmatory_queries_unseen(
     manifest: DataRoleManifest, development_read_digests: Sequence[str]
 ) -> None:
@@ -339,4 +398,5 @@ __all__ = [
     "assert_confirmatory_queries_unseen",
     "assert_process_can_read",
     "validate_loto_isolation",
+    "validate_representation_isolation",
 ]

@@ -29,11 +29,19 @@ from .transition_views import (
 )
 
 
+FORMAL_ATTRIBUTION_PREFIX_EPISODE_COUNTS = (1, 2, 4, 8, 16, 32, 64)
+ATTRIBUTION_PREFIX_SCHEDULE_SCHEMA = (
+    "policy-learnware.v03-attribution-prefix-schedule.v0"
+)
+
 ATTRIBUTION_REPLAY_PROTOCOL_ID = sha256_json(
     {
         "schema": "policy-learnware.v03-attribution-replay-protocol.v0",
         "view_protocol_id": TRANSITION_VIEW_PROTOCOL_ID,
         "comparison": "paired-against-full-legacy",
+        "formal_prefix_episode_counts": list(
+            FORMAL_ATTRIBUTION_PREFIX_EPISODE_COUNTS
+        ),
         "historical_artifact_mutation": "forbidden",
         "causal_claim": "nested-and-destructive-controls-only",
     }
@@ -108,6 +116,70 @@ def _prefix_curves(
             points = dict(sorted(points.items()))
         result[metric] = MappingProxyType(points)
     return MappingProxyType(dict(sorted(result.items())))
+
+
+@dataclass(frozen=True)
+class AttributionPrefixSchedule:
+    """Digest-bound prefix grid for archived attribution replay.
+
+    Development fixtures may use a strict subset so CPU tests remain small,
+    but only the exact preregistered 1/2/4/8/16/32/64 grid is formal-eligible.
+    The scope is persisted in every report; a short smoke cannot masquerade as
+    the archived replay protocol.
+    """
+
+    prefix_episode_counts: tuple[int, ...]
+    scope: Literal["FORMAL", "DEVELOPMENT"]
+    schema: str = ATTRIBUTION_PREFIX_SCHEDULE_SCHEMA
+
+    def __post_init__(self) -> None:
+        if self.schema != ATTRIBUTION_PREFIX_SCHEDULE_SCHEMA:
+            raise AttributionError("unsupported attribution prefix schedule schema")
+        prefixes = tuple(self.prefix_episode_counts)
+        if (
+            not prefixes
+            or any(type(value) is not int or value <= 0 for value in prefixes)
+            or prefixes != tuple(sorted(set(prefixes)))
+        ):
+            raise AttributionError(
+                "attribution prefixes must be positive, unique, and increasing"
+            )
+        if self.scope not in {"FORMAL", "DEVELOPMENT"}:
+            raise AttributionError("unknown attribution prefix schedule scope")
+        if (
+            self.scope == "FORMAL"
+            and prefixes != FORMAL_ATTRIBUTION_PREFIX_EPISODE_COUNTS
+        ):
+            raise AttributionError(
+                "formal attribution requires prefixes 1/2/4/8/16/32/64"
+            )
+        object.__setattr__(self, "prefix_episode_counts", prefixes)
+
+    @classmethod
+    def formal(cls) -> "AttributionPrefixSchedule":
+        return cls(FORMAL_ATTRIBUTION_PREFIX_EPISODE_COUNTS, "FORMAL")
+
+    @classmethod
+    def development(
+        cls, prefix_episode_counts: Sequence[int]
+    ) -> "AttributionPrefixSchedule":
+        return cls(tuple(prefix_episode_counts), "DEVELOPMENT")
+
+    @property
+    def formal_eligible(self) -> bool:
+        return self.scope == "FORMAL"
+
+    @property
+    def schedule_digest(self) -> str:
+        return sha256_json(self.to_dict())
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema": self.schema,
+            "prefix_episode_counts": list(self.prefix_episode_counts),
+            "scope": self.scope,
+            "formal_eligible": self.formal_eligible,
+        }
 
 
 @dataclass(frozen=True)
@@ -272,6 +344,8 @@ class AttributionReport:
     archived_dataset_digest: str
     canonical_bank_digest: str
     transition_view_digest: str
+    prefix_schedule_digest: str
+    prefix_schedule_scope: Literal["FORMAL", "DEVELOPMENT"]
     task_group: str
     shared_schema_group: str
     retrieval_metrics: Mapping[str, float]
@@ -294,10 +368,13 @@ class AttributionReport:
             "archived_dataset_digest",
             "canonical_bank_digest",
             "transition_view_digest",
+            "prefix_schedule_digest",
         ):
             object.__setattr__(self, name, _digest(getattr(self, name), name))
         _nonempty(self.task_group, "task_group")
         _nonempty(self.shared_schema_group, "shared_schema_group")
+        if self.prefix_schedule_scope not in {"FORMAL", "DEVELOPMENT"}:
+            raise AttributionError("unknown attribution prefix schedule scope")
         object.__setattr__(
             self,
             "retrieval_metrics",
@@ -352,6 +429,9 @@ class AttributionReport:
             "archived_dataset_digest": self.archived_dataset_digest,
             "canonical_bank_digest": self.canonical_bank_digest,
             "transition_view_digest": self.transition_view_digest,
+            "prefix_schedule_digest": self.prefix_schedule_digest,
+            "prefix_schedule_scope": self.prefix_schedule_scope,
+            "formal_prefix_schedule": self.prefix_schedule_scope == "FORMAL",
             "task_group": self.task_group,
             "shared_schema_group": self.shared_schema_group,
             "retrieval_metrics": dict(self.retrieval_metrics),
@@ -447,7 +527,19 @@ class AttributionGateEvidence:
 class AttributionSuite:
     reports: tuple[AttributionReport, ...]
     archived_reference_digest: str
+    prefix_schedule: AttributionPrefixSchedule
     gate_evidence: AttributionGateEvidence
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.prefix_schedule, AttributionPrefixSchedule):
+            raise AttributionError("suite requires a typed prefix schedule")
+        if any(
+            report.prefix_schedule_digest
+            != self.prefix_schedule.schedule_digest
+            or report.prefix_schedule_scope != self.prefix_schedule.scope
+            for report in self.reports
+        ):
+            raise AttributionError("reports disagree with the suite prefix schedule")
 
     @property
     def digest(self) -> str:
@@ -456,6 +548,8 @@ class AttributionSuite:
                 "schema": "policy-learnware.v03-attribution-suite.v0",
                 "report_digests": [report.digest for report in self.reports],
                 "archived_reference_digest": self.archived_reference_digest,
+                "prefix_schedule": self.prefix_schedule.to_dict(),
+                "prefix_schedule_digest": self.prefix_schedule.schedule_digest,
                 "gate_evidence_digest": self.gate_evidence.digest,
             }
         )
@@ -496,7 +590,8 @@ def run_attribution_replay(
     adapter: LegacyReplayAdapter,
     archived_reference: ArchivedLegacyReference,
     *,
-    prefix_episode_counts: Sequence[int],
+    prefix_episode_counts: Sequence[int] | None = None,
+    prefix_schedule: AttributionPrefixSchedule | None = None,
     view_ids: Sequence[str] = REQUIRED_ATTRIBUTION_VIEW_IDS,
     shuffle_seed: int = 0,
     dynamics_sensitivity_tolerance: float = 1.0e-8,
@@ -534,7 +629,20 @@ def run_attribution_replay(
         raise AttributionError("transition bank does not match archived reference")
     if bank.canonical_bank_digest != archived_reference.canonical_bank_digest:
         raise AttributionError("adapted transition arrays do not match archived reference")
-    prefixes = tuple(int(value) for value in prefix_episode_counts)
+    if (prefix_episode_counts is None) == (prefix_schedule is None):
+        raise AttributionError(
+            "supply exactly one of prefix_episode_counts or prefix_schedule"
+        )
+    if prefix_schedule is None:
+        # Backward-compatible short fixtures are explicitly development-only.
+        schedule = AttributionPrefixSchedule.development(
+            tuple(prefix_episode_counts or ())
+        )
+    else:
+        if not isinstance(prefix_schedule, AttributionPrefixSchedule):
+            raise AttributionError("prefix_schedule must be typed")
+        schedule = prefix_schedule
+    prefixes = schedule.prefix_episode_counts
     episode_count = int(bank.episode_offsets.size - 1)
     if (
         not prefixes
@@ -563,6 +671,10 @@ def run_attribution_replay(
             raise AttributionError("legacy adapter returned an invalid measurement")
         if measurement.view_id != view_id:
             raise AttributionError("legacy adapter returned the wrong view ID")
+        if any(tuple(curve) != prefixes for curve in measurement.prefix_curves.values()):
+            raise AttributionError(
+                "legacy adapter prefix curves disagree with the frozen schedule"
+            )
         views[view_id] = result
         measurements[view_id] = measurement
     full = measurements[V_FULL_LEGACY]
@@ -583,6 +695,8 @@ def run_attribution_replay(
             archived_dataset_digest=str(bank.archived_dataset_digest),
             canonical_bank_digest=bank.canonical_bank_digest,
             transition_view_digest=views[view_id].view_digest,
+            prefix_schedule_digest=schedule.schedule_digest,
+            prefix_schedule_scope=schedule.scope,
             task_group=measurements[view_id].task_group,
             shared_schema_group=measurements[view_id].shared_schema_group,
             retrieval_metrics=measurements[view_id].retrieval_metrics,
@@ -660,5 +774,6 @@ def run_attribution_replay(
     return AttributionSuite(
         reports=reports,
         archived_reference_digest=archived_reference.digest,
+        prefix_schedule=schedule,
         gate_evidence=gate,
     )

@@ -332,6 +332,8 @@ class JointDistanceRun:
             "ranking_key_digest",
         ):
             object.__setattr__(self, name, _digest(getattr(self, name), name))
+        if self.query_mode not in {"QUERY_EMPIRICAL", "QUERY_REDUCED"}:
+            raise V03ContractError("unsupported joint-distance query_mode")
         if not self.rows:
             raise V03ContractError("joint distance run cannot be empty")
         if tuple(row.rank for row in self.rows) != tuple(range(1, len(self.rows) + 1)):

@@ -437,6 +437,48 @@ VIEW_REGISTRY: Mapping[str, TransitionViewSpec] = MappingProxyType(
     }
 )
 
+SEEDED_VIEW_IDS = frozenset(
+    {V_SHUFFLED_NEXT, V_SHUFFLED_REWARD, V_TEMPORAL_SHUFFLE, V_RANDOM_ENCODER}
+)
+
+
+def transition_view_execution_digest(
+    view_id: str,
+    *,
+    seed: int | None = None,
+    random_output_dim: int | None = None,
+) -> str:
+    """Digest the executable view, including every stochastic choice."""
+
+    if view_id not in VIEW_REGISTRY:
+        raise TransitionViewError(f"unregistered transition view: {view_id!r}")
+    if view_id in SEEDED_VIEW_IDS:
+        if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
+            raise TransitionViewError("seeded view requires a non-negative seed")
+    elif seed is not None:
+        raise TransitionViewError("deterministic view cannot carry a seed")
+    if view_id == V_RANDOM_ENCODER:
+        if (
+            isinstance(random_output_dim, bool)
+            or not isinstance(random_output_dim, int)
+            or random_output_dim <= 0
+        ):
+            raise TransitionViewError(
+                "random encoder execution requires a positive output dimension"
+            )
+    elif random_output_dim is not None:
+        raise TransitionViewError(
+            "only random encoder execution carries random_output_dim"
+        )
+    return sha256_json(
+        {
+            "schema": "policy-learnware.v03-transition-view-execution.v0",
+            "view_spec_digest": VIEW_REGISTRY[view_id].digest,
+            "seed": seed,
+            "random_output_dim": random_output_dim,
+        }
+    )
+
 
 @dataclass(frozen=True)
 class TransitionViewResult:
@@ -447,10 +489,14 @@ class TransitionViewResult:
     next_source_indices: np.ndarray
     reward_source_indices: np.ndarray
     archived_dataset_digest: str
+    source_bank_digest: str
     padding_value: float
     observation_width: int
     action_width: int
     random_projection_digest: str | None = None
+    execution_seed: int | None = None
+    random_output_dim: int | None = None
+    execution_transform_digest: str | None = None
 
     def __post_init__(self) -> None:
         if self.spec.view_id not in VIEW_REGISTRY or VIEW_REGISTRY[self.spec.view_id] != self.spec:
@@ -507,6 +553,11 @@ class TransitionViewResult:
             "archived_dataset_digest",
             _sha256_digest(self.archived_dataset_digest, "archived_dataset_digest"),
         )
+        object.__setattr__(
+            self,
+            "source_bank_digest",
+            _sha256_digest(self.source_bank_digest, "source_bank_digest"),
+        )
         if self.view_id == V_RANDOM_ENCODER:
             if self.random_projection_digest is None:
                 raise TransitionViewError(
@@ -523,6 +574,22 @@ class TransitionViewResult:
             raise TransitionViewError(
                 "only V_RANDOM_ENCODER may carry a projection digest"
             )
+        expected_execution = transition_view_execution_digest(
+            self.view_id,
+            seed=self.execution_seed,
+            random_output_dim=self.random_output_dim,
+        )
+        if self.execution_transform_digest is None:
+            object.__setattr__(
+                self, "execution_transform_digest", expected_execution
+            )
+        elif (
+            _sha256_digest(
+                self.execution_transform_digest, "execution_transform_digest"
+            )
+            != expected_execution
+        ):
+            raise TransitionViewError("view execution transform digest mismatch")
 
     @property
     def view_id(self) -> str:
@@ -600,7 +667,13 @@ class TransitionViewResult:
 
     @property
     def padding_identity_audit(self) -> Mapping[str, Any]:
-        """Expose whether a no-mask view still leaks fixed padding positions."""
+        """Expose fixed padding positions not accompanied by their masks.
+
+        Padding leakage is a property of the selected channels, not only of
+        ``V_NO_MASK``.  A state-only or state-action view can reveal the same
+        native-width shortcut whenever padded value columns remain constant
+        and the corresponding mask channel is absent.
+        """
 
         def constant_padding_columns(name: str) -> tuple[int, ...]:
             if name not in self.channels:
@@ -616,16 +689,26 @@ class TransitionViewResult:
         observation_slots = constant_padding_columns("observation")
         action_slots = constant_padding_columns("action")
         next_slots = constant_padding_columns("next_observation")
+        delta_slots = constant_padding_columns("observation_delta")
+        unmasked: dict[str, tuple[int, ...]] = {}
+        if observation_slots and "observation_mask" not in self.channels:
+            unmasked["observation"] = observation_slots
+        if action_slots and "action_mask" not in self.channels:
+            unmasked["action"] = action_slots
+        if next_slots and "next_observation_mask" not in self.channels:
+            unmasked["next_observation"] = next_slots
+        if delta_slots and "observation_mask" not in self.channels:
+            unmasked["observation_delta"] = delta_slots
         return MappingProxyType(
             {
                 "padding_value": float(self.padding_value),
                 "stable_observation_padding_slots": observation_slots,
                 "stable_action_padding_slots": action_slots,
                 "stable_next_observation_padding_slots": next_slots,
-                "dimension_identity_inferable": bool(
-                    self.view_id == V_NO_MASK
-                    and (observation_slots or action_slots or next_slots)
-                ),
+                "stable_delta_padding_slots": delta_slots,
+                "unmasked_padding_channels": tuple(sorted(unmasked)),
+                "unmasked_padding_slots": MappingProxyType(dict(sorted(unmasked.items()))),
+                "dimension_identity_inferable": bool(unmasked),
             }
         )
 
@@ -635,6 +718,7 @@ class TransitionViewResult:
             {
                 "spec_digest": self.spec.digest,
                 "archived_dataset_digest": self.archived_dataset_digest,
+                "source_bank_digest": self.source_bank_digest,
                 "arrays_digest": sha256_ndarrays(
                     {
                         **dict(self.channels),
@@ -648,6 +732,7 @@ class TransitionViewResult:
                 "observation_width": self.observation_width,
                 "action_width": self.action_width,
                 "random_projection_digest": self.random_projection_digest,
+                "execution_transform_digest": self.execution_transform_digest,
             }
         )
 
@@ -818,10 +903,15 @@ def apply_transition_view(
         next_source_indices=next_indices,
         reward_source_indices=reward_indices,
         archived_dataset_digest=str(bank.archived_dataset_digest),
+        source_bank_digest=bank.canonical_bank_digest,
         padding_value=float(bank.padding_value),
         observation_width=int(bank.observation.shape[1]),
         action_width=int(bank.action.shape[1]),
         random_projection_digest=projection_digest,
+        execution_seed=(shuffle_seed if view_id in SEEDED_VIEW_IDS else None),
+        random_output_dim=(
+            random_output_dim if view_id == V_RANDOM_ENCODER else None
+        ),
     )
 
 

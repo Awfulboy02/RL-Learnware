@@ -24,6 +24,7 @@ from policy_learnware_v0.v03.probes import (
     ProbeTrainingManifest,
     registered_probe,
 )
+from policy_learnware_v0.v03.representation_ladder import R0_PADDED_RAW
 
 
 COLLECTOR_IMPLEMENTATION_DIGEST = sha256_json(
@@ -142,6 +143,11 @@ def _freeze(
 ) -> ProbeGateFreezeDecision:
     return ProbeGateFreezeDecision(
         required_task_ids=tasks,
+        required_task_axis_pairs=tuple(
+            (task_id, axis_id)
+            for task_id in tasks
+            for axis_id in ("mass", "damping")
+        ),
         training_manifest_digest=_manifest().digest,
         thresholds_digest=thresholds.digest,
         decision_authority="p2-development-review",
@@ -152,6 +158,7 @@ def _evidence(
     task: str,
     target_bank_digest: str,
     *,
+    axis_id: str = "mass",
     signal: float = 0.40,
     noise: float = 0.05,
     cross_probe: float = 0.08,
@@ -159,19 +166,32 @@ def _evidence(
 ) -> ProbeDistanceEvidence:
     return ProbeDistanceEvidence(
         task_id=task,
+        axis_id=axis_id,
+        representation_id=R0_PADDED_RAW,
+        representation_protocol_digest=sha256_json(
+            {"representation": R0_PADDED_RAW, "protocol": "probe-gate"}
+        ),
         semantic_bank_digests={
             "target_query": target_bank_digest,
-            "source_nominal": sha256_json({"task": task, "bank": "nominal"}),
-            "source_shifted": sha256_json({"task": task, "bank": "shifted"}),
+            "source_nominal": sha256_json(
+                {"task": task, "axis": axis_id, "bank": "nominal"}
+            ),
+            "source_shifted": sha256_json(
+                {"task": task, "axis": axis_id, "bank": "shifted"}
+            ),
         },
         encoder_checkpoint_digest=sha256_json(
-            {"task": task, "checkpoint": "development"}
+            {"task": task, "axis": axis_id, "checkpoint": "raw-identity"}
         ),
         distance_matrix_digest=sha256_json(
-            {"task": task, "matrix": "primary"}
+            {"task": task, "axis": axis_id, "matrix": "primary"}
         ),
         independent_recompute_digest=sha256_json(
-            {"task": task, "matrix": "independent-recompute-receipt"}
+            {
+                "task": task,
+                "axis": axis_id,
+                "matrix": "independent-recompute-receipt",
+            }
         ),
         same_environment_cross_probe_distances=(cross_probe, cross_probe * 1.1),
         different_dynamics_same_probe_distances=(signal, signal * 1.1),
@@ -191,7 +211,11 @@ def _inputs():
         "task-a": sha256_json({"bank": "a"}),
         "task-b": sha256_json({"bank": "b"}),
     }
-    evidence = tuple(_evidence(task, shared_target[task]) for task in tasks)
+    evidence = tuple(
+        _evidence(task, shared_target[task], axis_id=axis_id)
+        for task in tasks
+        for axis_id in ("mass", "damping")
+    )
     bindings = {
         "encoder-a": dict(shared_target),
         "encoder-b": dict(shared_target),
@@ -283,12 +307,16 @@ def test_distance_evidence_binds_banks_checkpoint_matrix_and_recompute() -> None
     assert len(evidence.semantic_bank_digests) == 3
     assert evidence.encoder_checkpoint_digest
     assert evidence.distance_matrix_digest != evidence.independent_recompute_digest
+    assert evidence.representation_id == R0_PADDED_RAW
+    assert evidence.axis_id == "mass"
     assert evidence.digest == sha256_json(evidence.to_dict())
     with pytest.raises(ProbeAuditError, match="independent recompute"):
         replace(
             evidence,
             independent_recompute_digest=evidence.distance_matrix_digest,
         )
+    with pytest.raises(ProbeAuditError, match="R0 padded-Raw"):
+        replace(evidence, representation_id="R5_VIEW_SPECIFIC_CORRO_REFIT")
 
 
 def test_good_evidence_can_only_receive_development_pass() -> None:
@@ -361,6 +389,8 @@ def test_low_signal_collapse_invariance_style_or_bank_mismatch_is_no_go() -> Non
             classifier_accuracy=0.90,
         ),
         evidence[1],
+        evidence[2],
+        evidence[3],
     )
     bindings["encoder-b"] = {
         "task-a": sha256_json({"bank": "different"}),
@@ -376,10 +406,10 @@ def test_low_signal_collapse_invariance_style_or_bank_mismatch_is_no_go() -> Non
     )
     assert tasks == freeze.required_task_ids
     assert report.gate_status == "NO_GO_PROBE_COVERAGE"
-    assert "SEMANTIC_BANK_COLLAPSE:task-a" in report.failure_reasons
-    assert "RAW_DYNAMICS_BELOW_BANK_NOISE:task-a" in report.failure_reasons
-    assert "PROBE_INVARIANCE_FAILURE:task-a" in report.failure_reasons
-    assert "PROBE_STYLE_CLASSIFIER_TOO_ACCURATE:task-a" in report.failure_reasons
+    assert "SEMANTIC_BANK_COLLAPSE:task-a:mass" in report.failure_reasons
+    assert "RAW_DYNAMICS_BELOW_BANK_NOISE:task-a:mass" in report.failure_reasons
+    assert "PROBE_INVARIANCE_FAILURE:task-a:mass" in report.failure_reasons
+    assert "PROBE_STYLE_CLASSIFIER_TOO_ACCURATE:task-a:mass" in report.failure_reasons
     assert "TARGET_PROBE_BANK_MISMATCH" in report.failure_reasons
     with pytest.raises(ProbeAuditError, match="inconsistent with failure reason"):
         replace(report, shared_target_banks_pass=True)
