@@ -1,4 +1,265 @@
-# Policy Learnware v0 / v0.1 / v0.2
+# Policy Learnware v0 / v0.1 / v0.2 / v0.3
+
+## v0.3：RL MDP 规约信号图谱与基础策略复用比较
+
+v0.3 位于独立 `v03` 分支。它从冻结的 v0/v0.1/v0.2 资产出发，回答一个比
+“哪个 Encoder 更强”更基础的问题：在 candidate-independent 公共 probe 下，识别
+RL 任务、goal 与同任务 dynamics context 并选择冻结策略，究竟依赖 transition 中的
+哪些信号？本版以受控 view、表示读出阶梯、KME、匿名策略市场和策略选择结果组成一条
+可复算的证据链。
+
+v0.3 不修改 v0/v0.1/v0.2 的历史协议或 artifacts。v0.2 交付的 exact-90 policy-pool
+handoff 是本版的只读资产输入；v0.3 负责复核它、产生 evaluator-owned source receipts、
+冻结每个 anchor 的 champion，并发布 30-entry anonymous market。Faithful CORRO、CaDM、
+DORA、MCAT、Proposed Encoder、六折 Encoder LOTO、family bake-off 和大型 Encoder
+ablation 已迁入 v0.4，不是 v0.3 的 completion 依赖。
+
+### v0.3 的 13+1 control 与表示矩阵
+
+“14-control”在本仓库中的准确含义是 **13 个输入/扰动 views + 1 个历史随机表示
+control**，不是 14 个可按单一分数排序的同类输入：
+
+| 类别 | ID | 作用 |
+|---|---|---|
+| 完整参照 | `V_FULL_LEGACY` | 历史 packed transition 参照 |
+| schema/ABI | `V_MASK_ONLY`、`V_DIMS_ONLY` | 测试 mask 或 native width shortcut |
+| 单通道/占据 | `V_REWARD_ONLY`、`V_STATE_ONLY`、`V_ACTION_ONLY`、`V_STATE_ACTION` | 测试 reward、state/action marginal 与 occupancy 的充分性 |
+| dynamics | `V_DELTA_ONLY`、`V_REWARD_FREE_TRANSITION` | 测试 reward-free transition signal |
+| 删除/破坏 | `V_NO_MASK`、`V_SHUFFLED_NEXT`、`V_SHUFFLED_REWARD`、`V_TEMPORAL_SHUFFLE` | 删除显式 mask 或破坏 pairing/order |
+| 历史表示 control | `V_RANDOM_ENCODER = R_HIST_RANDOM_TANH` | 固定为单层 random affine + tanh；不得与 matched 两层 `R3` 合并 |
+
+正式 dynamics contrast 使用
+`C_RF_SHUFFLED_NEXT=(o,a,perm(o'))`：它和 `V_REWARD_FREE_TRANSITION` 保持完全相同
+的 channels 与 marginals，禁止 reward/mask，只破坏 next-state pairing。历史 full-base
+`V_SHUFFLED_NEXT` 仅作 legacy control。`C_SCHEMA_COLLISION` 与 `C_EXACT_REPEAT` 是带
+digest 的 pair/bank-level controls，不增加 view 数量。
+
+Signal Atlas 不是 `13 views × all representations` 的无差别全排列，而是：
+
+| Block | 条件 | 逻辑 cells |
+|---|---|---:|
+| Core paired atlas | 13 views × `{R0 Raw, R5 trained CORRO-style MLP}` | 26 |
+| Historical control | `R_HIST_RANDOM_TANH` | 1 |
+| Mechanism staircase | `{FULL, REWARD_FREE_TRANSITION, C_RF_SHUFFLED_NEXT}` × `{R1 random linear, R2 PCA/whitening, R3 matched random MLP, R5L supervised linear}` | 12 |
+
+总计 39 个逻辑 cells。其中 one-step Raw/基础 MLP 不读取顺序，
+`V_TEMPORAL_SHUFFLE × R0/R5` 是两项结构性 `N/A`，不训练、不以零值填充，也不进入
+metric 分母，因此共有 37 个数值 cells 和 79 个可恢复 seed-level 工作项。只有 R5 与
+R5L 需要优化：最多 36 个 R5 fits + 9 个 R5L fits，共 45 个小模型训练；其余表示为
+确定性变换或冻结 replay。
+
+### 基础 baseline 与 RKME 协议
+
+v0.3 固定比较 9 个 required methods：
+
+| ID | 方法 |
+|---|---|
+| `B0` | random anonymous market |
+| `B1` | source/global champion |
+| `B2` | v0 TaskSpec-NN → nominal champion |
+| `B3a` | raw transition moments nearest |
+| `B3b` | raw packed-event KME nearest |
+| `B4a` | development-label kNN ranker |
+| `B4b` | development-label linear ranker |
+| `A-Env` | frozen CORRO EnvironmentSpec nearest |
+| `M02/B5` | L-min + frozen CORRO-style incumbent |
+
+`B4c` 和 `B6` 默认关闭，private best-in-pool oracle 只用于发布 public rankings 后的
+skyline/regret 评估，不属于可部署方法。所有方法都必须对匿名 30-entry full pool 排序，
+不得按 task、axis、algorithm 或 runtime 预筛。
+
+主 RKME 合同为非对称的 **source-reduced / query-empirical**：source anchor 在离线阶段
+构建 reduced RKME；target query 保持 empirical KME，并计算 empirical-to-reduced MMD。
+这样避免为每个 query 重复执行 support reduction。它是 v0.3 formal 的唯一模式；如果
+development 证据显示 query-empirical 有显著性能损失，query-reduced 只能使用新的
+protocol ID 和新的 freeze 另行运行，不能在同一个 formal run 中自动回退。
+
+### CLI：先验收，再由外部 freeze 启动正式链路
+
+仓库无需预装 console script。服务器上的轻量工程验收可直接运行：
+
+```bash
+cd /share/songyf/RL_Learnware/policy_learnware_v0
+
+V03_PY=/home/songyf/miniforge3/envs/GoRL/bin/python
+v03() {
+  PYTHONPATH=src "$V03_PY" -m policy_learnware_v0.v03.cli "$@"
+}
+
+v03 validate-config configs/v03_foundation_development.yaml
+v03 accept-numeric
+v03 accept-prelarge
+v03 fit-representation-controls --dry-run
+v03 build-signal-atlas --dry-run
+v03 fit-baselines --dry-run
+```
+
+后三条 dry-run 只冻结/展示 45-fit plan、39/37 matrix 与 9-method registry；输出必须保持
+`large_experiment_executed=false`，不会训练、读取 confirmatory oracle 或生成 formal
+科学结论。
+
+v0.2 exact-90 handoff 使用只读 production intake；路径必须指向已冻结且受信的服务器
+资产，不能用 synthetic fixture 代替：
+
+```bash
+v03 intake-v02-policy-pool \
+  --handoff-dir /absolute/frozen_v02_handoff \
+  --trusted-experiment-root /absolute/frozen_v02_experiment_root \
+  --artifacts-root /absolute/v03_artifacts \
+  --development-id v03-pool-intake-20260827-r0
+```
+
+成功状态 `POOL_READY` 只代表 exact-90 intake 通过；30 个 source champions、source
+receipts 与 anonymous market 仍由后续 P5M stages 生成。
+
+服务器侧随后执行一次 **validate-only** 资产绑定。该工具会重新校验 intake/plan 的
+canonical bytes、显式 SHA-256 与 semantic digest，经冻结 FPO/JAX driver 对 90 个
+candidate 逐一执行 `validate_candidate`，并盘点历史 v0 encoder、normalizer、kernel 与
+dataset manifests；它不会 rollout、训练或生成 source return：
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 \
+PYTHONPATH=/absolute/vendor:/absolute/policy_learnware_v0/src:/absolute/policy_learnware_v0 \
+python -B -m server.repro_fpo_ppo_v03.asset_binding \
+  --intake-record /absolute/v02_pool_intake/intake_record.json \
+  --intake-record-sha256 <reviewed-sha256> \
+  --trusted-experiment-root /absolute/frozen_v02_experiment_root \
+  --server-plan /absolute/frozen_v02_experiment_root/training_private/plans/server_training_plan.json \
+  --server-plan-sha256 <reviewed-sha256> \
+  --selection-ledger /absolute/policy_learnware_v0/configs/v02_selection_ledger.json \
+  --fpo-root /absolute/frozen_fpo_checkout \
+  --vendor-dir /absolute/attested_vendor \
+  --legacy-v0-root /absolute/frozen_v0_artifacts \
+  --output-dir /absolute/new_immutable_binding_root \
+  --market-alias-private-nonce-file /absolute/private/alias.nonce \
+  --tie-break-private-nonce-file /absolute/private/tie.nonce
+```
+
+生产协议不接受 episode 数或统计阈值的 CLI 覆盖：v0.2 已审核
+selection ledger 固定 `25/50` episodes、`OBSERVE`、`0.5/0.01/1.645` 与
+1000-step return contract；当前 v0.3 binding proposal 另固定 selection seeds
+`100000..100024` 和 attestation seeds `200000..200049`。后两个具体 seed tuple
+必须随后续整份 formal freeze 进入外部 review authority，不会因为资产绑定
+通过而自动升级为已审核科学协议。ledger 的 file/semantic/config/experiment
+digests 均是代码内受信常量，调用者不能通过自报 digest 更换它。
+
+两个 nonce 文件必须不同、非 symlink、权限精确为 `0600`，各含一个不同的 64 位小写
+hex 值；原值与路径都不会进入公开产物。成功状态为 `ASSET_BINDINGS_READY`，固定
+`formal_run_authorized=false`：它只发布 `SourceEvaluationProtocol`、90 个 selection work
+units、90-cell `FormalMarketPlan`、legacy inventory 与总 binding receipt，不能替代 P5M
+真实 90+30 receipts、championization 或 30-entry market。
+
+正式运行采用以下 11-stage 线性、digest-bound 链路：
+
+```text
+collect-source-receipts
+-> build-market
+-> build-canonical-banks
+-> build-transition-views
+-> replay-legacy-attribution
+-> fit-representation-controls
+-> build-signal-atlas
+-> build-source-specs
+-> build-query-specs
+-> fit-baselines
+-> run-public-rankings
+```
+
+每一 stage 都要求外部审核后的 freeze、该 stage 的 typed manifest、显式 server adapter
+和不可覆写 artifact root，例如：
+
+```bash
+v03 build-signal-atlas \
+  --stage-manifest /absolute/manifests/build-signal-atlas.json \
+  --freeze-manifest /absolute/reviewed/formal_freeze.json \
+  --artifacts-root /absolute/v03_formal_artifacts \
+  --adapter-entrypoint reviewed_server_adapter:create_adapter \
+  --resume
+```
+
+在启动任何 stage 前，可对 authorized freeze及其外部receipt文件、11份stage launch
+manifests/request templates、adapter identity/contract、adapter module root下由
+`module:attribute`入口唯一映射的leaf module `.py` bytes、固定
+前序拓扑和全部预存static input bytes做严格只读验收：
+
+```bash
+v03 preflight-formal \
+  --manifest /absolute/reviewed/formal_pipeline_launch.json \
+  --freeze-manifest /absolute/reviewed/formal_freeze.json
+```
+
+通过时返回 `FORMAL_STATIC_BINDINGS_READY`，并固定
+`adapter_executed=false`、`artifacts_written=false`。该命令不导入或调用stage adapter，
+不写artifact，也不能签发review authority。它只证明已审核的静态文件、入口声明和digest
+当前一致，不能证明adapter能够成功训练或生成科学产物；实际启动时传给driver的
+`--adapter-entrypoint`仍必须与该静态声明一致并通过runtime admission。未来的前序receipt、
+运行时manifest和输出bytes仍在每个stage实际执行前由正式driver逐文件复核。authorized freeze及外部
+receipt的真实性仍由项目的外部review/signature信任边界负责；本命令只复核其已声明的
+canonical receipt bytes与semantic digest，不能把调用者自写的receipt升级成authority。这里的
+外部 authority receipt 会同时反向绑定整份 freeze authorization surface
+（config、implementation、gates、query/statistics/cost 与全部规约 digests）和 launch
+surface（11个stage、entrypoint、leaf source SHA、templates、static inputs与module
+root），因此替换任一科学规约或源码并重算manifest自身digest仍会失败。
+源码绑定不覆盖package `__init__.py`、传递依赖或动态加载代码，也不保证Python运行时从同一
+module root导入；当前generic stage driver尚未实现把这份静态报告作为强制runtime admission并
+写入receipt，故该缺口闭合前不得启动formal stage。
+
+`--resume` 只复核并复用 byte-identical work units，不允许覆盖或静默换输入。CLI 可以发布
+未授权的 engineering freeze，但不能自行铸造 review authority；正式 manifest 必须由外部
+review handoff 提供，并同时满足 `review_authority_verified=true` 与
+`formal_run_authorized=true`。public rankings 与预先冻结的 pre-oracle signal manifest
+落盘后，`unlock-oracle` 也只生成 handoff；confirmatory oracle 的解封权仍属于
+`policy-learnware-paper1` 联合 orchestrator。
+
+### v0.4 extension gate
+
+v0.3 formal 固定：
+
+```yaml
+encoder_extension_gate:
+  enabled: false
+```
+
+关闭时不得要求 CaDM/DORA/MCAT/Proposed checkpoints、family IDs、LOTO manifests、
+额外 GPU dependencies 或额外 market representation indices。formal freeze 若把它设为
+`true` 必须 fail closed。显式开启只允许隔离的 v0.4 development interface smoke，且固定
+`completion_eligible=false`、`confirmatory_artifact_access=false`、
+`formal_authority=false`；其产物不得写入 v0.3 formal/confirmatory root。
+
+### 测试与正式启动条件
+
+本地或服务器的 v0.3 专属回归：
+
+```bash
+PYTHONPATH=src:. "$V03_PY" -m pytest -q tests/v03
+PYTHONPATH=src:. "$V03_PY" -m compileall -q \
+  src/policy_learnware_v0/v03 server/repro_fpo_ppo_v03
+```
+
+2026-08-27 的 clean `v03` 服务器验收为 `323 passed, 1 skipped`；GoRL 环境使用
+JAX 0.7.2，GPU 可见，真实 R5/R5L backend 的最小初始化/fit smoke 已通过。这个结果只说明
+代码、合同和最小训练路径可执行，不表示 79 项 Signal Atlas、45 个 fits 或 baseline
+真实矩阵已经运行。
+
+把 `formal_run_authorized` 置为 `true` 前，外部审核必须逐项绑定并复核：
+
+- P5R 已验证的 v0.2 exact-90 intake record、source-pool/cell digests 与受信 handoff root；
+- `SourceEvaluationProtocol`：evaluator/return contract、selection 与 attestation 的隔离 seed blocks、每类 episode 数、30 个 source environment bindings、`OBSERVE` competence literals；
+- `FormalMarketPlan`：90 个 candidate→intake cell/source anchor/deployment ABI 的逐项绑定、30 anchors × 3 candidates、预期 30-entry market，以及彼此独立的 market-alias/tie-break commitments；
+- `G03-Attribution`、`G03-Probe`、`G03-Market` 三个 formal gate plans，而不是运行后才产生的 admissions；
+- 11 个 production stages 的 request templates、线性依赖、静态 input bytes 与逐 stage server-adapter binding digests；
+- `PublicQueryPlan` 的 66-query 计划（30 exact、24 interpolation、12 extrapolation）、9-method/24-development-context baseline input plan、pre-oracle signal outcome plan，以及 oracle owner、零预读、ranking-before-unlock 的 isolation/handoff 计划；
+- source-fitted global canonicalizer、真实 CP0/CP2 与 source train/validation/reference/query bank bindings，historical normalizer/checkpoint、13+1 registry、pair controls、applicability ledger、source-reduced/query-empirical kernel/reducer 设置及最大 prefix memory/kernel smoke；
+- clean commit、external review authority、独立 formal artifact root、immutable resume、statistics/cost/recompute plans；
+- `encoder_extension_gate.enabled=false`，且不存在任何 v0.4 completion dependency。
+
+只有这些输入和权限进入同一份审核后的 freeze，才可以启动大规模 14-control 信号实验
+（含 45 个正式 fits）与基础 baseline 比较。90 份 source-selection receipts、30 份 champion
+attestation receipts、championization/30-entry market、三项 formal admissions、pre-oracle
+signal manifest、594 条 public rankings 与实际 `PublicRankingBarrier` 都是授权后的 formal
+run 或 completion 阶段产物，不是授予 authority 的前置产物，也不得提前伪造。最终
+completion 仍要求这些产物、全部 stage receipts、oracle handoff、统计、独立复算和 claim
+audit 同时通过；服务器 smoke、dry-run 或部分 cell 成功均不能单独替代 completion。
 
 ## v0.2：source-anchor frozen market 与 L-min sidecar
 

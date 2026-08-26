@@ -20,6 +20,7 @@ from .acceptance import run_minimal_compute_acceptance
 from .artifacts import V03ArtifactLayout
 from .baselines import OPTIONAL_BASELINE_STATES, REQUIRED_BASELINE_METHOD_IDS
 from .config import load_v03_foundation_config
+from .formal_preflight import verify_formal_launch_preflight_from_files
 from .pool_intake import V03PoolIntakeRecord, intake_v02_policy_pool
 from .orchestration import (
     PRODUCTION_STAGE_IDS,
@@ -231,6 +232,16 @@ def _parser() -> argparse.ArgumentParser:
         help="run deterministic P4/P6 acceptance without formal assets or training",
     )
 
+    formal_preflight = subparsers.add_parser(
+        "preflight-formal",
+        help=(
+            "read-only verification of an authorized freeze, all eleven stage "
+            "request templates, adapter bindings, topology, and static input bytes"
+        ),
+    )
+    formal_preflight.add_argument("--manifest", required=True)
+    formal_preflight.add_argument("--freeze-manifest", required=True)
+
     intake = subparsers.add_parser(
         "intake-v02-policy-pool",
         help="read-only replay and import of the one frozen exact-90 handoff",
@@ -375,6 +386,12 @@ def main(
             )
         elif args.command == "accept-prelarge":
             report = run_prelarge_acceptance()
+            result = _result(args.command, report.status, report.to_dict())
+        elif args.command == "preflight-formal":
+            report = verify_formal_launch_preflight_from_files(
+                launch_manifest_path=args.manifest,
+                freeze_manifest_path=args.freeze_manifest,
+            )
             result = _result(args.command, report.status, report.to_dict())
         elif args.command == "intake-v02-policy-pool":
             record = intake_v02_policy_pool(

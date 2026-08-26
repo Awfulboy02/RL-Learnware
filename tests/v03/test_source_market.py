@@ -9,6 +9,10 @@ import pytest
 
 from policy_learnware_v0.hashing import sha256_json
 from policy_learnware_v0.v02.schemas import ExecutionABIRecord
+from policy_learnware_v0.v03.formal_gates import (
+    FormalMarketPlan,
+    build_formal_market_evidence,
+)
 from policy_learnware_v0.v03.pool_intake import _intake_v02_policy_pool
 from policy_learnware_v0.v03.source_evaluator import (
     SourceEpisodeAttempt,
@@ -29,8 +33,10 @@ from policy_learnware_v0.v03.source_market import (
     build_source_evaluation_work_unit,
     build_source_policy_market,
     championize_source_pool,
+    formal_market_alias_protocol_digest,
     finalize_source_championization,
     freeze_source_attestation_plan,
+    market_nonce_commitment,
     provisionally_select_source_pool,
     receipt_from_source_episode_shard,
 )
@@ -280,6 +286,7 @@ def _formal_case(tmp_path: Path):
         protocol,
         provisional,
         plan,
+        selections,
         attestations,
         result,
         expected,
@@ -619,7 +626,7 @@ def test_evaluator_work_unit_and_raw_return_receipt_are_strictly_bound(
 def test_market_nonce_domains_are_separate_and_alias_changes_are_explicit(
     tmp_path: Path,
 ) -> None:
-    _intake, _protocol, _provisional, _plan, _receipts, result, _expected, _anchor = (
+    _intake, _protocol, _provisional, _plan, _selections, _receipts, result, _expected, _anchor = (
         _formal_case(tmp_path)
     )
     abis = {champion.candidate_id: _abi() for champion in result.champions.values()}
@@ -644,3 +651,103 @@ def test_market_nonce_domains_are_separate_and_alias_changes_are_explicit(
     )
     assert set(first.entries) != set(changed.entries)
     assert first.policy_market_id != changed.policy_market_id
+
+
+def test_formal_market_evidence_reopens_nonce_commitments_and_rejects_swap(
+    tmp_path: Path,
+) -> None:
+    (
+        intake,
+        protocol,
+        _provisional,
+        _attestation_plan,
+        selections,
+        attestations,
+        championization,
+        _expected,
+        _anchor,
+    ) = _formal_case(tmp_path)
+    alias_nonce = "a" * 64
+    tie_nonce = "b" * 64
+    abis = {
+        champion.candidate_id: _abi()
+        for champion in championization.champions.values()
+    }
+    market = build_source_policy_market(
+        championization,
+        abis,
+        market_alias_nonce=alias_nonce,
+        tie_break_nonce=tie_nonce,
+    )
+    alias_commitment = market_nonce_commitment(
+        purpose="market_alias",
+        nonce=alias_nonce,
+        intake_record_digest=intake.intake_record_digest,
+    )
+    tie_commitment = market_nonce_commitment(
+        purpose="market_tie_break",
+        nonce=tie_nonce,
+        intake_record_digest=intake.intake_record_digest,
+    )
+    plan = FormalMarketPlan(
+        intake_record_digest=intake.intake_record_digest,
+        source_pool_digest=intake.source_pool_digest,
+        source_evaluation_protocol_digest=protocol.source_evaluation_protocol_digest,
+        intake_cell_digests_by_candidate={
+            candidate: cell.intake_cell_digest
+            for candidate, cell in intake.cells.items()
+        },
+        source_anchor_id_by_candidate={
+            candidate: cell.source_anchor_id
+            for candidate, cell in intake.cells.items()
+        },
+        deployment_abi_digests_by_candidate={
+            candidate: _abi().digest for candidate in intake.cells
+        },
+        market_alias_protocol_digest=formal_market_alias_protocol_digest(
+            intake_record_digest=intake.intake_record_digest,
+            source_pool_digest=intake.source_pool_digest,
+            alias_commitment_digest=alias_commitment,
+        ),
+        market_alias_commitment_digest=alias_commitment,
+        tie_break_commitment_digest=tie_commitment,
+    )
+    evidence = build_formal_market_evidence(
+        plan=plan,
+        intake_record_digest=intake.intake_record_digest,
+        source_pool_digest=intake.source_pool_digest,
+        protocol=protocol,
+        selection_receipts=selections,
+        attestation_receipts=attestations,
+        championization=championization,
+        market=market,
+        market_alias_nonce=alias_nonce,
+        tie_break_nonce=tie_nonce,
+    )
+    assert evidence.nonce_commitment_binding_pass
+    assert evidence.market_derivation_pass
+    assert evidence.market_binding_pass
+    persisted = str(evidence.to_dict())
+    assert alias_nonce not in persisted
+    assert tie_nonce not in persisted
+
+    for wrong_alias, wrong_tie in (
+        ("c" * 64, tie_nonce),
+        (alias_nonce, "d" * 64),
+    ):
+        swapped = build_formal_market_evidence(
+            plan=plan,
+            intake_record_digest=intake.intake_record_digest,
+            source_pool_digest=intake.source_pool_digest,
+            protocol=protocol,
+            selection_receipts=selections,
+            attestation_receipts=attestations,
+            championization=championization,
+            market=market,
+            market_alias_nonce=wrong_alias,
+            tie_break_nonce=wrong_tie,
+        )
+        assert not swapped.nonce_commitment_binding_pass
+        assert not swapped.market_derivation_pass
+        assert "MARKET_NONCE_COMMITMENT_MISMATCH" in swapped.failure_reasons
+        assert "MARKET_ALIAS_TIE_DERIVATION_FAILURE" in swapped.failure_reasons

@@ -566,9 +566,15 @@ def _market_case():
         deployment_abi_digests_by_candidate={
             candidate: abis[candidate] for candidate in champions.values()
         },
+        derived_market_alias_protocol_digest=plan.market_alias_protocol_digest,
+        derived_market_alias_commitment_digest=plan.market_alias_commitment_digest,
+        derived_tie_break_commitment_digest=plan.tie_break_commitment_digest,
+        derived_market_binding_digest=_d("derived-market-binding"),
         receipts_binding_pass=True,
         market_binding_pass=True,
         observe_mode_pass=True,
+        nonce_commitment_binding_pass=True,
+        market_derivation_pass=True,
         failure_reasons=(),
     )
     return plan, evidence
@@ -618,6 +624,27 @@ def test_formal_market_29_entries_and_forged_receipt_fail_closed() -> None:
     payload["evidence_digest"] = evidence.evidence_digest
     with pytest.raises(FormalGateError, match="receipt digest"):
         FormalGateAuthorityReceipt.from_dict(payload)
+
+
+def test_formal_market_nonce_commitment_drift_is_no_go() -> None:
+    plan, evidence = _market_case()
+    drifted = replace(
+        evidence,
+        derived_tie_break_commitment_digest=_d("wrong-tie-break-nonce"),
+        nonce_commitment_binding_pass=False,
+        failure_reasons=("MARKET_NONCE_COMMITMENT_MISMATCH",),
+        evidence_digest=None,
+    )
+    freeze = _freeze("G03-Market", str(plan.plan_digest))
+    authority = _authority(
+        "G03-Market", str(plan.plan_digest), str(drifted.evidence_digest), freeze
+    )
+    result = admit_formal_market(
+        plan=plan, evidence=drifted, authority=authority, freeze=freeze
+    )
+    assert result.status == "NO_GO"
+    assert "MARKET_NONCE_COMMITMENT_MISMATCH" in result.failure_reasons
+    assert "TIE_BREAK_COMMITMENT_MISMATCH" in result.failure_reasons
 
 
 def test_preflight_requires_exact_formal_gate_plans_but_development_has_none() -> None:

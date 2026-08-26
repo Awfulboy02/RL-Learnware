@@ -43,7 +43,12 @@ from .source_market import (
     EvaluatorSourceReceipt,
     SourceChampionizationRecord,
     SourceEvaluationProtocol,
+    SourceMarketError,
     V03SourcePolicyMarket,
+    derive_market_opaque_id,
+    derive_market_tie_break_token,
+    formal_market_alias_protocol_digest,
+    market_nonce_commitment,
 )
 from .transition_views import V_RANDOM_ENCODER
 
@@ -1043,9 +1048,15 @@ class FormalMarketEvidence:
     deployment_entry_digests_by_opaque_id: Mapping[str, str]
     deployment_candidate_ids_by_opaque_id: Mapping[str, str]
     deployment_abi_digests_by_candidate: Mapping[str, str]
+    derived_market_alias_protocol_digest: str
+    derived_market_alias_commitment_digest: str
+    derived_tie_break_commitment_digest: str
+    derived_market_binding_digest: str
     receipts_binding_pass: bool
     market_binding_pass: bool
     observe_mode_pass: bool
+    nonce_commitment_binding_pass: bool
+    market_derivation_pass: bool
     failure_reasons: tuple[str, ...]
     evidence_digest: str | None = None
     schema: str = FORMAL_MARKET_EVIDENCE_SCHEMA
@@ -1059,6 +1070,10 @@ class FormalMarketEvidence:
             "source_evaluation_protocol_digest",
             "championization_digest",
             "policy_market_id",
+            "derived_market_alias_protocol_digest",
+            "derived_market_alias_commitment_digest",
+            "derived_tie_break_commitment_digest",
+            "derived_market_binding_digest",
         ):
             object.__setattr__(self, name, _digest(getattr(self, name), name))
         for name in (
@@ -1080,6 +1095,8 @@ class FormalMarketEvidence:
             "receipts_binding_pass",
             "market_binding_pass",
             "observe_mode_pass",
+            "nonce_commitment_binding_pass",
+            "market_derivation_pass",
         ):
             if type(getattr(self, name)) is not bool:
                 raise FormalGateError(f"{name} must be boolean")
@@ -1089,6 +1106,8 @@ class FormalMarketEvidence:
                 self.receipts_binding_pass,
                 self.market_binding_pass,
                 self.observe_mode_pass,
+                self.nonce_commitment_binding_pass,
+                self.market_derivation_pass,
             )
         ):
             raise FormalGateError("passing market evidence cannot carry failure reasons")
@@ -1116,9 +1135,15 @@ class FormalMarketEvidence:
             "deployment_entry_digests_by_opaque_id": dict(self.deployment_entry_digests_by_opaque_id),
             "deployment_candidate_ids_by_opaque_id": dict(self.deployment_candidate_ids_by_opaque_id),
             "deployment_abi_digests_by_candidate": dict(self.deployment_abi_digests_by_candidate),
+            "derived_market_alias_protocol_digest": self.derived_market_alias_protocol_digest,
+            "derived_market_alias_commitment_digest": self.derived_market_alias_commitment_digest,
+            "derived_tie_break_commitment_digest": self.derived_tie_break_commitment_digest,
+            "derived_market_binding_digest": self.derived_market_binding_digest,
             "receipts_binding_pass": self.receipts_binding_pass,
             "market_binding_pass": self.market_binding_pass,
             "observe_mode_pass": self.observe_mode_pass,
+            "nonce_commitment_binding_pass": self.nonce_commitment_binding_pass,
+            "market_derivation_pass": self.market_derivation_pass,
             "failure_reasons": list(self.failure_reasons),
         }
 
@@ -1139,6 +1164,7 @@ class FormalMarketEvidence:
 
 def build_formal_market_evidence(
     *,
+    plan: FormalMarketPlan,
     intake_record_digest: str,
     source_pool_digest: str,
     protocol: SourceEvaluationProtocol,
@@ -1146,11 +1172,20 @@ def build_formal_market_evidence(
     attestation_receipts: Sequence[EvaluatorSourceReceipt],
     championization: SourceChampionizationRecord,
     market: V03SourcePolicyMarket,
+    market_alias_nonce: str,
+    tie_break_nonce: str,
 ) -> FormalMarketEvidence:
-    """Build private market evidence from typed, already-produced assets."""
+    """Build private evidence and reopen both committed market nonces.
 
-    if not isinstance(protocol, SourceEvaluationProtocol):
-        raise FormalGateError("market evidence requires a typed source protocol")
+    The two raw nonces are used only to recompute commitments and the exact
+    champion-to-alias/tie-token assignment.  They are never copied into the
+    returned evidence.
+    """
+
+    if not isinstance(plan, FormalMarketPlan) or not isinstance(
+        protocol, SourceEvaluationProtocol
+    ):
+        raise FormalGateError("market evidence requires a typed plan/source protocol")
     if not isinstance(championization, SourceChampionizationRecord) or not isinstance(
         market, V03SourcePolicyMarket
     ):
@@ -1180,12 +1215,85 @@ def build_formal_market_evidence(
         )
     )
     champions = championization.champions
+    try:
+        alias_commitment = market_nonce_commitment(
+            purpose="market_alias",
+            nonce=market_alias_nonce,
+            intake_record_digest=intake_record_digest,
+        )
+        tie_commitment = market_nonce_commitment(
+            purpose="market_tie_break",
+            nonce=tie_break_nonce,
+            intake_record_digest=intake_record_digest,
+        )
+        alias_protocol_digest = formal_market_alias_protocol_digest(
+            intake_record_digest=intake_record_digest,
+            source_pool_digest=source_pool_digest,
+            alias_commitment_digest=alias_commitment,
+            candidate_count=plan.expected_candidate_count,
+            market_entry_count=plan.expected_market_entry_count,
+        )
+        expected_bindings = {
+            champion.candidate_id: {
+                "source_anchor_id": anchor,
+                "opaque_learnware_id": derive_market_opaque_id(
+                    candidate_id=champion.candidate_id,
+                    market_alias_nonce=market_alias_nonce,
+                ),
+                "tie_break_token": derive_market_tie_break_token(
+                    candidate_id=champion.candidate_id,
+                    tie_break_nonce=tie_break_nonce,
+                ),
+            }
+            for anchor, champion in champions.items()
+        }
+    except SourceMarketError as error:
+        raise FormalGateError(f"invalid formal market nonce reopening: {error}") from error
+    finally:
+        # Make the non-persistence boundary explicit; only derived commitments
+        # and bindings survive into the evidence below.
+        del market_alias_nonce, tie_break_nonce
+    nonce_binding = (
+        alias_commitment == plan.market_alias_commitment_digest
+        and tie_commitment == plan.tie_break_commitment_digest
+        and alias_protocol_digest == plan.market_alias_protocol_digest
+    )
+    expected_opaque_ids = {
+        binding["opaque_learnware_id"] for binding in expected_bindings.values()
+    }
+    market_derivation = (
+        len(expected_bindings) == EXPECTED_ANCHOR_COUNT
+        and len(expected_opaque_ids) == EXPECTED_ANCHOR_COUNT
+        and set(market.entries) == expected_opaque_ids
+        and set(market.deployment_private) == expected_opaque_ids
+        and set(market.anchor_to_opaque_learnware_id) == set(champions)
+        and all(
+            market.entries[binding["opaque_learnware_id"]].tie_break_token
+            == binding["tie_break_token"]
+            and market.entries[
+                binding["opaque_learnware_id"]
+            ].normalized_source_competence
+            == champions[binding["source_anchor_id"]].competence.normalized_competence
+            and market.deployment_private[
+                binding["opaque_learnware_id"]
+            ].candidate_id
+            == candidate_id
+            and market.deployment_private[
+                binding["opaque_learnware_id"]
+            ].source_anchor_id
+            == binding["source_anchor_id"]
+            and market.anchor_to_opaque_learnware_id[binding["source_anchor_id"]]
+            == binding["opaque_learnware_id"]
+            for candidate_id, binding in expected_bindings.items()
+        )
+    )
     market_binding = (
         championization.intake_record_digest == intake_record_digest
         and championization.source_evaluation_protocol_digest
         == protocol.source_evaluation_protocol_digest
         and market.intake_record_digest == intake_record_digest
         and market.championization_digest == championization.championization_digest
+        and market_derivation
     )
     observe = (
         championization.competence_mode == "OBSERVE"
@@ -1198,6 +1306,17 @@ def build_formal_market_evidence(
         reasons.append("SOURCE_MARKET_BINDING_FAILURE")
     if not observe:
         reasons.append("SOURCE_COMPETENCE_NOT_OBSERVE")
+    if not nonce_binding:
+        reasons.append("MARKET_NONCE_COMMITMENT_MISMATCH")
+    if not market_derivation:
+        reasons.append("MARKET_ALIAS_TIE_DERIVATION_FAILURE")
+    market_derivation_digest = sha256_json(
+        {
+            "schema": "policy-learnware.v03-formal-market-derived-binding.v0",
+            "policy_market_id": market.policy_market_id,
+            "bindings_by_candidate": expected_bindings,
+        }
+    )
     return FormalMarketEvidence(
         intake_record_digest=intake_record_digest,
         source_pool_digest=source_pool_digest,
@@ -1232,9 +1351,15 @@ def build_formal_market_evidence(
             entry.candidate_id: entry.execution_abi.digest
             for entry in market.deployment_private.values()
         },
+        derived_market_alias_protocol_digest=alias_protocol_digest,
+        derived_market_alias_commitment_digest=alias_commitment,
+        derived_tie_break_commitment_digest=tie_commitment,
+        derived_market_binding_digest=market_derivation_digest,
         receipts_binding_pass=receipt_binding,
         market_binding_pass=market_binding,
         observe_mode_pass=observe,
+        nonce_commitment_binding_pass=nonce_binding,
+        market_derivation_pass=market_derivation,
         failure_reasons=tuple(reasons),
     )
 
@@ -1344,6 +1469,25 @@ def admit_formal_market(
     ):
         raise FormalGateError("formal market evidence belongs to another plan")
     reasons = list(evidence.failure_reasons)
+    for matches, reason in (
+        (
+            evidence.derived_market_alias_protocol_digest
+            == plan.market_alias_protocol_digest,
+            "MARKET_ALIAS_PROTOCOL_MISMATCH",
+        ),
+        (
+            evidence.derived_market_alias_commitment_digest
+            == plan.market_alias_commitment_digest,
+            "MARKET_ALIAS_COMMITMENT_MISMATCH",
+        ),
+        (
+            evidence.derived_tie_break_commitment_digest
+            == plan.tie_break_commitment_digest,
+            "TIE_BREAK_COMMITMENT_MISMATCH",
+        ),
+    ):
+        if not matches and reason not in reasons:
+            reasons.append(reason)
     expected_candidates = set(plan.intake_cell_digests_by_candidate)
     if set(evidence.selection_receipt_digests_by_candidate) != expected_candidates:
         reasons.append("EXACT_90_SELECTION_RECEIPTS_MISSING")
@@ -1384,6 +1528,14 @@ def admit_formal_market(
         (evidence.receipts_binding_pass, "SOURCE_RECEIPT_BINDING_FAILURE"),
         (evidence.market_binding_pass, "SOURCE_MARKET_BINDING_FAILURE"),
         (evidence.observe_mode_pass, "SOURCE_COMPETENCE_NOT_OBSERVE"),
+        (
+            evidence.nonce_commitment_binding_pass,
+            "MARKET_NONCE_COMMITMENT_MISMATCH",
+        ),
+        (
+            evidence.market_derivation_pass,
+            "MARKET_ALIAS_TIE_DERIVATION_FAILURE",
+        ),
     ):
         if not passed and reason not in reasons:
             reasons.append(reason)

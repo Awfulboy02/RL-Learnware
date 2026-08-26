@@ -51,6 +51,13 @@ DEPLOYMENT_PRIVATE_ENTRY_SCHEMA = "policy-learnware.v03-deployment-private-entry
 PUBLIC_MARKET_SCHEMA = "policy-learnware.v03-public-policy-market.v0"
 PRIVATE_MARKET_SCHEMA = "policy-learnware.v03-deployment-private-registry.v0"
 MARKET_ID_SCHEMA = "policy-learnware.v03-policy-market-id.v0"
+PRIVATE_NONCE_COMMITMENT_SCHEMA = (
+    "policy-learnware.v03-private-nonce-commitment.v0"
+)
+MARKET_ALIAS_PROTOCOL_SCHEMA = "policy-learnware.v03-market-alias-protocol.v0"
+MARKET_ALIAS_SCHEMA = "policy-learnware.v03-market-alias.v0"
+MARKET_TIE_BREAK_SCHEMA = "policy-learnware.v03-market-tie-break.v0"
+MARKET_ALIAS_ASSIGNMENT = "private_nonce_domain_separated_sha256"
 ENGINEERING_MARKET_STATE = "ENGINEERING_CONTRACT_ONLY"
 SELECTION_RULE = "max_mean_within_tolerance_then_min_std_bundle_digest_candidate_id"
 
@@ -1896,6 +1903,90 @@ def _market_id(
     )
 
 
+def market_nonce_commitment(
+    *,
+    purpose: Literal["market_alias", "market_tie_break"],
+    nonce: str,
+    intake_record_digest: str,
+) -> str:
+    """Commit a private nonce without publishing the nonce itself."""
+
+    if purpose not in {"market_alias", "market_tie_break"}:
+        raise SourceMarketError("unsupported private market nonce purpose")
+    return sha256_json(
+        {
+            "schema": PRIVATE_NONCE_COMMITMENT_SCHEMA,
+            "purpose": purpose,
+            "intake_record_digest": _digest(
+                intake_record_digest, "intake_record_digest"
+            ),
+            "private_nonce": _nonce(nonce, f"{purpose}_nonce"),
+        }
+    )
+
+
+def formal_market_alias_protocol_digest(
+    *,
+    intake_record_digest: str,
+    source_pool_digest: str,
+    alias_commitment_digest: str,
+    candidate_count: int = EXPECTED_JOB_COUNT,
+    market_entry_count: int = EXPECTED_ANCHOR_COUNT,
+) -> str:
+    """Recompute the frozen alias protocol commitment used by the formal plan."""
+
+    if (
+        candidate_count != EXPECTED_JOB_COUNT
+        or market_entry_count != EXPECTED_ANCHOR_COUNT
+    ):
+        raise SourceMarketError("formal alias protocol requires exact 90-to-30 counts")
+    return sha256_json(
+        {
+            "schema": MARKET_ALIAS_PROTOCOL_SCHEMA,
+            "intake_record_digest": _digest(
+                intake_record_digest, "intake_record_digest"
+            ),
+            "source_pool_digest": _digest(source_pool_digest, "source_pool_digest"),
+            "candidate_count": candidate_count,
+            "market_entry_count": market_entry_count,
+            "assignment": MARKET_ALIAS_ASSIGNMENT,
+            "alias_commitment_digest": _digest(
+                alias_commitment_digest, "alias_commitment_digest"
+            ),
+        }
+    )
+
+
+def derive_market_opaque_id(*, candidate_id: str, market_alias_nonce: str) -> str:
+    """Derive the public alias for one champion under the private alias nonce."""
+
+    candidate = _nonempty(candidate_id, "candidate_id")
+    nonce = _nonce(market_alias_nonce, "market_alias_nonce")
+    return "lw-" + sha256_json(
+        {
+            "schema": MARKET_ALIAS_SCHEMA,
+            "market_alias_nonce": nonce,
+            "candidate_id": candidate,
+        }
+    )[:32]
+
+
+def derive_market_tie_break_token(
+    *, candidate_id: str, tie_break_nonce: str
+) -> str:
+    """Derive the public deterministic tie token for one champion."""
+
+    candidate = _nonempty(candidate_id, "candidate_id")
+    nonce = _nonce(tie_break_nonce, "tie_break_nonce")
+    return sha256_json(
+        {
+            "schema": MARKET_TIE_BREAK_SCHEMA,
+            "tie_break_nonce": nonce,
+            "candidate_id": candidate,
+        }
+    )
+
+
 def build_source_policy_market(
     championization: SourceChampionizationRecord,
     execution_abis: Mapping[str, ExecutionABIRecord],
@@ -1927,21 +2018,15 @@ def build_source_policy_market(
     private: dict[str, V03DeploymentPrivateEntry] = {}
     anchor_map: dict[str, str] = {}
     for anchor, champion in championization.champions.items():
-        opaque_id = "lw-" + sha256_json(
-            {
-                "schema": "policy-learnware.v03-market-alias.v0",
-                "market_alias_nonce": alias_nonce,
-                "candidate_id": champion.candidate_id,
-            }
-        )[:32]
+        opaque_id = derive_market_opaque_id(
+            candidate_id=champion.candidate_id,
+            market_alias_nonce=alias_nonce,
+        )
         if opaque_id in public:
             raise SourceMarketError("market alias collision")
-        token = sha256_json(
-            {
-                "schema": "policy-learnware.v03-market-tie-break.v0",
-                "tie_break_nonce": tie_nonce,
-                "candidate_id": champion.candidate_id,
-            }
+        token = derive_market_tie_break_token(
+            candidate_id=champion.candidate_id,
+            tie_break_nonce=tie_nonce,
         )
         public[opaque_id] = PublicMarketEntry(
             opaque_learnware_id=opaque_id,
@@ -1983,6 +2068,11 @@ def build_source_policy_market(
 
 __all__ = [
     "ENGINEERING_MARKET_STATE",
+    "MARKET_ALIAS_ASSIGNMENT",
+    "MARKET_ALIAS_PROTOCOL_SCHEMA",
+    "MARKET_ALIAS_SCHEMA",
+    "MARKET_TIE_BREAK_SCHEMA",
+    "PRIVATE_NONCE_COMMITMENT_SCHEMA",
     "EvaluatorSourceReceipt",
     "ProvisionalSourceSelection",
     "RawSourceEpisodeShard",
@@ -1999,10 +2089,14 @@ __all__ = [
     "V03DeploymentPrivateEntry",
     "V03SourcePolicyMarket",
     "build_source_policy_market",
+    "derive_market_opaque_id",
+    "derive_market_tie_break_token",
+    "formal_market_alias_protocol_digest",
     "build_source_evaluation_work_unit",
     "championize_source_pool",
     "finalize_source_championization",
     "freeze_source_attestation_plan",
+    "market_nonce_commitment",
     "provisionally_select_source_pool",
     "receipt_from_source_episode_shard",
 ]
