@@ -299,7 +299,9 @@ class V03FoundationConfig:
         object.__setattr__(self, "protocol_id", checked_digest(self.protocol_id, "protocol_id"))
         tasks = checked_ids(self.task_private_ids, "task_private_ids")
         if len(tasks) < 2:
-            raise V03ConfigError("LOTO foundation requires at least two registered tasks")
+            raise V03ConfigError(
+                "signal-attribution foundation requires at least two registered tasks"
+            )
         object.__setattr__(self, "task_private_ids", tasks)
 
         root = Path(self.artifact_root).expanduser()
