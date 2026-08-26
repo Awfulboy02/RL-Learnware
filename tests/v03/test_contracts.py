@@ -19,6 +19,7 @@ from policy_learnware_v0.v03.contracts import (
     RankingKey,
     SemanticCacheKey,
     SemanticCacheRecord,
+    SemanticTransform,
     SourceReducedSpec,
     SpecKey,
     V03ContractError,
@@ -41,9 +42,11 @@ def _key(raw: str = "raw", *, checkpoint: str = "checkpoint") -> SemanticCacheKe
         canonical_view_digest=_d("view"),
         window_protocol_digest=_d("window-protocol"),
         normalizer_digest=_d("normalizer"),
-        encoder_implementation_digest=_d("encoder"),
-        checkpoint_digest=_d(checkpoint),
-        semantic_output_protocol_digest=_d("semantic-output"),
+        semantic_transform=SemanticTransform.frozen_encoder(
+            encoder_implementation_digest=_d("encoder"),
+            checkpoint_digest=_d(checkpoint),
+            semantic_output_protocol_digest=_d("semantic-output"),
+        ),
         mathematical_dtype_digest=FLOAT64_MATHEMATICAL_DTYPE_DIGEST,
     )
 
@@ -84,9 +87,74 @@ def test_semantic_cache_key_roundtrip_and_content_binding() -> None:
     assert first.key.semantic_cache_key_digest == second.key.semantic_cache_key_digest
     assert first.semantic_cache_digest != second.semantic_cache_digest
     tampered = key.to_dict()
-    tampered["checkpoint_digest"] = _d("tampered")
+    tampered["semantic_transform"]["checkpoint_digest"] = _d("tampered")
     with pytest.raises(V03ContractError, match="does not match"):
         SemanticCacheKey.from_dict(tampered)
+
+
+def test_semantic_transform_tagged_roundtrip_and_raw_has_no_encoder_sentinels() -> None:
+    raw = SemanticTransform.raw_identity()
+    raw_payload = raw.to_dict()
+    assert SemanticTransform.from_dict(raw_payload) == raw
+    assert set(raw_payload) == {
+        "schema",
+        "transform_kind",
+        "semantic_transform_digest",
+    }
+    assert raw.representation_protocol_digest == raw.semantic_transform_digest
+
+    frozen = SemanticTransform.frozen_encoder(
+        encoder_implementation_digest=_d("implementation"),
+        checkpoint_digest=_d("checkpoint"),
+        semantic_output_protocol_digest=_d("output-protocol"),
+    )
+    assert SemanticTransform.from_dict(frozen.to_dict()) == frozen
+    assert frozen.representation_protocol_digest == frozen.semantic_transform_digest
+    assert frozen.representation_protocol_digest != _d("output-protocol")
+    assert frozen.semantic_transform_digest != raw.semantic_transform_digest
+
+    raw_key = replace(
+        _key(), semantic_transform=raw, semantic_cache_key_digest=None
+    )
+    serialized = raw_key.to_dict()
+    assert SemanticCacheKey.from_dict(serialized) == raw_key
+    assert "checkpoint_digest" not in serialized["semantic_transform"]
+    assert "encoder_implementation_digest" not in serialized["semantic_transform"]
+
+
+def test_semantic_transform_rejects_partial_or_legacy_combinations() -> None:
+    with pytest.raises(V03ContractError, match="must not carry"):
+        SemanticTransform(
+            transform_kind="RAW_IDENTITY",
+            checkpoint_digest=_d("sentinel-checkpoint"),
+        )
+    with pytest.raises(V03ContractError, match="requires checkpoint_digest"):
+        SemanticTransform(
+            transform_kind="FROZEN_ENCODER",
+            encoder_implementation_digest=_d("implementation"),
+            semantic_output_protocol_digest=_d("output-protocol"),
+        )
+
+    old_flat_key = _key().to_dict()
+    transform = old_flat_key.pop("semantic_transform")
+    old_flat_key.update(
+        {
+            "encoder_implementation_digest": transform[
+                "encoder_implementation_digest"
+            ],
+            "checkpoint_digest": transform["checkpoint_digest"],
+            "semantic_output_protocol_digest": transform[
+                "semantic_output_protocol_digest"
+            ],
+        }
+    )
+    with pytest.raises(V03ContractError, match="fields differ"):
+        SemanticCacheKey.from_dict(old_flat_key)
+
+    raw_payload = SemanticTransform.raw_identity().to_dict()
+    raw_payload["checkpoint_digest"] = _d("forbidden-sentinel")
+    with pytest.raises(V03ContractError, match="fields differ"):
+        SemanticTransform.from_dict(raw_payload)
 
 
 def test_semantic_cache_freezes_mathematical_dtype() -> None:
@@ -203,10 +271,46 @@ def test_reducer_digest_is_derived_and_mixed_index_reducers_are_rejected() -> No
     )
     with pytest.raises(V03ContractError, match="reducer_digest"):
         contracts.SourceRepresentationIndex(
-            "market",
-            cache_a.key.semantic_output_protocol_digest,
+            cache_a.key.representation_protocol_digest,
             {"a": source_a, "b": source_b},
         )
+
+
+def test_base_source_index_is_market_free_until_explicit_binding() -> None:
+    cache = _cache()
+    source = build_source_reduced_spec(
+        cache,
+        kernel_bandwidth=1.0,
+        measurement_protocol_id=_d("measurement"),
+        probe_dataset_digest=cache.key.raw_dataset_digest,
+        reducer_config=ReducerConfig(
+            support_budget=2,
+            support_steps=0,
+            kmeans_steps=0,
+            ridge=0.0,
+        ),
+    )
+    base = contracts.SourceRepresentationIndex(
+        cache.key.representation_protocol_digest,
+        {"source-a": source},
+    )
+    assert "policy_market_id" not in base.to_manifest_dict()
+    with pytest.raises(TypeError):
+        contracts.SourceRepresentationIndex(
+            policy_market_id=_d("fake-market"),
+            representation_protocol_id=cache.key.representation_protocol_digest,
+            entries={"source-a": source},
+        )
+
+    bound = contracts.bind_source_representation_index_to_market(
+        base,
+        policy_market_id=_d("real-market"),
+    )
+    assert bound.source_index is base
+    assert bound.entries == base.entries
+    assert bound.source_representation_index_digest == base.representation_index_digest
+    assert bound.representation_index_digest != base.representation_index_digest
+    assert bound.to_manifest_dict()["policy_market_id"] == _d("real-market")
 
 
 def test_signed_reduced_weights_are_preserved_and_norm_checked() -> None:
@@ -221,7 +325,7 @@ def test_signed_reduced_weights_are_preserved_and_norm_checked() -> None:
         rkme_norm2=norm,
         empirical_norm2=1.0,
         reduction_error=0.1,
-        protocol_id=cache.key.semantic_output_protocol_digest,
+        protocol_id=cache.key.representation_protocol_digest,
         source_dataset_digest=cache.key.raw_dataset_digest,
     )
     key = SpecKey(
@@ -271,7 +375,7 @@ def test_v02_adapter_rejects_norm_inconsistent_legacy_spec() -> None:
         reducer_digest=_d("reducer"),
         support_budget=2,
         latent_dim=1,
-        representation_protocol_id=cache.key.semantic_output_protocol_digest,
+        representation_protocol_id=cache.key.representation_protocol_digest,
         measurement_protocol_id=_d("measurement"),
         canonical_view_digest=cache.key.canonical_view_digest,
         kernel_bandwidth=1.0,
@@ -298,7 +402,7 @@ def test_v02_adapter_recomputes_full_cache_lineage() -> None:
         reducer_digest=_d("legacy-reducer"),
         support_budget=supports.shape[0],
         latent_dim=1,
-        representation_protocol_id=cache.key.semantic_output_protocol_digest,
+        representation_protocol_id=cache.key.representation_protocol_digest,
         measurement_protocol_id=_d("measurement"),
         canonical_view_digest=cache.key.canonical_view_digest,
         kernel_bandwidth=1.0,

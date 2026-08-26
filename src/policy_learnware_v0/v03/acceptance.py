@@ -22,6 +22,7 @@ from .contracts import (
     RankingKey,
     SemanticCacheKey,
     SemanticCacheRecord,
+    SemanticTransform,
     SourceRepresentationIndex,
     build_empirical_query_spec,
     build_source_reduced_spec,
@@ -47,9 +48,7 @@ def _cache(label: str, points: np.ndarray, offsets: np.ndarray) -> SemanticCache
             canonical_view_digest=view,
             window_protocol_digest=_d("window-protocol"),
             normalizer_digest=_d("normalizer"),
-            encoder_implementation_digest=_d("fake-encoder-implementation"),
-            checkpoint_digest=_d("fake-encoder-checkpoint"),
-            semantic_output_protocol_digest=_d("representation-protocol"),
+            semantic_transform=SemanticTransform.raw_identity(),
             mathematical_dtype_digest=FLOAT64_MATHEMATICAL_DTYPE_DIGEST,
         ),
         points=points,
@@ -123,7 +122,7 @@ def run_minimal_compute_acceptance() -> MinimalComputeAcceptanceReport:
         ),
         np.asarray([0, 2, 4, 6], dtype=np.int64),
     )
-    representation = _d("representation-protocol")
+    representation = source_a_cache.key.representation_protocol_digest
     measurement = _d("measurement-protocol")
     reducer = ReducerConfig(
         support_budget=4,
@@ -148,7 +147,6 @@ def run_minimal_compute_acceptance() -> MinimalComputeAcceptanceReport:
         **common,
     )
     index = SourceRepresentationIndex(
-        policy_market_id="v03-smoke-market",
         representation_protocol_id=representation,
         entries={"source-a": source_a, "source-b": source_b},
     )
@@ -181,8 +179,12 @@ def run_minimal_compute_acceptance() -> MinimalComputeAcceptanceReport:
     reduced_run = run_joint_distance_stage(reduced_request)
     recompute = recompute_joint_distance_run(empirical_request, empirical_run)
     gate = evaluate_minimal_numeric_gate(empirical_request, empirical_run, recompute)
-    empirical_by_id = {row.opaque_id: row.result for row in empirical_run.rows}
-    reduced_by_id = {row.opaque_id: row.result for row in reduced_run.rows}
+    empirical_by_id = {
+        row.opaque_learnware_id: row.result for row in empirical_run.rows
+    }
+    reduced_by_id = {
+        row.opaque_learnware_id: row.result for row in reduced_run.rows
+    }
     checks = {
         "empirical_primary_role": empirical_query.spec_role == "QUERY_EMPIRICAL",
         "explicit_reduced_role": reduced_query.spec_role == "QUERY_REDUCED",
@@ -197,7 +199,9 @@ def run_minimal_compute_acceptance() -> MinimalComputeAcceptanceReport:
             empirical_request.ranking_key.ranking_key_digest
             != reduced_request.ranking_key.ranking_key_digest
         ),
-        "expected_nearest_source": empirical_run.rows[0].opaque_id == "source-a",
+        "expected_nearest_source": (
+            empirical_run.rows[0].opaque_learnware_id == "source-a"
+        ),
         "lossless_mode_distance_parity": all(
             abs(empirical_by_id[source_id].squared_distance - reduced_by_id[source_id].squared_distance)
             <= 1.0e-7

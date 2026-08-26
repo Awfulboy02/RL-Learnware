@@ -36,7 +36,8 @@ class V03ContractError(ValueError):
 SpecRole = Literal["SOURCE_REDUCED", "QUERY_EMPIRICAL", "QUERY_REDUCED"]
 SPEC_ROLES = frozenset({"SOURCE_REDUCED", "QUERY_EMPIRICAL", "QUERY_REDUCED"})
 
-SEMANTIC_CACHE_KEY_SCHEMA = "policy-learnware.v03-semantic-cache-key.v0"
+SEMANTIC_TRANSFORM_SCHEMA = "policy-learnware.v03-semantic-transform.v0"
+SEMANTIC_CACHE_KEY_SCHEMA = "policy-learnware.v03-semantic-cache-key.v1"
 SEMANTIC_CACHE_RECORD_SCHEMA = "policy-learnware.v03-semantic-cache-record.v0"
 SEMANTIC_CACHE_SLICE_SCHEMA = "policy-learnware.v03-semantic-cache-slice.v0"
 SPEC_KEY_SCHEMA = "policy-learnware.v03-spec-key.v0"
@@ -44,7 +45,10 @@ RANKING_KEY_SCHEMA = "policy-learnware.v03-ranking-key.v0"
 SOURCE_REDUCED_SPEC_SCHEMA = "policy-learnware.v03-source-reduced-spec.v0"
 EMPIRICAL_QUERY_SPEC_SCHEMA = "policy-learnware.v03-empirical-query-spec.v0"
 REDUCED_QUERY_SPEC_SCHEMA = "policy-learnware.v03-reduced-query-spec.v0"
-SOURCE_INDEX_SCHEMA = "policy-learnware.v03-source-representation-index.v0"
+SOURCE_INDEX_SCHEMA = "policy-learnware.v03-source-representation-index.v1"
+MARKET_BOUND_SOURCE_INDEX_SCHEMA = (
+    "policy-learnware.v03-market-bound-source-representation-index.v0"
+)
 
 EMPIRICAL_QUERY_MARKER = sha256_json(
     {
@@ -153,6 +157,142 @@ def derive_reducer_digest(config: ReducerConfig) -> str:
     )
 
 
+SemanticTransformKind: TypeAlias = Literal["RAW_IDENTITY", "FROZEN_ENCODER"]
+SEMANTIC_TRANSFORM_KINDS = frozenset({"RAW_IDENTITY", "FROZEN_ENCODER"})
+
+
+@dataclass(frozen=True)
+class SemanticTransform:
+    """Tagged, fail-closed transform from canonical windows to KME points.
+
+    ``RAW_IDENTITY`` deliberately has no encoder implementation, checkpoint,
+    or semantic-output protocol fields.  For both tags, the representation
+    protocol is the digest of the complete transform contract.  In particular,
+    two frozen checkpoints never share a coordinate-system identity merely
+    because they expose the same output shape/protocol.
+    """
+
+    transform_kind: SemanticTransformKind
+    encoder_implementation_digest: str | None = None
+    checkpoint_digest: str | None = None
+    semantic_output_protocol_digest: str | None = None
+    semantic_transform_digest: str | None = None
+    schema: str = SEMANTIC_TRANSFORM_SCHEMA
+
+    def __post_init__(self) -> None:
+        if self.schema != SEMANTIC_TRANSFORM_SCHEMA:
+            raise V03ContractError("unsupported SemanticTransform schema")
+        if self.transform_kind not in SEMANTIC_TRANSFORM_KINDS:
+            raise V03ContractError("unsupported semantic transform kind")
+        if self.transform_kind == "RAW_IDENTITY":
+            forbidden = {
+                name: getattr(self, name)
+                for name in (
+                    "encoder_implementation_digest",
+                    "checkpoint_digest",
+                    "semantic_output_protocol_digest",
+                )
+                if getattr(self, name) is not None
+            }
+            if forbidden:
+                raise V03ContractError(
+                    "RAW_IDENTITY must not carry encoder/checkpoint/protocol "
+                    f"bindings: {sorted(forbidden)}"
+                )
+        else:
+            for name in (
+                "encoder_implementation_digest",
+                "checkpoint_digest",
+                "semantic_output_protocol_digest",
+            ):
+                value = getattr(self, name)
+                if value is None:
+                    raise V03ContractError(
+                        f"FROZEN_ENCODER requires {name}"
+                    )
+                object.__setattr__(self, name, _digest(value, name))
+        expected = sha256_json(self._payload_without_digest())
+        if self.semantic_transform_digest is None:
+            object.__setattr__(self, "semantic_transform_digest", expected)
+        elif _digest(
+            self.semantic_transform_digest, "semantic_transform_digest"
+        ) != expected:
+            raise V03ContractError(
+                "semantic_transform_digest does not match transform contents"
+            )
+
+    @classmethod
+    def raw_identity(cls) -> "SemanticTransform":
+        return cls(transform_kind="RAW_IDENTITY")
+
+    @classmethod
+    def frozen_encoder(
+        cls,
+        *,
+        encoder_implementation_digest: str,
+        checkpoint_digest: str,
+        semantic_output_protocol_digest: str,
+    ) -> "SemanticTransform":
+        return cls(
+            transform_kind="FROZEN_ENCODER",
+            encoder_implementation_digest=encoder_implementation_digest,
+            checkpoint_digest=checkpoint_digest,
+            semantic_output_protocol_digest=semantic_output_protocol_digest,
+        )
+
+    @property
+    def representation_protocol_digest(self) -> str:
+        return str(self.semantic_transform_digest)
+
+    def _payload_without_digest(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "schema": self.schema,
+            "transform_kind": self.transform_kind,
+        }
+        if self.transform_kind == "FROZEN_ENCODER":
+            payload.update(
+                {
+                    "encoder_implementation_digest": (
+                        self.encoder_implementation_digest
+                    ),
+                    "checkpoint_digest": self.checkpoint_digest,
+                    "semantic_output_protocol_digest": (
+                        self.semantic_output_protocol_digest
+                    ),
+                }
+            )
+        return payload
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            **self._payload_without_digest(),
+            "semantic_transform_digest": self.semantic_transform_digest,
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "SemanticTransform":
+        if not isinstance(value, Mapping):
+            raise V03ContractError("SemanticTransform must be a mapping")
+        kind = value.get("transform_kind")
+        common = {"schema", "transform_kind", "semantic_transform_digest"}
+        if kind == "RAW_IDENTITY":
+            _strict(value, common, "RAW_IDENTITY SemanticTransform")
+        elif kind == "FROZEN_ENCODER":
+            _strict(
+                value,
+                common
+                | {
+                    "encoder_implementation_digest",
+                    "checkpoint_digest",
+                    "semantic_output_protocol_digest",
+                },
+                "FROZEN_ENCODER SemanticTransform",
+            )
+        else:
+            raise V03ContractError("unsupported semantic transform kind")
+        return cls(**dict(value))
+
+
 @dataclass(frozen=True)
 class SemanticCacheKey:
     raw_dataset_digest: str
@@ -160,9 +300,7 @@ class SemanticCacheKey:
     canonical_view_digest: str
     window_protocol_digest: str
     normalizer_digest: str
-    encoder_implementation_digest: str
-    checkpoint_digest: str
-    semantic_output_protocol_digest: str
+    semantic_transform: SemanticTransform
     mathematical_dtype_digest: str
     semantic_cache_key_digest: str | None = None
     schema: str = SEMANTIC_CACHE_KEY_SCHEMA
@@ -176,12 +314,13 @@ class SemanticCacheKey:
             "canonical_view_digest",
             "window_protocol_digest",
             "normalizer_digest",
-            "encoder_implementation_digest",
-            "checkpoint_digest",
-            "semantic_output_protocol_digest",
             "mathematical_dtype_digest",
         ):
             object.__setattr__(self, name, _digest(getattr(self, name), name))
+        if not isinstance(self.semantic_transform, SemanticTransform):
+            raise V03ContractError(
+                "semantic_transform must be a typed SemanticTransform"
+            )
         expected = sha256_json(self._payload_without_digest())
         if self.semantic_cache_key_digest is None:
             object.__setattr__(self, "semantic_cache_key_digest", expected)
@@ -200,11 +339,13 @@ class SemanticCacheKey:
             "canonical_view_digest": self.canonical_view_digest,
             "window_protocol_digest": self.window_protocol_digest,
             "normalizer_digest": self.normalizer_digest,
-            "encoder_implementation_digest": self.encoder_implementation_digest,
-            "checkpoint_digest": self.checkpoint_digest,
-            "semantic_output_protocol_digest": self.semantic_output_protocol_digest,
+            "semantic_transform": self.semantic_transform.to_dict(),
             "mathematical_dtype_digest": self.mathematical_dtype_digest,
         }
+
+    @property
+    def representation_protocol_digest(self) -> str:
+        return self.semantic_transform.representation_protocol_digest
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -216,7 +357,11 @@ class SemanticCacheKey:
     def from_dict(cls, value: Mapping[str, Any]) -> "SemanticCacheKey":
         fields = set(cls.__dataclass_fields__)
         _strict(value, fields, "SemanticCacheKey")
-        return cls(**{name: value[name] for name in fields})
+        payload = {name: value[name] for name in fields}
+        payload["semantic_transform"] = SemanticTransform.from_dict(
+            payload["semantic_transform"]
+        )
+        return cls(**payload)
 
 
 @dataclass(frozen=True)
@@ -531,10 +676,10 @@ class SourceReducedSpec:
         _digest(self.reduced_kme.protocol_id, "reduced_kme.protocol_id")
         if (
             self.reduced_kme.protocol_id
-            != self.semantic_cache_key.semantic_output_protocol_digest
+            != self.semantic_cache_key.representation_protocol_digest
         ):
             raise V03ContractError(
-                "source ReducedRKME and semantic-output protocol differ"
+                "source ReducedRKME and representation protocol differ"
             )
         if self.spec_key.kernel_bandwidth != self.reduced_kme.bandwidth:
             raise V03ContractError("source SpecKey and ReducedRKME bandwidth differ")
@@ -644,10 +789,10 @@ class EmpiricalQuerySpec:
             raise V03ContractError("empirical KME and representation protocol differ")
         if (
             self.representation_protocol_id
-            != self.semantic_cache_key.semantic_output_protocol_digest
+            != self.semantic_cache_key.representation_protocol_digest
         ):
             raise V03ContractError(
-                "query representation and semantic-output protocol differ"
+                "query representation and semantic-cache protocol differ"
             )
         if self.empirical_kme.dataset_digest != self.probe_dataset_digest:
             raise V03ContractError("empirical KME and probe dataset digest differ")
@@ -760,10 +905,10 @@ class ReducedQuerySpec:
         _digest(self.reduced_kme.protocol_id, "reduced_kme.protocol_id")
         if (
             self.reduced_kme.protocol_id
-            != self.semantic_cache_key.semantic_output_protocol_digest
+            != self.semantic_cache_key.representation_protocol_digest
         ):
             raise V03ContractError(
-                "reduced query and semantic-output protocol differ"
+                "reduced query and representation protocol differ"
             )
         if self.spec_key.semantic_cache_digest != self.semantic_cache_digest:
             raise V03ContractError("reduced-query SpecKey is bound to another semantic cache")
@@ -842,7 +987,6 @@ QuerySpec: TypeAlias = EmpiricalQuerySpec | ReducedQuerySpec
 
 @dataclass(frozen=True)
 class SourceRepresentationIndex:
-    policy_market_id: str
     representation_protocol_id: str
     entries: Mapping[str, SourceReducedSpec]
     representation_index_digest: str | None = None
@@ -851,19 +995,18 @@ class SourceRepresentationIndex:
     def __post_init__(self) -> None:
         if self.schema != SOURCE_INDEX_SCHEMA:
             raise V03ContractError("unsupported SourceRepresentationIndex schema")
-        market_id = _nonempty(self.policy_market_id, "policy_market_id")
         protocol = _digest(self.representation_protocol_id, "representation_protocol_id")
         entries = dict(self.entries)
         if not entries:
             raise V03ContractError("source representation index cannot be empty")
-        for opaque_id, source in entries.items():
-            _nonempty(opaque_id, "source opaque_id")
+        for opaque_learnware_id, source in entries.items():
+            _nonempty(opaque_learnware_id, "source opaque_learnware_id")
             if not isinstance(source, SourceReducedSpec):
                 raise V03ContractError("source index entries must be SourceReducedSpec")
             if source.representation_protocol_id != protocol:
                 raise V03ContractError("source index contains another representation protocol")
         reference = next(iter(entries.values()))
-        for opaque_id, source in entries.items():
+        for opaque_learnware_id, source in entries.items():
             shared = {
                 "measurement_protocol_id": (
                     source.measurement_protocol_id,
@@ -896,10 +1039,10 @@ class SourceRepresentationIndex:
             }
             if mismatches:
                 raise V03ContractError(
-                    f"source index entry {opaque_id!r} has incompatible bindings: "
+                    "source index entry "
+                    f"{opaque_learnware_id!r} has incompatible bindings: "
                     f"{mismatches}"
                 )
-        object.__setattr__(self, "policy_market_id", market_id)
         object.__setattr__(self, "representation_protocol_id", protocol)
         object.__setattr__(self, "entries", MappingProxyType(dict(sorted(entries.items()))))
         expected = sha256_json(self._payload_without_digest())
@@ -913,11 +1056,10 @@ class SourceRepresentationIndex:
     def _payload_without_digest(self) -> dict[str, Any]:
         return {
             "schema": self.schema,
-            "policy_market_id": self.policy_market_id,
             "representation_protocol_id": self.representation_protocol_id,
             "entries": {
-                opaque_id: source.source_spec_digest
-                for opaque_id, source in self.entries.items()
+                opaque_learnware_id: source.source_spec_digest
+                for opaque_learnware_id, source in self.entries.items()
             },
         }
 
@@ -926,6 +1068,93 @@ class SourceRepresentationIndex:
             **self._payload_without_digest(),
             "representation_index_digest": self.representation_index_digest,
         }
+
+
+@dataclass(frozen=True)
+class MarketBoundSourceRepresentationIndex:
+    """Explicitly bind a reusable representation index to one policy market.
+
+    Raw KME and encoder-only computation use :class:`SourceRepresentationIndex`
+    directly and therefore carry no fake market identity.  The anonymous policy
+    selector accepts only this wrapper, whose digest commits to both the market
+    and the already-validated base index.
+    """
+
+    policy_market_id: str
+    source_index: SourceRepresentationIndex
+    market_bound_index_digest: str | None = None
+    schema: str = MARKET_BOUND_SOURCE_INDEX_SCHEMA
+
+    def __post_init__(self) -> None:
+        if self.schema != MARKET_BOUND_SOURCE_INDEX_SCHEMA:
+            raise V03ContractError(
+                "unsupported MarketBoundSourceRepresentationIndex schema"
+            )
+        market_id = _digest(self.policy_market_id, "policy_market_id")
+        if not isinstance(self.source_index, SourceRepresentationIndex):
+            raise V03ContractError(
+                "market-bound index requires a typed SourceRepresentationIndex"
+            )
+        object.__setattr__(self, "policy_market_id", market_id)
+        expected = sha256_json(self._payload_without_digest())
+        if self.market_bound_index_digest is None:
+            object.__setattr__(self, "market_bound_index_digest", expected)
+        elif _digest(
+            self.market_bound_index_digest, "market_bound_index_digest"
+        ) != expected:
+            raise V03ContractError(
+                "market_bound_index_digest does not match market/index binding"
+            )
+
+    @property
+    def representation_protocol_id(self) -> str:
+        return self.source_index.representation_protocol_id
+
+    @property
+    def entries(self) -> Mapping[str, SourceReducedSpec]:
+        return self.source_index.entries
+
+    @property
+    def representation_index_digest(self) -> str:
+        return str(self.market_bound_index_digest)
+
+    @property
+    def source_representation_index_digest(self) -> str:
+        return str(self.source_index.representation_index_digest)
+
+    def _payload_without_digest(self) -> dict[str, Any]:
+        return {
+            "schema": self.schema,
+            "policy_market_id": self.policy_market_id,
+            "source_representation_index_digest": (
+                self.source_representation_index_digest
+            ),
+        }
+
+    def to_manifest_dict(self) -> dict[str, Any]:
+        return {
+            **self._payload_without_digest(),
+            "representation_protocol_id": self.representation_protocol_id,
+            "market_bound_index_digest": self.market_bound_index_digest,
+        }
+
+
+RepresentationIndex: TypeAlias = (
+    SourceRepresentationIndex | MarketBoundSourceRepresentationIndex
+)
+
+
+def bind_source_representation_index_to_market(
+    source_index: SourceRepresentationIndex,
+    *,
+    policy_market_id: str,
+) -> MarketBoundSourceRepresentationIndex:
+    """Create the only policy-market-bearing representation index contract."""
+
+    return MarketBoundSourceRepresentationIndex(
+        policy_market_id=policy_market_id,
+        source_index=source_index,
+    )
 
 
 def source_from_v02_environment_spec(
@@ -948,7 +1177,7 @@ def source_from_v02_environment_spec(
         raise V03ContractError("legacy source and semantic-cache raw dataset differ")
     if (
         environment_spec.representation_protocol_id
-        != semantic_cache.key.semantic_output_protocol_digest
+        != semantic_cache.key.representation_protocol_digest
     ):
         raise V03ContractError(
             "legacy source and semantic-cache output protocol differ"
@@ -1064,7 +1293,7 @@ def build_empirical_query_spec(
         semantic_slice.points,
         GaussianKernel(kernel_bandwidth),
         episode_offsets=semantic_slice.episode_offsets,
-        protocol_id=semantic_cache.key.semantic_output_protocol_digest,
+        protocol_id=semantic_cache.key.representation_protocol_digest,
         dataset_digest=probe_dataset_digest,
         block_size=block_size,
         computation_backend=computation_backend,
@@ -1074,7 +1303,7 @@ def build_empirical_query_spec(
         semantic_cache_key=semantic_cache.key,
         semantic_cache_digest=str(semantic_cache.semantic_cache_digest),
         spec_key=key,
-        representation_protocol_id=semantic_cache.key.semantic_output_protocol_digest,
+        representation_protocol_id=semantic_cache.key.representation_protocol_digest,
         measurement_protocol_id=measurement_protocol_id,
         canonical_view_digest=semantic_cache.key.canonical_view_digest,
         probe_dataset_digest=probe_dataset_digest,
@@ -1104,7 +1333,7 @@ def build_source_reduced_spec(
         semantic_slice.points,
         GaussianKernel(kernel_bandwidth),
         episode_offsets=semantic_slice.episode_offsets,
-        protocol_id=semantic_cache.key.semantic_output_protocol_digest,
+        protocol_id=semantic_cache.key.representation_protocol_digest,
         dataset_digest=probe_dataset_digest,
         block_size=block_size,
         computation_backend=computation_backend,
@@ -1172,21 +1401,26 @@ __all__ = [
     "EPISODE_BALANCED_WEIGHTING_DIGEST",
     "FLOAT64_MATHEMATICAL_DTYPE_DIGEST",
     "GAUSSIAN_KERNEL_EVALUATOR_DIGEST",
+    "MARKET_BOUND_SOURCE_INDEX_SCHEMA",
     "QUERY_EMPIRICAL_PROTOCOL_ID",
     "QUERY_REDUCED_PROTOCOL_ID",
     "EmpiricalQuerySpec",
+    "MarketBoundSourceRepresentationIndex",
     "QuerySpec",
     "RankingKey",
     "ReducedQuerySpec",
     "SemanticCacheRecord",
     "SemanticCacheSlice",
     "SemanticCacheKey",
+    "SemanticTransform",
+    "SemanticTransformKind",
     "SourceReducedSpec",
     "SourceRepresentationIndex",
     "SpecKey",
     "SpecRole",
     "V03ContractError",
     "build_empirical_query_spec",
+    "bind_source_representation_index_to_market",
     "build_source_reduced_spec",
     "derive_reducer_digest",
     "reduce_query_spec",

@@ -20,6 +20,7 @@ from policy_learnware_v0.v03.contracts import (
     RankingKey,
     SemanticCacheKey,
     SemanticCacheRecord,
+    SemanticTransform,
     SourceRepresentationIndex,
     V03ContractError,
     build_empirical_query_spec,
@@ -40,9 +41,32 @@ def _cache(label: str, points: np.ndarray) -> SemanticCacheRecord:
             canonical_view_digest=_d("view"),
             window_protocol_digest=_d("window-protocol"),
             normalizer_digest=_d("normalizer"),
-            encoder_implementation_digest=_d("encoder"),
-            checkpoint_digest=_d("checkpoint"),
-            semantic_output_protocol_digest=_d("semantic-output"),
+            semantic_transform=SemanticTransform.raw_identity(),
+            mathematical_dtype_digest=FLOAT64_MATHEMATICAL_DTYPE_DIGEST,
+        ),
+        points,
+        np.asarray([0, 2, 4], dtype=np.int64),
+    )
+
+
+def _frozen_cache(
+    label: str,
+    points: np.ndarray,
+    *,
+    checkpoint_label: str,
+) -> SemanticCacheRecord:
+    return SemanticCacheRecord(
+        SemanticCacheKey(
+            raw_dataset_digest=_d(f"raw:{label}"),
+            ordered_episode_window_digest=_d(f"window:{label}"),
+            canonical_view_digest=_d("view"),
+            window_protocol_digest=_d("window-protocol"),
+            normalizer_digest=_d("normalizer"),
+            semantic_transform=SemanticTransform.frozen_encoder(
+                encoder_implementation_digest=_d("shared-implementation"),
+                checkpoint_digest=_d(checkpoint_label),
+                semantic_output_protocol_digest=_d("shared-output-protocol"),
+            ),
             mathematical_dtype_digest=FLOAT64_MATHEMATICAL_DTYPE_DIGEST,
         ),
         points,
@@ -55,7 +79,7 @@ def numeric_fixture():
     source_a_cache = _cache("a", np.asarray([[0.0], [0.1], [0.2], [0.3]]))
     source_b_cache = _cache("b", np.asarray([[2.0], [2.1], [2.2], [2.3]]))
     query_cache = _cache("q", np.asarray([[0.05], [0.15], [0.1], [0.2]]))
-    representation = source_a_cache.key.semantic_output_protocol_digest
+    representation = source_a_cache.key.representation_protocol_digest
     measurement = _d("measurement")
     reducer = ReducerConfig(
         support_budget=4,
@@ -114,7 +138,7 @@ def test_lossless_reduced_query_matches_empirical_ranking(numeric_fixture) -> No
             reduced_distance.squared_distance, abs=1.0e-7
         )
 
-    index = SourceRepresentationIndex("market", representation, sources)
+    index = SourceRepresentationIndex(representation, sources)
     tokens = {"a": _d("tie-a"), "b": _d("tie-b")}
 
     def request(item):
@@ -130,8 +154,8 @@ def test_lossless_reduced_query_matches_empirical_ranking(numeric_fixture) -> No
     reduced_request = request(reduced)
     empirical_run = run_joint_distance_stage(empirical_request)
     reduced_run = run_joint_distance_stage(reduced_request)
-    assert [row.opaque_id for row in empirical_run.rows] == ["a", "b"]
-    assert [row.opaque_id for row in reduced_run.rows] == ["a", "b"]
+    assert [row.opaque_learnware_id for row in empirical_run.rows] == ["a", "b"]
+    assert [row.opaque_learnware_id for row in reduced_run.rows] == ["a", "b"]
     assert empirical_request.ranking_key.ranking_key_digest != reduced_request.ranking_key.ranking_key_digest
     recompute = recompute_joint_distance_run(empirical_request, empirical_run)
     assert recompute.matched
@@ -153,7 +177,7 @@ def test_binding_mismatch_and_negative_tolerance_fail_closed(numeric_fixture) ->
 
 def test_ranking_key_rejects_wrong_index_and_tie_map(numeric_fixture) -> None:
     query, sources, _reducer, representation = numeric_fixture
-    index = SourceRepresentationIndex("market", representation, sources)
+    index = SourceRepresentationIndex(representation, sources)
     tokens = {"a": _d("tie-a"), "b": _d("tie-b")}
     ranking = RankingKey(
         query.query_spec_digest,
@@ -172,3 +196,70 @@ def test_ranking_key_rejects_wrong_index_and_tie_map(numeric_fixture) -> None:
     )
     with pytest.raises(V03ContractError, match="coverage"):
         JointDistanceRequest(query, index, correct, {"a": _d("tie-a")})
+
+
+def test_frozen_checkpoint_identity_cannot_cross_source_or_query_geometry() -> None:
+    measurement = _d("measurement")
+    reducer = ReducerConfig(
+        support_budget=4,
+        support_steps=0,
+        kmeans_steps=0,
+        ridge=0.0,
+        pinv_rcond=1.0e-12,
+    )
+
+    def source(cache: SemanticCacheRecord):
+        return build_source_reduced_spec(
+            cache,
+            kernel_bandwidth=0.9,
+            measurement_protocol_id=measurement,
+            probe_dataset_digest=cache.key.raw_dataset_digest,
+            reducer_config=reducer,
+        )
+
+    source_a_cache = _frozen_cache(
+        "source-a",
+        np.asarray([[0.0], [0.1], [0.2], [0.3]]),
+        checkpoint_label="checkpoint-a",
+    )
+    source_b_cache = _frozen_cache(
+        "source-b",
+        np.asarray([[1.0], [1.1], [1.2], [1.3]]),
+        checkpoint_label="checkpoint-b",
+    )
+    source_a = source(source_a_cache)
+    source_b = source(source_b_cache)
+    assert (
+        source_a_cache.key.semantic_transform.semantic_output_protocol_digest
+        == source_b_cache.key.semantic_transform.semantic_output_protocol_digest
+    )
+    with pytest.raises(V03ContractError, match="another representation protocol"):
+        SourceRepresentationIndex(
+            source_a.representation_protocol_id,
+            {"a": source_a, "b": source_b},
+        )
+
+    index = SourceRepresentationIndex(
+        source_a.representation_protocol_id,
+        {"a": source_a},
+    )
+    query_cache = _frozen_cache(
+        "query",
+        np.asarray([[0.0], [0.1], [0.2], [0.3]]),
+        checkpoint_label="checkpoint-query",
+    )
+    query = build_empirical_query_spec(
+        query_cache,
+        kernel_bandwidth=0.9,
+        measurement_protocol_id=measurement,
+        probe_dataset_digest=query_cache.key.raw_dataset_digest,
+    )
+    tokens = {"a": _d("tie-a")}
+    ranking = RankingKey(
+        query.query_spec_digest,
+        index.representation_index_digest,
+        _d("selector"),
+        tie_break_digest(tokens),
+    )
+    with pytest.raises(V03ContractError, match="different representation protocols"):
+        JointDistanceRequest(query, index, ranking, tokens)

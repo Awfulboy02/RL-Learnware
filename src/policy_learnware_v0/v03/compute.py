@@ -14,6 +14,7 @@ from ..rkme.distance import empirical_to_reduced_distance
 from ..rkme.gaussian import GaussianKernel
 from .contracts import (
     EmpiricalQuerySpec,
+    MarketBoundSourceRepresentationIndex,
     QuerySpec,
     RankingKey,
     ReducedQuerySpec,
@@ -54,10 +55,13 @@ def tie_break_digest(tokens: Mapping[str, str]) -> str:
     parsed: dict[str, str] = {}
     if not isinstance(tokens, Mapping) or not tokens:
         raise V03ContractError("tie-break token map cannot be empty")
-    for opaque_id, token in tokens.items():
-        if not isinstance(opaque_id, str) or not opaque_id:
+    for opaque_learnware_id, token in tokens.items():
+        if not isinstance(opaque_learnware_id, str) or not opaque_learnware_id:
             raise V03ContractError("tie-break opaque IDs must be non-empty")
-        parsed[opaque_id] = _digest(token, f"tie_break_tokens[{opaque_id!r}]")
+        parsed[opaque_learnware_id] = _digest(
+            token,
+            f"tie_break_tokens[{opaque_learnware_id!r}]",
+        )
     if len(set(parsed.values())) != len(parsed):
         raise V03ContractError("tie-break tokens must be unique")
     return sha256_json(
@@ -236,7 +240,7 @@ def query_to_source_distance(
 @dataclass(frozen=True)
 class JointDistanceRequest:
     query_spec: QuerySpec
-    source_index: SourceRepresentationIndex
+    source_index: SourceRepresentationIndex | MarketBoundSourceRepresentationIndex
     ranking_key: RankingKey
     tie_break_tokens: Mapping[str, str]
     distance_form: DistanceForm = "mmd"
@@ -246,7 +250,10 @@ class JointDistanceRequest:
     def __post_init__(self) -> None:
         if not isinstance(self.query_spec, (EmpiricalQuerySpec, ReducedQuerySpec)):
             raise V03ContractError("joint request query has the wrong type")
-        if not isinstance(self.source_index, SourceRepresentationIndex):
+        if not isinstance(
+            self.source_index,
+            (SourceRepresentationIndex, MarketBoundSourceRepresentationIndex),
+        ):
             raise V03ContractError("joint request index has the wrong type")
         if not isinstance(self.ranking_key, RankingKey):
             raise V03ContractError("joint request ranking key has the wrong type")
@@ -290,12 +297,16 @@ class JointDistanceRequest:
 
 @dataclass(frozen=True)
 class JointDistanceRow:
-    opaque_id: str
+    opaque_learnware_id: str
     rank: int
     result: QuerySourceDistance
 
     def to_dict(self) -> dict[str, Any]:
-        return {"opaque_id": self.opaque_id, "rank": self.rank, **self.result.to_dict()}
+        return {
+            "opaque_learnware_id": self.opaque_learnware_id,
+            "rank": self.rank,
+            **self.result.to_dict(),
+        }
 
 
 @dataclass(frozen=True)
@@ -325,7 +336,7 @@ class JointDistanceRun:
             raise V03ContractError("joint distance run cannot be empty")
         if tuple(row.rank for row in self.rows) != tuple(range(1, len(self.rows) + 1)):
             raise V03ContractError("joint distance ranks must be contiguous")
-        if len({row.opaque_id for row in self.rows}) != len(self.rows):
+        if len({row.opaque_learnware_id for row in self.rows}) != len(self.rows):
             raise V03ContractError("joint distance rows contain duplicate IDs")
         if self.clamp_count != sum(row.result.clamped for row in self.rows):
             raise V03ContractError("clamp_count does not match rows")
@@ -358,7 +369,7 @@ def run_joint_distance_stage(request: JointDistanceRequest) -> JointDistanceRun:
     if not isinstance(request, JointDistanceRequest):
         raise V03ContractError("request must be a JointDistanceRequest")
     scored: list[tuple[float, str, str, QuerySourceDistance]] = []
-    for opaque_id, source in request.source_index.entries.items():
+    for opaque_learnware_id, source in request.source_index.entries.items():
         result = query_to_source_distance(
             request.query_spec,
             source,
@@ -367,12 +378,24 @@ def run_joint_distance_stage(request: JointDistanceRequest) -> JointDistanceRun:
             negative_tolerance=request.negative_tolerance,
         )
         scored.append(
-            (result.value, request.tie_break_tokens[opaque_id], opaque_id, result)
+            (
+                result.value,
+                request.tie_break_tokens[opaque_learnware_id],
+                opaque_learnware_id,
+                result,
+            )
         )
     scored.sort(key=lambda item: (item[0], item[1]))
     rows = tuple(
-        JointDistanceRow(opaque_id=opaque_id, rank=rank, result=result)
-        for rank, (_value, _token, opaque_id, result) in enumerate(scored, start=1)
+        JointDistanceRow(
+            opaque_learnware_id=opaque_learnware_id,
+            rank=rank,
+            result=result,
+        )
+        for rank, (_value, _token, opaque_learnware_id, result) in enumerate(
+            scored,
+            start=1,
+        )
     )
     return JointDistanceRun(
         request_digest=request.request_digest,

@@ -40,7 +40,15 @@ def atomic_write_bytes(
     *,
     overwrite: bool = False,
 ) -> str:
-    """Publish bytes with flush + fsync + rename, returning file SHA-256."""
+    """Publish bytes durably, without racing immutable writers.
+
+    Immutable publication uses a hard-link from a same-directory temporary
+    file.  Creating that final directory entry is atomic and fails when the
+    destination already exists; unlike a check followed by ``os.replace``, it
+    cannot overwrite a winner from another process.  Explicit ``overwrite``
+    retains replacement semantics for the few mutable/debug call sites that
+    request it deliberately.
+    """
 
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -56,9 +64,15 @@ def atomic_write_bytes(
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
-        if destination.exists() and not overwrite:
-            raise ArtifactExistsError(f"refusing to overwrite artifact: {destination}")
-        os.replace(temporary, destination)
+        if overwrite:
+            os.replace(temporary, destination)
+        else:
+            try:
+                os.link(temporary, destination)
+            except FileExistsError as error:
+                raise ArtifactExistsError(
+                    f"refusing to overwrite artifact: {destination}"
+                ) from error
         _fsync_directory(destination.parent)
     finally:
         if temporary.exists():
