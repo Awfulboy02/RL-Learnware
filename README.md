@@ -236,10 +236,17 @@ PYTHONPATH=src:. "$V03_PY" -m compileall -q \
   src/policy_learnware_v0/v03 server/repro_fpo_ppo_v03
 ```
 
-2026-08-27 的 clean `v03` 服务器验收为 `323 passed, 1 skipped`；GoRL 环境使用
+2026-08-27 的 clean `v03` 服务器验收为 `340 passed, 1 skipped`；GoRL 环境使用
 JAX 0.7.2，GPU 可见，真实 R5/R5L backend 的最小初始化/fit smoke 已通过。这个结果只说明
 代码、合同和最小训练路径可执行，不表示 79 项 Signal Atlas、45 个 fits 或 baseline
 真实矩阵已经运行。
+
+同日的 production asset binding 已在服务器对 exact-90 进行 90/90
+`validate_candidate` 并通过，发布状态为 `ASSET_BINDINGS_READY`。binding receipt
+digest 为 `161667e7432b507382c9cb1cc08cbab7287ecc01f7bf18d075ccd35700b0dad4`，
+file SHA-256 为 `1b3f8e4baae5a29553d2c8f62375b38fdeaa017faf203dbaa9ef0906ce9f56f9`。
+该步骤明确记录 `rollout_executed=false`、`training_executed=false`、
+`private_nonces_persisted=false` 和 `formal_run_authorized=false`。
 
 把 `formal_run_authorized` 置为 `true` 前，外部审核必须逐项绑定并复核：
 

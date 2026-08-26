@@ -1,19 +1,7 @@
-"""Server-owned, read-only v0.3 production asset binding."""
+"""Server-owned v0.3 production helpers.
 
-from .asset_binding import (
-    ASSET_BINDING_RECEIPT_SCHEMA,
-    ASSET_BINDINGS_READY,
-    LEGACY_ASSET_INVENTORY_SCHEMA,
-    AssetBindingError,
-    ProductionAssetBindingConfig,
-    bind_production_assets,
-)
-
-__all__ = [
-    "ASSET_BINDING_RECEIPT_SCHEMA",
-    "ASSET_BINDINGS_READY",
-    "LEGACY_ASSET_INVENTORY_SCHEMA",
-    "AssetBindingError",
-    "ProductionAssetBindingConfig",
-    "bind_production_assets",
-]
+The package intentionally avoids importing command modules eagerly.  This
+keeps ``python -m server.repro_fpo_ppo_v03.asset_binding`` single-loaded and
+prevents ``runpy`` from executing a module that was already imported while
+initialising its package.
+"""
