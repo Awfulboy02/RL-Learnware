@@ -921,6 +921,17 @@ def run(args: argparse.Namespace) -> Mapping[str, Any]:
         "signal_fit_train_steps": optimization.train_steps,
     }
     atomic_write_json(output / "summary.json", summary, overwrite=True)
+    atomic_write_json(
+        output / "progress.json",
+        {
+            "scope": SCOPE,
+            "status": "COMPLETE" if complete else "PARTIAL",
+            "completed_numeric_cell_count": len(all_cell_artifacts),
+            "scheduled_numeric_cell_count": len(scheduled),
+            "completed_cell_ids": sorted(all_cell_artifacts),
+        },
+        overwrite=True,
+    )
     return summary
 
 
