@@ -6,8 +6,10 @@ v0.2 在独立 `v02` 分支上实现 dynamics-axis/anchor 环境、source-specia
 训练 provenance、匿名全市场、replaceable `EnvironmentSpec` 表征、L-min、B0–B5
 baselines、development P/private O/reference E tables、return/regret/ranking metrics、
 hierarchical bootstrap、max-T/Holm/non-inferiority、cold/warm cost、information isolation、
-independent recompute 与不可覆写 completion。正式 v0.2 终点是
-`READY_FOR_V03_JOINT_CONFIRMATORY`，不是 Paper-I held-out 实证结论。
+independent recompute 与不可覆写 completion。v0.2 冻结 handoff milestone 记为
+`READY_FOR_V03_MARKET_INTAKE`：它交付 exact-90 source candidate-pool handoff，
+不是 30-entry champion market，也不是 Paper-I held-out 实证结论。真实 source
+receipts、championization、market intake 与后续 benchmark 全部由 `v03` 分支执行。
 
 关键边界：
 
@@ -26,9 +28,13 @@ independent recompute 与不可覆写 completion。正式 v0.2 终点是
   `execution_purpose` 贯穿 job、attempt、checkpoint、bundle、record 与 queue result；只有
   `v02_freeze_ready + GPU` 可以进入 formal admission，development GPU 和 CPU/debug smoke
   均不能升级。
-- 正式 championization 精确复核 config 派生的 `30 anchors × 3 seeds` admitted grid、
-  selection/attestation episode 数和三方 bundle digest；market 数量与 ID 集合均不能由
-  调用方缩减。
+- exact-90 handoff 对 `30 anchors × seeds 0/1/2` 做逐字节复核。正常终态直接接纳；
+  仅因 reload compiled-policy parity 失败的六个终态由 append-only promotion record
+  指向同一 attempt 中最后一个已经通过 finite、golden parity 与 compiled parity 的
+  canonical checkpoint。它不放宽 tolerance，也不接纳失败的新 checkpoint。
+- 该 handoff acceptance 是 v0.3 的只读资产输入，不冒充既有
+  `TrainingRunRecord` admission、真实 championization 或 30-entry market。v0.3 必须先
+  fail-closed intake，再用 evaluator-owned source receipts 完成 champion/market。
 - 正式 protocol freeze 同时绑定 config 原始 bytes、四类 config projection、Git clean
   commit 和 v0.2 package/server implementation tree；所有后续正式命令都会重验该 freeze。
 - 正式 gate/recompute 使用不可序列化的进程内 authority；裸 `true` JSON、手写 digest 或
@@ -47,6 +53,21 @@ independent recompute 与不可覆写 completion。正式 v0.2 终点是
 PYTHONPATH=src:. pytest tests/v02 -q
 PYTHONPATH=src:. pytest server/repro_fpo_ppo_v02/tests tests/v02/test_server_training_bridge.py -q
 PYTHONPATH=src:. python scripts/run_v02_cpu_acceptance.py
+```
+
+冻结的服务器训练树可用 append-only CLI 生成 promotion manifest 并复核 exact-90
+handoff；两个输出路径必须尚不存在：
+
+```bash
+PYTHONPATH=src:. python scripts/accept_v02_policy_pool.py prepare-promotions \
+  --server-plan /absolute/server_training_plan.json \
+  --runs-root /absolute/server_runs \
+  --output /new/private_validation/compiled_parity_promotions.json
+PYTHONPATH=src:. python scripts/accept_v02_policy_pool.py accept \
+  --server-plan /absolute/server_training_plan.json \
+  --runs-root /absolute/server_runs \
+  --promotions /new/private_validation/compiled_parity_promotions.json \
+  --output /new/private_validation/policy_pool_acceptance.json
 ```
 
 CPU acceptance 会真实跑通 2 tasks × 5 shared-nominal anchors × 2 seeds、9 methods、
