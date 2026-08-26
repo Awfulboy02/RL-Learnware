@@ -88,7 +88,9 @@ def _complete_report(value: Mapping[str, Any], where: str) -> None:
 
 
 def _formal_unavailable(market_loaded: bool) -> Mapping[str, Sequence[str]]:
-    shared = [] if market_loaded else ["missing real 30-entry V03SourcePolicyMarket"]
+    shared = ["missing 66 typed v03 baseline queries"]
+    if not market_loaded:
+        shared.insert(0, "missing real 30-entry V03SourcePolicyMarket")
     return {
         "B0": (*shared, "missing market-bound Raw source index", "exact-nine fitter needs a real development freeze"),
         "B1": (*shared, "missing market-bound Raw source index", "exact-nine fitter needs a real development freeze"),
