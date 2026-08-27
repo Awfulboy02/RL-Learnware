@@ -77,6 +77,7 @@ class MujocoPlaygroundEnvAdapter:
         self,
         task: str,
         *,
+        native_environment: Any | None = None,
         expected_horizon: int | None = None,
         expected_action_repeat: int | None = None,
         jit: bool = True,
@@ -92,8 +93,17 @@ class MujocoPlaygroundEnvAdapter:
         self._jax = jax
         self._registry = registry
         self._task = task
-        self._registry_config_object = registry.get_default_config(task)
-        self._env = registry.load(task, config=self._registry_config_object)
+        if native_environment is None:
+            self._registry_config_object = registry.get_default_config(task)
+            self._env = registry.load(task, config=self._registry_config_object)
+        else:
+            config = getattr(native_environment, "_config", None)
+            if config is None:
+                raise ValueError(
+                    "native_environment must expose the registry config as _config"
+                )
+            self._registry_config_object = config
+            self._env = native_environment
         self._reset_fn = jax.jit(self._env.reset) if jit else self._env.reset
         self._step_fn = jax.jit(self._env.step) if jit else self._env.step
 
@@ -273,6 +283,7 @@ class MujocoPlaygroundEnvAdapter:
         reset_seeds: np.ndarray,
         probe_seeds: np.ndarray,
         sigma: float,
+        steps: int | None = None,
     ) -> dict[str, np.ndarray]:
         """Collect fixed-horizon DMC episodes with one JIT ``scan`` + ``vmap``.
 
@@ -290,6 +301,14 @@ class MujocoPlaygroundEnvAdapter:
             raise ValueError("reset_seeds and probe_seeds must be same-shape vectors")
         if reset_values.size == 0:
             raise ValueError("at least one episode seed is required")
+        rollout_steps = self.schema.horizon if steps is None else steps
+        if (
+            isinstance(rollout_steps, bool)
+            or not isinstance(rollout_steps, (int, np.integer))
+            or not 1 <= int(rollout_steps) <= self.schema.horizon
+        ):
+            raise ValueError("steps must lie in [1, environment horizon]")
+        rollout_steps = int(rollout_steps)
 
         def keys_from_seeds(values: np.ndarray) -> Any:
             device_values = jnp.asarray(values, dtype=jnp.uint32)
@@ -307,7 +326,7 @@ class MujocoPlaygroundEnvAdapter:
         def episode_actions(key: Any) -> Any:
             return sample_clipped_gaussian_episode_jax(
                 key,
-                steps=self.schema.horizon,
+                steps=rollout_steps,
                 action_dim=self.schema.action_dim,
                 sigma=float(sigma),
                 action_low=low,
@@ -365,14 +384,14 @@ class MujocoPlaygroundEnvAdapter:
         episode_count = reset_values.size
         return {
             "observation": observation.reshape(
-                episode_count * self.schema.horizon, self.schema.observation_dim
+                episode_count * rollout_steps, self.schema.observation_dim
             ).astype(np.float32),
             "action": action.reshape(
-                episode_count * self.schema.horizon, self.schema.action_dim
+                episode_count * rollout_steps, self.schema.action_dim
             ).astype(np.float32),
             "reward": reward.reshape(-1).astype(np.float32),
             "next_observation": next_observation.reshape(
-                episode_count * self.schema.horizon, self.schema.observation_dim
+                episode_count * rollout_steps, self.schema.observation_dim
             ).astype(np.float32),
             "terminated": terminated.reshape(-1),
             "truncated": truncated.reshape(-1),
