@@ -72,6 +72,26 @@ BASELINE_METHOD_KINDS = MappingProxyType(
         "M02/B5": "lmin_joint_distance",
     }
 )
+
+# v0.31 changes the paper-facing method hierarchy without changing any frozen
+# selector or artifact identifier.  In particular, ``B3b`` and ``M02/B5`` are
+# historical IDs embedded in development artifacts and must not be renamed.
+V031_PRIMARY_METHOD_ID = "B3b"
+V031_COMPARISON_VARIANT_METHOD_ID = "M02/B5"
+V031_METHOD_DISPLAY_NAMES = MappingProxyType(
+    {
+        "B3b": "Raw-RKME Learnware",
+        "A-Env": "Learned EnvironmentSpec, distance-only",
+        "M02/B5": "Learned EnvironmentSpec + global competence fusion",
+    }
+)
+V031_METHOD_ROLES = MappingProxyType(
+    {
+        "B3b": "primary_operator",
+        "A-Env": "learned_representation_variant",
+        "M02/B5": "competence_fusion_variant",
+    }
+)
 FORMAL_DEVELOPMENT_CONTEXT_COUNT = 24
 NO_FALLBACK_POLICY = "RANK_ONE_ONLY_NO_FALLBACK"
 

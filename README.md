@@ -1,4 +1,23 @@
-# Policy Learnware v0 / v0.1 / v0.2 / v0.3
+# Policy Learnware v0 / v0.1 / v0.2 / v0.3 / v0.31
+
+## v0.31：Raw-RKME 方法角色修订
+
+v0.31 不另开分支，也不重写算法或冻结产物。根据 v0.3 development 结果，论文主算子改为
+**Raw-RKME Learnware**：canonical raw transitions 经 source-only normalization、跨任务
+padding/mask canonicalization 后，构建 source Reduced RKME 与 query Empirical KME，并以
+Gaussian MMD 最近邻完成复用。原 `B3b` 仅作为冻结 artifact ID 保留。
+
+| 冻结 artifact ID | v0.31 论文角色 | 展示名 |
+|---|---|---|
+| `B3b` | 主方法 | Raw-RKME Learnware |
+| `A-Env` | 表示学习比较变种 | Learned EnvironmentSpec, distance-only |
+| `M02/B5` | competence 融合比较变种 | Learned EnvironmentSpec + global competence fusion |
+
+`competence_i` 不再进入主检索公式，只保留为 source-side 质量信息或诊断量。历史 JSON/CSV、
+method ID、RKME/MMD 公式和 selector 数值逻辑均不改名、不重算。完整的结果、证据边界与后续
+最小实验计划统一记录在
+[Policy_Learnware_v0.31_Plan_and_Report.md](docs/Policy_Learnware_v0.31_Plan_and_Report.md)。
+当前证据仍是 `formal=false` 的 development 结果，不能表述为 confirmatory 结论。
 
 ## v0.3：最小可复现实验闭环
 
@@ -107,11 +126,11 @@ v0.3 固定比较 9 个 required methods：
 | `B1` | source/global champion |
 | `B2` | v0 TaskSpec-NN → nominal champion |
 | `B3a` | raw transition moments nearest |
-| `B3b` | raw packed-event KME nearest |
+| `B3b` | raw packed-event KME nearest（历史 ID；v0.31 论文主方法） |
 | `B4a` | development-label kNN ranker |
 | `B4b` | development-label linear ranker |
 | `A-Env` | frozen CORRO EnvironmentSpec nearest |
-| `M02/B5` | L-min + frozen CORRO-style incumbent |
+| `M02/B5` | L-min + frozen CORRO-style（历史 ID；v0.31 competence 融合比较变种） |
 
 `B4c` 和 `B6` 默认关闭，private best-in-pool oracle 只用于发布 public rankings 后的
 skyline/regret 评估，不属于可部署方法。所有方法都必须对匿名 30-entry full pool 排序，
@@ -174,7 +193,8 @@ PYTHONPATH=src:. python -B -m server.repro_fpo_ppo_v03.baseline_runner \
 
 `signal_fit_runner` 执行 36 个 R5 + 9 个 R5L 真实 fits；
 `source_market_runner` 执行 90 selection + 30 attestation 并发布 30-entry market。
-默认 baseline 入口是可立即复算的历史六任务 M02/B5 development replay，
+默认 baseline 入口是可立即复算的历史六任务 M02/B5 development replay；这是兼容性入口，
+不是 v0.31 的论文主方法。v0.31 主方法是 Raw-RKME Learnware（冻结 ID `B3b`）。
 不冒充 P6 formal exact-nine；真实 30-market/24-context prepared inputs 到位后，
 用 `--prepared-input-factory module:callable` 在同一入口运行现有 exact-nine 科学实现。
 `--max-jobs 1 --train-steps 2`、`--max-selection 1` 和 `--max-queries 1`

@@ -1,5 +1,12 @@
 # v0.3 anonymous-market runtime note
 
+> **v0.31 method-role note.** The paper-primary operator is now
+> **Raw-RKME Learnware** (stable historical artifact ID `B3b`). The learned
+> EnvironmentSpec distance path (`A-Env`) and its global-competence fusion
+> (`M02/B5`) are comparison variants. This role change does not alter the
+> runtime contracts, numerical selector logic, or frozen artifact IDs. See
+> [Policy_Learnware_v0.31_Plan_and_Report.md](Policy_Learnware_v0.31_Plan_and_Report.md).
+
 `policy_learnware_v0.v03.anonymous_market` implements the P0 engineering
 join between the source policy market, source RKME index, public distance run,
 and the target execution ABI. It is runtime plumbing, not an admission system.
