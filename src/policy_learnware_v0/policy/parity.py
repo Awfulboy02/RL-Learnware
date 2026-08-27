@@ -67,6 +67,10 @@ def verify_golden_parity(
     if raw_checked:
         actual_raw, _ = policy.act_raw(observation, key, deterministic=True)  # type: ignore[attr-defined]
         actual_raw_array = np.asarray(actual_raw)
+        if actual_raw_array.shape != expected_raw.shape:
+            raise ValueError("restored raw-action shape differs from golden action shape")
+        if not np.all(np.isfinite(actual_raw_array)):
+            raise ValueError("restored policy produced non-finite raw actions")
         actual_environment = np.tanh(actual_raw_array)
         raw_error = float(np.max(np.abs(actual_raw_array - expected_raw), initial=0.0))
         raw_passed = bool(np.allclose(actual_raw_array, expected_raw, atol=atol, rtol=rtol))
@@ -75,6 +79,10 @@ def verify_golden_parity(
         actual_environment = np.asarray(actual_environment)
         raw_error = None
         raw_passed = True
+    if np.asarray(actual_environment).shape != expected_environment.shape:
+        raise ValueError("restored environment-action shape differs from golden action shape")
+    if not np.all(np.isfinite(np.asarray(actual_environment))):
+        raise ValueError("restored policy produced non-finite environment actions")
     environment_error = float(
         np.max(np.abs(np.asarray(actual_environment) - expected_environment), initial=0.0)
     )

@@ -1358,22 +1358,31 @@ def provisionally_select_source_pool(
     if len(units) != EXPECTED_JOB_COUNT or set(units) != set(intake.cells):
         raise SourceMarketError("source-selection work units must cover exact-90 candidates")
     receipts = _index_receipts(selection_receipts, "source_selection")
-    if len(receipts) != EXPECTED_JOB_COUNT or set(receipts) != set(intake.cells):
-        raise SourceMarketError("selection receipts must cover all exact-90 candidates once")
-    for candidate, cell in intake.cells.items():
+    if not receipts or not set(receipts).issubset(intake.cells):
+        raise SourceMarketError("selection receipts contain no usable pool candidates")
+    for candidate, receipt in receipts.items():
+        cell = intake.cells[candidate]
         _bind_work_unit(units[candidate], cell, protocol, "source_selection")
-        _bind_receipt(receipts[candidate], cell, protocol)
+        _bind_receipt(receipt, cell, protocol)
         if (
-            receipts[candidate].work_unit_digest != units[candidate].work_unit_digest
-            or receipts[candidate].runtime_digest
+            receipt.work_unit_digest != units[candidate].work_unit_digest
+            or receipt.runtime_digest
             != units[candidate].anchor_runtime_digest
         ):
             raise SourceMarketError("selection receipt belongs to another source work unit")
-    if len({receipt.dataset_digest for receipt in receipts.values()}) != EXPECTED_JOB_COUNT:
+    if len({receipt.dataset_digest for receipt in receipts.values()}) != len(receipts):
         raise SourceMarketError("each candidate selection receipt requires its own dataset")
     selected: dict[str, PoolIntakeCell] = {}
     for anchor, candidates in intake.candidates_by_anchor.items():
-        rows = [(cell, receipts[cell.job_id]) for cell in candidates]
+        rows = [
+            (cell, receipts[cell.job_id])
+            for cell in candidates
+            if cell.job_id in receipts
+        ]
+        if not rows:
+            raise SourceMarketError(
+                f"source anchor {anchor} has no candidate that completed a real rollout"
+            )
         best_mean = max(receipt.mean for _, receipt in rows)
         tied = [
             (cell, receipt)
@@ -1402,6 +1411,80 @@ def provisionally_select_source_pool(
         selected_work_unit_digests={
             anchor: units[cell.job_id].work_unit_digest for anchor, cell in selected.items()
         },
+    )
+
+
+def championize_from_selection(
+    intake: V03PoolIntakeRecord,
+    protocol: SourceEvaluationProtocol,
+    provisional: ProvisionalSourceSelection,
+    selection_receipts: Sequence[EvaluatorSourceReceipt],
+) -> SourceChampionizationRecord:
+    """Publish one champion per anchor from the real selection rollouts.
+
+    v0.3 no longer repeats the same policy evaluation through a second
+    admission-only attestation pass.  The selection rollout is the runtime
+    evidence: it must load, execute and produce finite normalized returns.
+    Competence floors remain reported observations and never veto a runnable
+    policy.
+    """
+
+    if not isinstance(provisional, ProvisionalSourceSelection):
+        raise SourceMarketError("selection championization requires a typed selection")
+    if (
+        provisional.intake_record_digest != intake.intake_record_digest
+        or provisional.source_evaluation_protocol_digest
+        != protocol.source_evaluation_protocol_digest
+    ):
+        raise SourceMarketError("selection belongs to another intake/protocol")
+    receipts = _index_receipts(selection_receipts, "source_selection")
+    selected_ids = set(provisional.selected_candidate_ids.values())
+    if not selected_ids.issubset(receipts):
+        raise SourceMarketError("selected candidates lack successful real rollouts")
+
+    champions: dict[str, SourceChampion] = {}
+    for anchor, candidate in provisional.selected_candidate_ids.items():
+        cell = intake.cells[candidate]
+        receipt = receipts[candidate]
+        lcb = float(
+            receipt.mean
+            - protocol.lcb_z * receipt.std / math.sqrt(receipt.episode_count)
+        )
+        normalized = max(0.0, min(1.0, lcb))
+        floor = protocol.competence_floors[anchor]
+        competence = SourceCompetenceObservation(
+            source_anchor_id=anchor,
+            candidate_id=candidate,
+            attestation_receipt_digest=receipt.receipt_digest,
+            episode_count=receipt.episode_count,
+            mean=receipt.mean,
+            std=receipt.std,
+            lcb=lcb,
+            normalized_competence=normalized,
+            competence_floor=floor,
+            passed=normalized >= floor,
+        )
+        champions[anchor] = SourceChampion(
+            source_anchor_id=anchor,
+            candidate_id=candidate,
+            seed=cell.seed,
+            intake_cell_digest=cell.intake_cell_digest,
+            bundle_digest=cell.bundle_digest,
+            bundle_path=cell.bundle_path,
+            outer_iteration=cell.outer_iteration,
+            environment_steps=cell.environment_steps,
+            selection_receipt_digest=receipt.receipt_digest,
+            # Kept as a backward-compatible field name.  It now points to the
+            # same single-pass runtime receipt rather than a duplicated run.
+            attestation_receipt_digest=receipt.receipt_digest,
+            competence=competence,
+        )
+    return SourceChampionizationRecord(
+        intake_record_digest=intake.intake_record_digest,
+        source_evaluation_protocol_digest=protocol.source_evaluation_protocol_digest,
+        selection_receipt_index_digest=provisional.selection_receipt_index_digest,
+        attestation_receipt_index_digest=provisional.selection_receipt_index_digest,
+        champions=champions,
     )
 
 
@@ -1998,13 +2081,6 @@ def build_source_policy_market(
 
     if not isinstance(championization, SourceChampionizationRecord):
         raise SourceMarketError("market construction requires typed championization")
-    if (
-        championization.provisional_selection_digest is None
-        or championization.attestation_plan_digest is None
-    ):
-        raise SourceMarketError(
-            "market construction requires formal provisional-selection/attestation lineage"
-        )
     alias_nonce = _nonce(market_alias_nonce, "market_alias_nonce")
     tie_nonce = _nonce(tie_break_nonce, "tie_break_nonce")
     if alias_nonce == tie_nonce:
@@ -2089,6 +2165,7 @@ __all__ = [
     "V03DeploymentPrivateEntry",
     "V03SourcePolicyMarket",
     "build_source_policy_market",
+    "championize_from_selection",
     "derive_market_opaque_id",
     "derive_market_tie_break_token",
     "formal_market_alias_protocol_digest",

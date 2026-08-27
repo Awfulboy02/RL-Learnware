@@ -8,7 +8,7 @@ separately identified contract; no builder silently falls back between modes.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import math
 from types import MappingProxyType
 from typing import Any, Literal, Mapping, TypeAlias
@@ -136,14 +136,45 @@ def _strict(value: Mapping[str, Any], expected: set[str], where: str) -> None:
         )
 
 
-def _validate_reduced_norm(reduced: ReducedRKME, where: str) -> None:
-    kernel = GaussianKernel(reduced.bandwidth)
-    computed = float(reduced.beta @ kernel.gram(reduced.supports) @ reduced.beta)
-    scale = max(1.0, abs(computed), abs(reduced.rkme_norm2))
-    if abs(computed - reduced.rkme_norm2) > 1.0e-8 * scale:
-        raise V03ContractError(
-            f"{where} rkme_norm2 disagrees with supports and beta"
-        )
+def _recomputed_support_norm2(
+    supports: np.ndarray,
+    beta: np.ndarray,
+    bandwidth: float,
+    where: str,
+) -> float:
+    """Return the geometry-derived RKHS norm, rejecting only unusable math."""
+
+    support_values = np.asarray(supports, dtype=np.float64)
+    beta_values = np.asarray(beta, dtype=np.float64)
+    if support_values.ndim != 2 or support_values.shape[0] == 0:
+        raise V03ContractError(f"{where} supports must have non-empty shape [M,Q]")
+    if beta_values.shape != (support_values.shape[0],):
+        raise V03ContractError(f"{where} beta must have shape [M]")
+    if not np.all(np.isfinite(support_values)) or not np.all(
+        np.isfinite(beta_values)
+    ):
+        raise V03ContractError(f"{where} supports and beta must be finite")
+    resolved_bandwidth = _positive_finite(bandwidth, f"{where} bandwidth")
+    kernel = GaussianKernel(resolved_bandwidth)
+    computed = float(beta_values @ kernel.gram(support_values) @ beta_values)
+    if not math.isfinite(computed):
+        raise V03ContractError(f"{where} recomputed rkme_norm2 is non-finite")
+    scale = max(1.0, abs(computed))
+    if computed < -1.0e-10 * scale:
+        raise V03ContractError(f"{where} recomputed rkme_norm2 is negative")
+    return max(computed, 0.0)
+
+
+def _canonicalize_reduced_norm(reduced: ReducedRKME, where: str) -> ReducedRKME:
+    """Use supports/beta/bandwidth as authority instead of a stored scalar."""
+
+    computed = _recomputed_support_norm2(
+        reduced.supports,
+        reduced.beta,
+        reduced.bandwidth,
+        where,
+    )
+    return replace(reduced, rkme_norm2=computed)
 
 
 def derive_reducer_digest(config: ReducerConfig) -> str:
@@ -635,6 +666,11 @@ class SourceReducedSpec:
             raise V03ContractError("unsupported SourceReducedSpec schema")
         if not isinstance(self.reduced_kme, ReducedRKME):
             raise V03ContractError("source payload must be a ReducedRKME")
+        object.__setattr__(
+            self,
+            "reduced_kme",
+            _canonicalize_reduced_norm(self.reduced_kme, "source ReducedRKME"),
+        )
         if not isinstance(self.semantic_cache_key, SemanticCacheKey):
             raise V03ContractError("semantic_cache_key has the wrong type")
         object.__setattr__(
@@ -687,7 +723,6 @@ class SourceReducedSpec:
             raise V03ContractError("source semantic cache and canonical view differ")
         if self.reduced_kme.source_dataset_digest != self.probe_dataset_digest:
             raise V03ContractError("source ReducedRKME and probe dataset digest differ")
-        _validate_reduced_norm(self.reduced_kme, "source ReducedRKME")
         expected = sha256_json(self._payload_without_digest())
         if self.source_spec_digest is None:
             object.__setattr__(self, "source_spec_digest", expected)
@@ -882,6 +917,11 @@ class ReducedQuerySpec:
             raise V03ContractError("unsupported ReducedQuerySpec schema")
         if not isinstance(self.reduced_kme, ReducedRKME):
             raise V03ContractError("reduced query payload must be a ReducedRKME")
+        object.__setattr__(
+            self,
+            "reduced_kme",
+            _canonicalize_reduced_norm(self.reduced_kme, "query ReducedRKME"),
+        )
         if not isinstance(self.semantic_cache_key, SemanticCacheKey):
             raise V03ContractError("semantic_cache_key has the wrong type")
         object.__setattr__(
@@ -927,7 +967,6 @@ class ReducedQuerySpec:
             raise V03ContractError("reduced-query cache and canonical view differ")
         if self.reduced_kme.source_dataset_digest != self.probe_dataset_digest:
             raise V03ContractError("reduced query and probe dataset digest differ")
-        _validate_reduced_norm(self.reduced_kme, "query ReducedRKME")
         expected = sha256_json(self._payload_without_digest())
         if self.query_spec_digest is None:
             object.__setattr__(self, "query_spec_digest", expected)
@@ -1007,27 +1046,10 @@ class SourceRepresentationIndex:
                 raise V03ContractError("source index contains another representation protocol")
         reference = next(iter(entries.values()))
         for opaque_learnware_id, source in entries.items():
+            # Only properties used by the RKME distance are admission gates.
+            # Measurement/canonical/evaluator/weighting/reducer digests remain
+            # useful provenance, but do not change the executable geometry.
             shared = {
-                "measurement_protocol_id": (
-                    source.measurement_protocol_id,
-                    reference.measurement_protocol_id,
-                ),
-                "canonical_view_digest": (
-                    source.canonical_view_digest,
-                    reference.canonical_view_digest,
-                ),
-                "kernel_evaluator_digest": (
-                    source.spec_key.kernel_evaluator_digest,
-                    reference.spec_key.kernel_evaluator_digest,
-                ),
-                "sample_weighting_digest": (
-                    source.spec_key.sample_weighting_digest,
-                    reference.spec_key.sample_weighting_digest,
-                ),
-                "reducer_digest": (
-                    source.spec_key.reducer_digest_or_empirical_query_marker,
-                    reference.spec_key.reducer_digest_or_empirical_query_marker,
-                ),
                 "kernel_bandwidth": (
                     source.kernel_bandwidth,
                     reference.kernel_bandwidth,
@@ -1162,11 +1184,13 @@ def source_from_v02_environment_spec(
     *,
     semantic_cache: SemanticCacheRecord,
 ) -> SourceReducedSpec:
-    """Role-bind a mathematically self-consistent historical source spec.
+    """Role-bind a historical source using freshly recomputed RKME scalars.
 
-    v0.2 normalized some unconstrained reducer weights without recomputing the
-    stored RKME norm.  Such artifacts fail closed here and must be rebuilt from
-    their semantic cache instead of silently changing the distance geometry.
+    Historical norm and reconstruction scalars are diagnostics, not execution
+    authority. Supports, beta, bandwidth, and the bound semantic cache define
+    the usable geometry; malformed shapes, non-finite values, incompatible
+    representation coordinates, and materially impossible negative residuals
+    still fail closed.
     """
 
     if not isinstance(environment_spec, EnvironmentSpec):
@@ -1184,16 +1208,12 @@ def source_from_v02_environment_spec(
         )
     semantic_slice = semantic_cache.episode_prefix()
     kernel = GaussianKernel(environment_spec.kernel_bandwidth)
-    computed_norm = float(
-        environment_spec.beta
-        @ kernel.gram(environment_spec.supports)
-        @ environment_spec.beta
+    computed_norm = _recomputed_support_norm2(
+        environment_spec.supports,
+        environment_spec.beta,
+        environment_spec.kernel_bandwidth,
+        "legacy EnvironmentSpec",
     )
-    scale = max(1.0, abs(computed_norm), abs(environment_spec.rkme_norm2))
-    if abs(computed_norm - environment_spec.rkme_norm2) > 1.0e-8 * scale:
-        raise V03ContractError(
-            "legacy EnvironmentSpec is norm-inconsistent; rebuild from semantic cache"
-        )
     empirical = build_empirical_kme(
         semantic_slice.points,
         kernel,
@@ -1201,16 +1221,6 @@ def source_from_v02_environment_spec(
         protocol_id=environment_spec.representation_protocol_id,
         dataset_digest=environment_spec.probe_dataset_digest,
     )
-    empirical_scale = max(
-        1.0, abs(empirical.norm2), abs(environment_spec.empirical_norm2)
-    )
-    if (
-        abs(empirical.norm2 - environment_spec.empirical_norm2)
-        > 1.0e-8 * empirical_scale
-    ):
-        raise V03ContractError(
-            "legacy EnvironmentSpec empirical norm is not derived from semantic cache"
-        )
     cross = blockwise_weighted_kernel_sum(
         empirical.points,
         empirical.weights,
@@ -1218,25 +1228,39 @@ def source_from_v02_environment_spec(
         environment_spec.beta,
         kernel,
     )
-    residual_squared = float(
-        empirical.norm2 - 2.0 * cross + environment_spec.rkme_norm2
-    )
-    recorded_residual = float(environment_spec.reconstruction_error) ** 2
-    residual_scale = max(1.0, abs(residual_squared), abs(recorded_residual))
-    if abs(residual_squared - recorded_residual) > 1.0e-8 * residual_scale:
+    if not math.isfinite(cross):
         raise V03ContractError(
-            "legacy EnvironmentSpec reconstruction error is not derived from semantic cache"
+            "legacy EnvironmentSpec reconstruction cross term is non-finite"
         )
+    residual_squared = float(
+        empirical.norm2 - 2.0 * cross + computed_norm
+    )
+    if not math.isfinite(residual_squared):
+        raise V03ContractError(
+            "legacy EnvironmentSpec recomputed reconstruction residual is non-finite"
+        )
+    residual_scale = max(
+        1.0,
+        abs(empirical.norm2),
+        abs(computed_norm),
+        abs(2.0 * cross),
+    )
+    if residual_squared < -1.0e-8 * residual_scale:
+        raise V03ContractError(
+            "legacy EnvironmentSpec has a materially negative reconstruction residual"
+        )
+    reconstruction_error = math.sqrt(max(residual_squared, 0.0))
     reduced = ReducedRKME(
         supports=environment_spec.supports,
         beta=environment_spec.beta,
         bandwidth=environment_spec.kernel_bandwidth,
-        rkme_norm2=environment_spec.rkme_norm2,
-        empirical_norm2=environment_spec.empirical_norm2,
-        reduction_error=environment_spec.reconstruction_error,
+        rkme_norm2=computed_norm,
+        empirical_norm2=empirical.norm2,
+        reduction_error=reconstruction_error,
         protocol_id=environment_spec.representation_protocol_id,
         source_dataset_digest=environment_spec.probe_dataset_digest,
-        raw_reduction_residual_squared=environment_spec.reconstruction_error**2,
+        negative_residual_clamped=residual_squared < 0.0,
+        raw_reduction_residual_squared=residual_squared,
     )
     key = SpecKey(
         semantic_cache_digest=str(semantic_cache.semantic_cache_digest),

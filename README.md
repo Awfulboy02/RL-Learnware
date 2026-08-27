@@ -1,6 +1,55 @@
 # Policy Learnware v0 / v0.1 / v0.2 / v0.3
 
-## v0.3：RL MDP 规约信号图谱与基础策略复用比较
+## v0.3：最小可复现实验闭环
+
+2026-08-27 起，v0.3 采用硬性 Occam 边界：仓库只维护
+`加载 policy/encoder 资产 → 构建 RKME → query/source 匹配 → 真实策略复用 → 记录必要 metrics`
+这一条可执行链。只有缺失/不可反序列化资产、tensor ABI 或 shape 不兼容、NaN/Inf、
+真实 rollout 失败、RKME 表征协议/latent dimension/kernel bandwidth 不兼容，以及全池没有
+ABI-compatible 候选会阻断运行。golden/compiled parity 的有限漂移、历史 norm 或重构误差、
+provenance/digest 漂移、competence floor 和低回报只写入 metric/warning，不再作为事前门禁。
+单个坏候选被隔离；只有某个 anchor 的全部候选都无法真实运行时，该 anchor 才失败。
+
+v0.3 保留 13 个 transition views + 1 个历史 random-tanh control、39 个逻辑 cells、37 个
+数值 cells、45 个 R5/R5L fits，以及基础 baseline。Encoder-family 复现、LOTO 和大型
+ablation 全部属于 v0.4，v0.3 不读取也不要求这些 checkpoint。source market 使用一次真实
+selection rollout 后直接按 anchor 选优；不再重复 30 次 admission-only attestation。
+
+最小 CLI 与服务器入口：
+
+```bash
+# 数值闭环与 14-control 计划（不启动大实验）
+PYTHONPATH=src python -m policy_learnware_v0.v03 accept-numeric
+PYTHONPATH=src python -m policy_learnware_v0.v03 signal-plan
+
+# 从现有 v0.2 pool 建立最小运行绑定
+PYTHONPATH=/absolute/vendor:src:. python -B \
+  -m server.repro_fpo_ppo_v03.asset_binding \
+  --intake-record /absolute/v02_pool_intake/intake_record.json \
+  --server-plan /absolute/server_training_plan.json \
+  --fpo-root /absolute/fpo_checkout \
+  --vendor-dir /absolute/vendor \
+  --output-dir /absolute/new_binding
+
+# 单通道真实 source-market；nonce 参数可省略
+PYTHONPATH=/absolute/vendor:src:. python -B \
+  -m server.repro_fpo_ppo_v03.source_market_runner \
+  --binding-dir /absolute/new_binding \
+  --output-dir /absolute/v03_run/source_market \
+  --fpo-root /absolute/fpo_checkout \
+  --vendor-dir /absolute/vendor \
+  --resume
+```
+
+`tests/v03` 只保留数值核心、signal plan 和 CLI 三组短测试；不再用数万行测试复制 schema、
+receipt 或 authority 状态机。运行产物继续原子写入且默认不覆盖，但这属于结果保护，不是
+科学 admission。下面折叠内容是 Occam 修订前的设计记录，仅供理解历史，不是当前接口、
+命令或 completion 合同。
+
+<details>
+<summary>历史 v0.3 设计记录（已废止）</summary>
+
+### 旧版：RL MDP 规约信号图谱与基础策略复用比较
 
 v0.3 位于独立 `v03` 分支。它从冻结的 v0/v0.1/v0.2 资产出发，回答一个比
 “哪个 Encoder 更强”更基础的问题：在 candidate-independent 公共 probe 下，识别
@@ -300,6 +349,8 @@ signal manifest、594 条 public rankings 与实际 `PublicRankingBarrier` 都�
 run 或 completion 阶段产物，不是授予 authority 的前置产物，也不得提前伪造。最终
 completion 仍要求这些产物、全部 stage receipts、oracle handoff、统计、独立复算和 claim
 audit 同时通过；服务器 smoke、dry-run 或部分 cell 成功均不能单独替代 completion。
+
+</details>
 
 ## v0.2：source-anchor frozen market 与 L-min sidecar
 

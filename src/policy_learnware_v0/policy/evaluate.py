@@ -92,6 +92,16 @@ def verify_compiled_policy_parity(
     )
     reference_actions_array = np.stack(reference_actions)
     reference_key_data = np.stack(reference_next_keys)
+    if compiled_actions_array.shape != reference_actions_array.shape:
+        raise FrozenPolicyEvaluationError(
+            "compiled policy returned an incompatible action shape"
+        )
+    if not np.all(np.isfinite(compiled_actions_array)) or not np.all(
+        np.isfinite(reference_actions_array)
+    ):
+        raise FrozenPolicyEvaluationError(
+            "compiled policy parity observed non-finite actions"
+        )
     max_abs_error = float(
         np.max(
             np.abs(compiled_actions_array - reference_actions_array),

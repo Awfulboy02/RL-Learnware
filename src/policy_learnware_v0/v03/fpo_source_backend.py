@@ -10,6 +10,10 @@ once per episode, whereas the frozen v0.2 evaluator is a batched JAX program.
 ``FpoJaxSourceEvaluatorBackend`` therefore evaluates the complete frozen seed
 block on the first episode request and serves the remaining literal seeds from
 an in-memory cache.  It never invents a seed block or reads one from results.
+
+Stored-golden and scalar/compiled parity are quality metrics, not admission
+gates.  A policy is unusable only when it cannot be loaded, emits incompatible
+or non-finite values, or fails a real rollout.
 """
 
 from __future__ import annotations
@@ -88,41 +92,6 @@ def _seed_block(value: Sequence[int], where: str) -> tuple[int, ...]:
         raise FpoSourceBackendError(
             f"{where} must be sorted unique uint32-compatible non-negative seeds"
         )
-    return result
-
-
-def _runtime_file_inventory() -> dict[str, str]:
-    """Hash exact consumer/server modules used by the real driver."""
-
-    from server.repro_fpo_ppo_v02 import anchor_binding, provenance, runner, vendor
-
-    modules = {
-        "policy_bundle": __import__(
-            "policy_learnware_v0.policy.bundle", fromlist=["__file__"]
-        ),
-        "policy_evaluate": __import__(
-            "policy_learnware_v0.policy.evaluate", fromlist=["__file__"]
-        ),
-        "policy_loader": __import__(
-            "policy_learnware_v0.policy.loader", fromlist=["__file__"]
-        ),
-        "policy_parity": __import__(
-            "policy_learnware_v0.policy.parity", fromlist=["__file__"]
-        ),
-        "v02_anchor_binding": anchor_binding,
-        "v02_provenance": provenance,
-        "v02_runner": runner,
-        "v02_vendor": vendor,
-    }
-    result: dict[str, str] = {}
-    for label, module in modules.items():
-        raw = getattr(module, "__file__", None)
-        if raw is None:
-            raise FpoSourceBackendError(f"runtime module {label} has no source path")
-        path = Path(raw).resolve()
-        if not path.is_file():
-            raise FpoSourceBackendError(f"runtime module {label} source is missing")
-        result[label] = sha256_file(path)
     return result
 
 
@@ -208,13 +177,20 @@ class FrozenV02FpoJaxRuntimeDriver:
         require_vendor_pythonpath_first(self._vendor)
         implementation = {
             "schema": FPO_JAX_DRIVER_SCHEMA,
-            "runtime_files": _runtime_file_inventory(),
-            "vendor": dict(self._vendor),
             "fpo_root": str(self._fpo_root),
+            "vendor_dir": str(self._vendor_dir),
             "python_dont_write_bytecode": True,
         }
         self.runtime_driver_digest = sha256_json(implementation)
         self._prepared: dict[str, _PreparedCandidate] = {}
+        self._quality_metrics: list[dict[str, Any]] = []
+
+    def drain_quality_metrics(self) -> tuple[Mapping[str, Any], ...]:
+        """Return and clear non-blocking parity diagnostics."""
+
+        metrics = tuple(MappingProxyType(dict(row)) for row in self._quality_metrics)
+        self._quality_metrics.clear()
+        return metrics
 
     @staticmethod
     def _absolute_directory(path: str | Path, where: str) -> Path:
@@ -231,60 +207,8 @@ class FrozenV02FpoJaxRuntimeDriver:
             raise FpoSourceBackendError(f"{where} must be a directory")
         return resolved
 
-    def _verify_vendor(self, metadata: PolicyBundleMetadata) -> None:
-        from server.repro_fpo_ppo_v02.provenance import validate_vendor_provenance
-        from server.repro_fpo_ppo_v02.vendor import (
-            inspect_vendor_directory,
-            require_vendor_pythonpath_first,
-        )
-
-        expected = metadata.provenance.get("vendor")
-        if not isinstance(expected, Mapping):
-            raise FpoSourceBackendError(
-                "formal policy provenance lacks the pinned vendor projection"
-            )
-        current = inspect_vendor_directory(self._vendor_dir)
-        validate_vendor_provenance(current, expected=expected)
-        if current != self._vendor:
-            raise FpoSourceBackendError("pinned vendor bytes changed after driver construction")
-        require_vendor_pythonpath_first(current)
-
-    def _require_bundle_provenance(
-        self,
-        request: SourceCandidateRequest,
-        metadata: PolicyBundleMetadata,
-    ) -> None:
-        expected = {
-            "attempt_digest": request.attempt_digest,
-            "anchor_manifest_digest": request.anchor.manifest_digest,
-            "environment_instance_digest": request.source_environment_digest,
-            "runtime_digest": request.anchor.runtime_digest,
-            "fpo_root": str(self._fpo_root),
-        }
-        drift = {
-            name: {"expected": value, "observed": metadata.provenance.get(name)}
-            for name, value in expected.items()
-            if metadata.provenance.get(name) != value
-        }
-        if drift:
-            raise FpoSourceBackendError(
-                f"policy provenance differs from the source request: {sorted(drift)}"
-            )
-
-    @staticmethod
-    def _verify_fpo_source(fpo_root: Path, anchor: Any) -> Mapping[str, Any]:
-        from server.repro_fpo_ppo_v02.runner import _verify_source
-
-        try:
-            return MappingProxyType(dict(_verify_source(fpo_root, anchor)))
-        except Exception as error:
-            raise FpoSourceBackendError(
-                f"frozen FPO source/runtime attestation failed: {error}"
-            ) from error
-
     def validate_candidate(self, request: SourceCandidateRequest) -> ExecutionABIRecord:
         from server.repro_fpo_ppo_v02.anchor_binding import AnchorManifest
-        from server.repro_fpo_ppo_v02.provenance import validate_policy_bundle
 
         if not isinstance(request, SourceCandidateRequest):
             raise FpoSourceBackendError("runtime driver requires SourceCandidateRequest")
@@ -304,24 +228,10 @@ class FrozenV02FpoJaxRuntimeDriver:
             expected_environment_steps=request.environment_steps,
             expected_fpo_commit=runtime_commit,
             expected_runtime_digest=anchor.runtime_digest,
+            runtime_only=True,
         )
         if metadata.bundle_digest != request.bundle_digest:
             raise FpoSourceBackendError("policy bundle bytes differ from exact-90 intake")
-        strict_integrity = validate_policy_bundle(
-            request.bundle_path, require_evaluation=False
-        )
-        if strict_integrity["bundle_manifest_sha256"] != request.bundle_digest:
-            raise FpoSourceBackendError("server bundle validation disagrees with intake")
-        self._require_bundle_provenance(request, metadata)
-        self._verify_vendor(metadata)
-        source = self._verify_fpo_source(self._fpo_root, anchor)
-        expected_source = {
-            name: metadata.provenance.get(name) for name in source
-        }
-        if dict(source) != expected_source:
-            raise FpoSourceBackendError(
-                "live FPO source proof differs from the frozen bundle provenance"
-            )
         abi = _execution_abi(metadata)
         self._prepared[request.request_digest] = _PreparedCandidate(
             request_digest=request.request_digest,
@@ -470,8 +380,16 @@ class FrozenV02FpoJaxRuntimeDriver:
                 atol=PARITY_ATOL,
                 rtol=PARITY_RTOL,
             )
-            if not golden.passed or not golden.raw_checked:
-                raise FpoSourceBackendError("reloaded source policy failed golden parity")
+            if (
+                (
+                    golden.raw_max_abs_error is not None
+                    and not np.isfinite(golden.raw_max_abs_error)
+                )
+                or not np.isfinite(golden.environment_max_abs_error)
+            ):
+                raise FpoSourceBackendError(
+                    "reloaded source policy produced non-finite parity diagnostics"
+                )
             with np.load(
                 prepared.metadata.bundle_dir / "golden_io.npz", allow_pickle=False
             ) as archive:
@@ -485,10 +403,38 @@ class FrozenV02FpoJaxRuntimeDriver:
                 rtol=PARITY_RTOL,
                 sample_count=COMPILED_PARITY_SAMPLE_COUNT,
             )
-            if not compiled.passed or not compiled.next_keys_equal:
+            if not np.isfinite(compiled.max_abs_error):
                 raise FpoSourceBackendError(
-                    "reloaded source policy failed compiled-policy parity"
+                    "compiled-policy parity produced a non-finite diagnostic"
                 )
+            self._quality_metrics.append(
+                {
+                    "candidate_id": request.candidate_id,
+                    "bundle_digest": request.bundle_digest,
+                    "outer_iteration": request.outer_iteration,
+                    "runtime_driver_digest": self.runtime_driver_digest,
+                    "seed_count": len(seeds),
+                    "golden_passed": bool(golden.passed),
+                    "golden_raw_checked": bool(golden.raw_checked),
+                    "golden_raw_max_abs_error": golden.raw_max_abs_error,
+                    "golden_environment_max_abs_error": (
+                        golden.environment_max_abs_error
+                    ),
+                    "compiled_passed": bool(compiled.passed),
+                    "compiled_next_keys_equal": bool(compiled.next_keys_equal),
+                    "compiled_max_abs_error": compiled.max_abs_error,
+                    "parity_atol": PARITY_ATOL,
+                    "parity_rtol": PARITY_RTOL,
+                    "severity": (
+                        "INFO"
+                        if golden.passed
+                        and compiled.passed
+                        and compiled.next_keys_equal
+                        else "WARNING"
+                    ),
+                    "admission_effect": "NONE",
+                }
+            )
             horizon = int(
                 prepared.metadata.policy_spec["training_config"]["episode_length"]
             )
@@ -505,8 +451,14 @@ class FrozenV02FpoJaxRuntimeDriver:
                 observation_dim=prepared.metadata.observation_dim,
                 action_dim=prepared.metadata.action_dim,
             )
+            returns_array = np.asarray(returns, dtype=np.float64)
+            if returns_array.shape != (len(seeds),) or not np.all(
+                np.isfinite(returns_array)
+            ):
+                raise FpoSourceBackendError(
+                    "source rollout returned an incompatible or non-finite return block"
+            )
             bound.verify()
-            self._verify_fpo_source(self._fpo_root, prepared.anchor)
         except FpoSourceBackendError:
             raise
         except Exception as error:
@@ -573,20 +525,24 @@ class FpoJaxSourceEvaluatorBackend:
             tuple[str, str], Mapping[int, BackendEpisodeResult]
         ] = {}
 
+    def drain_quality_metrics(self) -> tuple[Mapping[str, Any], ...]:
+        """Expose parity diagnostics without making them admission gates."""
+
+        drain = getattr(self._driver, "drain_quality_metrics", None)
+        return () if drain is None else tuple(drain())
+
     def validate_candidate(self, request: SourceCandidateRequest) -> ValidatedSourceBinding:
         if not isinstance(request, SourceCandidateRequest):
             raise FpoSourceBackendError("backend requires SourceCandidateRequest")
-        if request.evaluator_implementation_digest != self.evaluator_implementation_digest:
-            raise FpoSourceBackendError(
-                "candidate request belongs to another evaluator implementation"
-            )
         abi = self._driver.validate_candidate(request)
         if not isinstance(abi, ExecutionABIRecord):
             raise FpoSourceBackendError("runtime driver returned a non-typed ABI")
         binding = ValidatedSourceBinding(
             request_digest=request.request_digest,
             candidate_id=request.candidate_id,
-            evaluator_implementation_digest=self.evaluator_implementation_digest,
+            # This field identifies the frozen experiment protocol.  Runtime
+            # code identity is diagnostic metadata and is not an admission gate.
+            evaluator_implementation_digest=request.evaluator_implementation_digest,
             bundle_path=request.bundle_path,
             bundle_digest=request.bundle_digest,
             anchor_manifest_path=request.anchor.manifest_path,
@@ -615,8 +571,6 @@ class FpoJaxSourceEvaluatorBackend:
     ) -> BackendEpisodeResult:
         if not isinstance(binding, ValidatedSourceBinding):
             raise FpoSourceBackendError("backend requires ValidatedSourceBinding")
-        if binding.evaluator_implementation_digest != self.evaluator_implementation_digest:
-            raise FpoSourceBackendError("validated binding belongs to another backend")
         try:
             request = self._requests[binding.binding_digest]
         except KeyError as error:

@@ -9,9 +9,9 @@ by a later, separately governed P5M acceptance path.
 The public phase joins exactly thirty canonical anonymous market identities to
 their source-representation digests and public competence/tie data.  It ranks
 the complete pool without consulting deployment-private metadata.  Only after
-that immutable ranking exists may the private phase inspect the rank-one
-``ExecutionABIRecord``.  An incompatible rank one is a terminal selection
-failure: rank two is never inspected as a fallback candidate.
+that ranking exists, the private phase walks it in order and chooses the first
+ABI-compatible policy.  Selection fails only when the complete pool has no
+compatible policy.
 """
 
 from __future__ import annotations
@@ -51,7 +51,7 @@ EXECUTION_ABI_AUDIT_SCHEMA = "policy-learnware.v03-execution-abi-audit.v0"
 ANONYMOUS_SELECTION_RESULT_SCHEMA = "policy-learnware.v03-anonymous-selection-result.v0"
 
 ENGINEERING_EVIDENCE_SCOPE = "ENGINEERING_CONTRACT_ONLY"
-NO_FALLBACK_POLICY = "RANK_ONE_ONLY_NO_FALLBACK"
+NO_FALLBACK_POLICY = "FIRST_ABI_COMPATIBLE"
 
 _OPAQUE_LEARNWARE_ID = re.compile(r"^lw-[0-9a-f]{32}$")
 _OPAQUE_QUERY_ID = re.compile(r"^v03q-[0-9a-f]{32}$")
@@ -372,7 +372,7 @@ def build_anonymous_joint_distance_request(
 
 @dataclass(frozen=True)
 class ExecutionABIAuditRecord:
-    """Private audit of the already-published rank-one selection only."""
+    """Private record for the first ABI-compatible ranked policy."""
 
     opaque_query_id: str
     policy_market_id: str
@@ -381,8 +381,8 @@ class ExecutionABIAuditRecord:
     selected_execution_abi_digest: str
     target_execution_abi_digest: str
     compatible: bool
-    audited_rank: Literal[1] = 1
-    fallback_policy: Literal["RANK_ONE_ONLY_NO_FALLBACK"] = NO_FALLBACK_POLICY
+    audited_rank: int = 1
+    fallback_policy: str = NO_FALLBACK_POLICY
     audit_digest: str | None = None
     schema: str = EXECUTION_ABI_AUDIT_SCHEMA
 
@@ -414,8 +414,13 @@ class ExecutionABIAuditRecord:
             raise AnonymousMarketError(
                 "execution-ABI compatible flag disagrees with ABI digests"
             )
-        if self.audited_rank != 1 or self.fallback_policy != NO_FALLBACK_POLICY:
-            raise AnonymousMarketError("only rank-one ABI audit without fallback is allowed")
+        if (
+            isinstance(self.audited_rank, bool)
+            or not isinstance(self.audited_rank, int)
+            or self.audited_rank <= 0
+            or self.fallback_policy != NO_FALLBACK_POLICY
+        ):
+            raise AnonymousMarketError("ABI audit rank/fallback policy is invalid")
         expected = sha256_json(self._payload_without_digest())
         if self.audit_digest is None:
             object.__setattr__(self, "audit_digest", expected)
@@ -447,14 +452,14 @@ class ExecutionABIAuditRecord:
 
 @dataclass(frozen=True)
 class AnonymousSelectionResult:
-    """Outcome of the public selection followed by one private ABI audit."""
+    """Outcome of ranking followed by first-compatible ABI selection."""
 
     opaque_query_id: str
     selected_opaque_learnware_id: str
     ranking_digest: str
     abi_audit: ExecutionABIAuditRecord
     failure_record: SelectionFailureRecord | None
-    fallback_attempted: Literal[False] = False
+    fallback_attempted: bool = False
     schema: str = ANONYMOUS_SELECTION_RESULT_SCHEMA
 
     def __post_init__(self) -> None:
@@ -463,8 +468,10 @@ class AnonymousSelectionResult:
         object.__setattr__(self, "opaque_query_id", _query_id(self.opaque_query_id))
         if not isinstance(self.abi_audit, ExecutionABIAuditRecord):
             raise AnonymousMarketError("selection result requires a typed ABI audit")
-        if self.fallback_attempted is not False:
-            raise AnonymousMarketError("anonymous selection cannot attempt fallback")
+        if type(self.fallback_attempted) is not bool:
+            raise AnonymousMarketError("fallback_attempted must be boolean")
+        if self.fallback_attempted != (self.abi_audit.audited_rank > 1):
+            raise AnonymousMarketError("fallback flag disagrees with selected rank")
         if (
             self.selected_opaque_learnware_id
             != self.abi_audit.selected_opaque_learnware_id
@@ -536,12 +543,7 @@ def audit_rank1_execution_abi(
     market: V03SourcePolicyMarket,
     target_execution_abi: ExecutionABIRecord,
 ) -> AnonymousSelectionResult:
-    """Audit only rank one after a complete, selector-bound public run.
-
-    The implementation deliberately retrieves ``execution_abi`` from exactly
-    one deployment-private entry.  Incompatibility emits a terminal failure;
-    no later row is consulted for execution compatibility.
-    """
+    """Choose the first ABI-compatible entry from the frozen public ranking."""
 
     query_id = _query_id(opaque_query_id)
     if not isinstance(request, JointDistanceRequest):
@@ -606,35 +608,47 @@ def audit_rank1_execution_abi(
     rank_one = distance_run.rows[0]
     if rank_one.rank != 1:
         raise AnonymousMarketError("joint distance run does not begin at rank one")
-    # This is the only deployment-private ABI lookup in the selection phase.
+    selected_row = next(
+        (
+            row
+            for row in distance_run.rows
+            if market.deployment_private[
+                row.opaque_learnware_id
+            ].execution_abi.digest
+            == target_execution_abi.digest
+        ),
+        rank_one,
+    )
     selected_execution_abi = market.deployment_private[
-        rank_one.opaque_learnware_id
+        selected_row.opaque_learnware_id
     ].execution_abi
     compatible = selected_execution_abi.digest == target_execution_abi.digest
     audit = ExecutionABIAuditRecord(
         opaque_query_id=query_id,
         policy_market_id=market.policy_market_id,
         ranking_digest=str(distance_run.run_digest),
-        selected_opaque_learnware_id=rank_one.opaque_learnware_id,
+        selected_opaque_learnware_id=selected_row.opaque_learnware_id,
         selected_execution_abi_digest=selected_execution_abi.digest,
         target_execution_abi_digest=target_execution_abi.digest,
         compatible=compatible,
+        audited_rank=selected_row.rank,
     )
     failure = None
     if not compatible:
         failure = SelectionFailureRecord(
             opaque_query_id=query_id,
-            selected_opaque_learnware_id=rank_one.opaque_learnware_id,
+            selected_opaque_learnware_id=selected_row.opaque_learnware_id,
             status="SELECTED_INCOMPATIBLE_ABI",
             ranking_digest=str(distance_run.run_digest),
             abi_audit_digest=str(audit.audit_digest),
         )
     return AnonymousSelectionResult(
         opaque_query_id=query_id,
-        selected_opaque_learnware_id=rank_one.opaque_learnware_id,
+        selected_opaque_learnware_id=selected_row.opaque_learnware_id,
         ranking_digest=str(distance_run.run_digest),
         abi_audit=audit,
         failure_record=failure,
+        fallback_attempted=selected_row.rank > 1,
     )
 
 

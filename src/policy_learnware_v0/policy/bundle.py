@@ -214,8 +214,14 @@ def validate_bundle(
     expected_environment_steps: int | None = None,
     expected_fpo_commit: str | None = None,
     expected_runtime_digest: str | None = None,
+    runtime_only: bool = False,
 ) -> PolicyBundleMetadata:
-    """Fail-closed validation of one immutable exported policy bundle."""
+    """Validate one exported policy bundle.
+
+    ``runtime_only`` keeps structural, checksum, shape, and finite-value checks
+    while treating historical clean-tree/external-authority provenance as
+    metadata.  It is the appropriate boundary for a real rollout.
+    """
 
     bundle_dir = Path(bundle_dir)
     if not bundle_dir.is_dir():
@@ -281,7 +287,7 @@ def validate_bundle(
         raise BundleValidationError(f"unsupported algorithm: {algorithm!r}")
     fpo_commit = provenance.get("fpo_commit")
     expected_commit = provenance.get("expected_fpo_commit")
-    if (
+    if not runtime_only and (
         not isinstance(fpo_commit, str)
         or len(fpo_commit) not in {40, 64}
         or fpo_commit != expected_commit
@@ -293,26 +299,27 @@ def validate_bundle(
     formal_eligible = provenance.get("formal_eligible")
     if formal_eligible is not None and not isinstance(formal_eligible, bool):
         raise BundleValidationError("bundle formal_eligible must be boolean when present")
-    if formal_eligible is True and (
+    if not runtime_only and formal_eligible is True and (
         expected_fpo_commit is None or expected_runtime_digest is None
     ):
         raise BundleValidationError(
             "formal bundle validation requires external commit and runtime authority"
         )
-    if expected_fpo_commit is not None and re.fullmatch(
+    if not runtime_only and expected_fpo_commit is not None and re.fullmatch(
         r"(?:[0-9a-f]{40}|[0-9a-f]{64})", expected_fpo_commit
     ) is None:
         raise BundleValidationError("external FPO commit authority is malformed")
-    if expected_runtime_digest is not None and re.fullmatch(
+    if not runtime_only and expected_runtime_digest is not None and re.fullmatch(
         r"[0-9a-f]{64}", expected_runtime_digest
     ) is None:
         raise BundleValidationError("external runtime digest authority is malformed")
-    if expected_fpo_commit is not None and fpo_commit != expected_fpo_commit:
+    if not runtime_only and expected_fpo_commit is not None and fpo_commit != expected_fpo_commit:
         raise BundleValidationError(
             "bundle FPO commit differs from external runtime authority"
         )
     if (
-        expected_runtime_digest is not None
+        not runtime_only
+        and expected_runtime_digest is not None
         and provenance.get("runtime_digest") != expected_runtime_digest
     ):
         raise BundleValidationError(

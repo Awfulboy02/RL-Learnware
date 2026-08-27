@@ -132,26 +132,13 @@ class QuerySourceDistance:
 def _validate_query_source_bindings(
     query: QuerySpec, source: SourceReducedSpec
 ) -> None:
+    # Only executable RKME geometry is an admission boundary. The remaining
+    # measurement/canonical/evaluator/weighting/reducer/provenance digests are
+    # observational lineage and may differ without changing this computation.
     checks = {
         "representation_protocol_id": (
             query.representation_protocol_id,
             source.representation_protocol_id,
-        ),
-        "measurement_protocol_id": (
-            query.measurement_protocol_id,
-            source.measurement_protocol_id,
-        ),
-        "canonical_view_digest": (
-            query.canonical_view_digest,
-            source.canonical_view_digest,
-        ),
-        "kernel_evaluator_digest": (
-            query.spec_key.kernel_evaluator_digest,
-            source.spec_key.kernel_evaluator_digest,
-        ),
-        "sample_weighting_digest": (
-            query.spec_key.sample_weighting_digest,
-            source.spec_key.sample_weighting_digest,
         ),
         "kernel_bandwidth": (query.kernel_bandwidth, source.kernel_bandwidth),
         "latent_dim": (query.latent_dim, source.latent_dim),

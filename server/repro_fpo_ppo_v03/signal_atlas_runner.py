@@ -54,7 +54,6 @@ from policy_learnware_v0.v03.representation_ladder import (
     restore_trained_representation,
 )
 from policy_learnware_v0.v03.representation_plan import RepresentationExecutionPlan
-from policy_learnware_v0.v03.signal_atlas import signal_work_key
 from policy_learnware_v0.v03.signal_controls import (
     HistoricalRandomTanhSpec,
     RewardFreeShuffledNextSpec,
@@ -107,6 +106,18 @@ TASK_TAXONOMY = {
 
 class SignalAtlasRunnerError(RuntimeError):
     """The legacy assets, checkpoint set, or resume artifact is invalid."""
+
+
+def signal_work_key(cell_id: str, seed: int | None) -> str:
+    """Stable filename key; kept local to avoid a report/governance dependency."""
+
+    if not isinstance(cell_id, str) or not cell_id:
+        raise SignalAtlasRunnerError("work key requires a cell ID")
+    if seed is not None and (
+        isinstance(seed, bool) or not isinstance(seed, int) or seed < 0
+    ):
+        raise SignalAtlasRunnerError("work key seed is invalid")
+    return f"{cell_id.replace('::', '--')}--seed-{'NONE' if seed is None else seed}"
 
 
 def _positive_int(value: str) -> int:
