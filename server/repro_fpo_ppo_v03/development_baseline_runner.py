@@ -864,6 +864,7 @@ def evaluate(args: argparse.Namespace) -> Mapping[str, Any]:
                     policy_cache[opaque_id] = load_policy(
                         market.deployment_private[opaque_id].bundle_path,
                         fpo_root=args.fpo_root,
+                        runtime_only=True,
                     )
                 policy = policy_cache[opaque_id]
                 if policy.observation_dim != int(np.load(row["npz"], allow_pickle=False)["observation"].shape[1]) or policy.action_dim != int(np.load(row["npz"], allow_pickle=False)["action"].shape[1]):
@@ -1052,7 +1053,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     else:
         result = summarize(args)
     print(json.dumps(result, sort_keys=True, separators=(",", ":")))
-    return 0
+    return 1 if result.get("status") == "PARTIAL" else 0
 
 
 if __name__ == "__main__":
