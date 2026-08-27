@@ -2,7 +2,7 @@
 
 日期：2026-08-28
 
-状态：development design pivot；不是 formal confirmatory 结论
+状态：development design pivot + fixed-Raw-RKME view 对照完成；不是 formal confirmatory 结论
 
 ## 1. 文档权威与变更边界
 
@@ -14,17 +14,19 @@
 
 - 不改 RKME、Gaussian MMD、reducer、encoder 或 selector 的数值公式；
 - 不重写历史 JSON/CSV，不替换 `B3b`、`A-Env`、`M02/B5` 等冻结 ID；
-- 不新增 schema、数据合同、兼容层或大规模测试；
-- 只增加论文角色元数据、说明文档与后续最小实验安排。
+- 不新增通用数据合同、兼容层或大规模测试；
+- 只增加一个独立 Raw-only runner、其最小结果格式与论文表格，不修改冻结 Atlas。
 
 ## 2. 核心设计决议
 
-v0.31 将 **Raw-RKME Learnware** 升格为论文主算子，将原来的 learned
-EnvironmentSpec 与 competence 融合设计降为比较变种：
+v0.31 将 **Raw-RKME Learnware** 升格为论文主算子族，将原来的 learned
+EnvironmentSpec 与 competence 融合设计降为比较变种。补充 view 对照进一步选出
+`Delta + action` 作为 development 阶段的主 measurement 候选：
 
-| 冻结 artifact ID | v0.31 角色 | 论文展示名 |
+| artifact / candidate | v0.31 角色 | 论文展示名 |
 |---|---|---|
-| `B3b` | **Primary** | **Raw-RKME Learnware** |
+| v0.31 dev candidate（不伪造冻结 ID） | **Primary candidate** | **Raw-Delta RKME Learnware** |
+| `B3b` | Historical FULL comparator | Raw-FULL RKME Learnware |
 | `A-Env` | Variant | Learned EnvironmentSpec, distance-only |
 | `M02/B5` | Variant | Learned EnvironmentSpec + global competence fusion |
 | `B3a` | Raw-stat control | Raw transition moments |
@@ -34,13 +36,17 @@ EnvironmentSpec 与 competence 融合设计降为比较变种：
 检索分数；它只保留为 source championization、质量元数据或诊断量。若未来作为近似同分
 候选的 tie-break 使用，必须单独报告，不能悄然恢复为主评分项。
 
-新主算子为：
+主算子对 transition measurement `v` 的统一形式为：
 
 \[
 \hat i(q)=\arg\min_i
-\operatorname{MMD}\!\left(\widehat\Phi_q^{\mathrm{emp}},
-\widetilde\Phi_i^{\mathrm{red}}\right).
+\operatorname{MMD}\!\left(\widehat\Phi_{q,v}^{\mathrm{emp}},
+\widetilde\Phi_{i,v}^{\mathrm{red}}\right),
+\qquad \phi_{\Delta a}(\tau)=(o'-o,a).
 \]
+
+这里选中 `Delta + action` 使用了同一六任务 development panel，因此它是需要在未读取的
+confirmatory/extrapolation 上验证的候选，而不是 method-selection-blind formal 结论。
 
 被降级的 competence 融合变种为：
 
@@ -50,7 +56,7 @@ s_i(q)=\log c_i-d_i(q)/\sigma.
 
 ## 3. 源码事实：Raw-RKME 的输入与计算链
 
-当前 `B3b` 的数值路径不经过 learned encoder，也不存在显式的随机或线性“硬投影矩阵”。
+冻结 `B3b` 的数值路径不经过 learned encoder，也不存在显式的随机或线性“硬投影矩阵”。
 它使用固定 canonicalization，再由 Gaussian kernel 隐式映射到 RKHS：
 
 ```text
@@ -71,9 +77,10 @@ native (o, a, r, o')
 \]
 
 `terminated/truncated` 用于 episode 边界与 episode-balanced weighting，不进入 109 维点。
-现有 fused development runner 会同时构建 Raw 与 R5 路径，因此工程入口仍会加载 R5
-checkpoint；但 `B3b` 的点、kernel、RKME、距离和分数均不读取 R5 输出。将 Raw-only runner
-从这项非数值依赖中拆出是可选的后续工程降本，不是本次角色调整或结果成立的前提。
+v0.31 已用独立 Raw-only runner 去除这项工程上的 R5 checkpoint 依赖。新候选只把 FULL
+measurement 替换为 `(o'-o,a)`；canonicalizer、episode-balanced weighting、Gaussian kernel、
+source Reduced RKME、query Empirical KME、support budget 与 MMD ranking 均保持不变。FULL
+重算带宽逐值复现冻结 `B3b` 的 `8.918560970286762`，all regret 也复现为 `0.1040333914`。
 
 ## 4. v0.3 development 结果
 
@@ -83,49 +90,92 @@ extrapolation oracle。
 
 | 方法 | Source regret ↓ | Dev regret ↓ | All regret ↓ | Task-compatible ↑ | Exact anchor ↑ | Top-3 oracle ↑ |
 |---|---:|---:|---:|---:|---:|---:|
-| `B3a` Raw moments | 0.0800 | 0.1078 | **0.0923** | 100.0% | 66.7% | 74.1% |
-| `B3b` **Raw-RKME** | **0.0806** | 0.1334 | **0.1040** | 100.0% | **43.3%** | 63.0% |
-| `A-Env` distance-only | 0.1345 | **0.0995** | 0.1190 | 100.0% | 16.7% | **74.1%** |
+| `B3a` Raw moments | 0.0800 | 0.1078 | 0.0923 | 100.0% | 66.7% | 74.1% |
+| `B3b` Raw-RKME | 0.0806 | 0.1334 | 0.1040 | 100.0% | 43.3% | 63.0% |
+| `A-Env` distance-only | 0.1345 | 0.0995 | 0.1190 | 100.0% | 16.7% | 74.1% |
 | `M02/B5` encoder + competence | 0.1728 | 0.1686 | 0.1709 | 83.3% | 16.7% | 59.3% |
 | `B4a` privileged kNN | 0.0662 | 0.0424 | 0.0557 | 98.1% | 16.7% | 81.5% |
 | `B4b` privileged ridge | 0.0423 | 0.0091 | 0.0276 | 100.0% | 33.3% | 87.0% |
 
 主要结论：
 
-1. Raw-RKME 相对 `M02/B5` 将总体 regret 从 `0.1709` 降至 `0.1040`，相对改善
+1. FULL Raw-RKME 相对 `M02/B5` 将总体 regret 从 `0.1709` 降至 `0.1040`，相对改善
    **39.1%**，并将 task-compatible selection 从 `83.3%` 提高到 `100%`。
-2. 在排除 raw-coordinate moments (`B3a`) 与读取 target policy-return labels 的
-   privileged upper bounds (`B4a/B4b`) 后，Raw-RKME 是本轮 pooled 结果最强的方法。
-3. Raw-RKME 并非所有 regime 全面支配：`A-Env` 在 development interpolation 上的
-   regret 为 `0.0995`，优于 Raw-RKME 的 `0.1334`，Top-3 coverage 也更高。因此
-   `A-Env` 应保留为重要的互补比较变种。
+2. 在该历史 FULL measurement 下，排除 raw-coordinate moments (`B3a`) 与读取 target
+   policy-return labels 的 privileged upper bounds (`B4a/B4b`) 后，Raw-RKME 是 pooled
+   结果最强的方法；第 5 节的 fixed-operator 对照随后改写了 view 选择结论。
+3. `A-Env` 在 development interpolation 上的 regret 为 `0.0995`，优于 FULL Raw-RKME
+   的 `0.1334`；但新 Raw-Delta 候选进一步降至 `0.0699`。`A-Env` 仍作为 learned
+   representation 比较变种保留，而不再是 development interpolation 最优无标签方法。
 4. `A-Env` 与 `M02/B5` 使用同一 R5 表示。只加入未经跨任务校准的 global competence
    后，总体 regret 从 `0.1190` 恶化到 `0.1709`，相容率从 `100%` 降到 `83.3%`；9 个
    不相容选择全部来自 CartpoleSwingup。当前证据否定的是这项融合方式，而不是
    competence 作为 source-side 质量控制的所有用途。
 
-`B3a` 仍是所有无 target-label 方法中的最低总体 regret，但它公开 raw-coordinate 低阶
-统计，且不是 RKME 学件接口，所以保留为强 control，而不取代论文主算子。
+`B3a` 在这张历史 baseline 表中是最低总体 regret 的无 target-label 方法；新 Raw-Delta
+RKME 的总体 regret 为 `0.0413`，已经低于 `B3a` 的 `0.0923`。`B3a` 仍因直接发布
+raw-coordinate 低阶统计且不属于 RKME 学件接口而保留为强 control。
 
-## 5. Transition Signal Atlas 对设计决议的支持
+## 5. 重置版 Table 1：固定 Raw-RKME 的 transition controls
 
-当前 dynamics-facing panel 包含 22 个数值 cells / 50 个 seed-level works，不是完整
-39-logical-cell 14-control Atlas。最强的经验 dynamics 规约来自 Raw Delta + action：
+本表不再混合 representation family。八行全部固定为
+`R0 raw identity → source Reduced RKME / query Empirical KME → nearest Gaussian MMD`，只改变
+transition measurement。它复用同一批 30 source、24 development banks 与已经完成的
+54-context policy oracle，不重训 policy/encoder，也未读取 confirmatory/extrapolation。
+每个 view 都按同一 source-only calibration 规则独立估计 bandwidth；固定的是算法协议，
+不是跨 view 强行共用一个带宽数值。`C_RF_SHUFFLED_NEXT` 的 84 个 measured banks 均通过
+observation/action/next-state marginal preservation 与 pairing-destroyed audit。
 
-| Transition 规约 | Representation | Task/ABI Top-1 | Axis bracket@2 | ρ(log-factor) | Repeat separation | P(ratio>1) |
-|---|---|---:|---:|---:|---:|---:|
-| FULL `(o,masks,a,r,o')` | Raw KME | 1.000 | 0.542 | 0.229 | 1.225 | 0.667 |
-| Reward-free `(o,a,o')` | Raw KME | 0.958 | 0.583 | 0.208 | 1.518 | 0.700 |
-| **Delta + action `(o'-o,a)`** | **Raw KME** | **1.000** | **0.750** | **0.417** | **2.206** | **0.967** |
-| Delta + action `(o'-o,a)` | R5 CORRO-style MLP | 1.000 | 0.569 | 0.278 | 1.608 | 0.833 |
+### 5.1 Panel A：绝对结果
 
-这说明简单 Raw geometry 已包含很强的异构 task/ABI 路由信号，并且 Delta + action 对同
-task 内 dynamics axis/factor 的规约最强。当前 task-SupCon R5 训练会把同 task 的多个
-dynamics anchors 拉近，可能压缩了细粒度 dynamics geometry。
+| View | Channels | Role | Task/ABI@1 (n=24) | Repeat exact-source@1 (n=30) | Axis bracket@2 | ρ(log-factor) | Repeat separation | Source regret | Dev regret | All regret | Task-compatible |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| FULL | `(o,masks,a,r,o')` | historical paper operator | 1.000 | 0.433 | 0.542 | 0.229 | 1.726 | 0.0806 | 0.1334 | 0.1040 | 1.000 |
+| No mask | `(o,a,r,o')` | mask control | 0.958 | 0.433 | 0.583 | 0.250 | 1.754 | 0.1299 | 0.1626 | 0.1445 | 0.944 |
+| Reward-free | `(o,a,o')` | reward control | 0.958 | 0.467 | 0.583 | 0.208 | 1.835 | 0.1265 | 0.1577 | 0.1404 | 0.944 |
+| RF shuffled-next | `(o,a,perm(o'))` | pairing control | 0.917 | 0.467 | 0.542 | 0.167 | 1.833 | 0.1660 | 0.1934 | 0.1782 | 0.907 |
+| **Delta + action** | **`(o'-o,a)`** | **development primary candidate** | **1.000** | **0.633** | **0.750** | **0.417** | **2.250** | **0.0185** | **0.0699** | **0.0413** | **1.000** |
+| Action values only | `(a)` | clean Delta reference | 0.792 | 0.067 | 0.250 | -0.146 | 1.169 | 0.4994 | 0.2971 | 0.4095 | 0.630 |
+| State + action | `(o,a)` | next-state control | 0.958 | 0.500 | 0.583 | 0.188 | 1.725 | 0.1308 | 0.1577 | 0.1427 | 0.944 |
+| State only | `(o)` | occupancy/action control | 0.958 | 0.533 | 0.583 | 0.188 | 1.996 | 0.1038 | 0.1577 | 0.1277 | 0.963 |
 
-但必须分开两类证据：已完成的 end-to-end `B3b` 使用 FULL packed event；最强
-dynamics 结果来自 `(o'-o,a)`。现有结果不能写成“Delta Raw-RKME 已在策略选择端获胜”。
-若论文需要 dynamics-only 主张，必须补一项最小的 view-specific end-to-end 对照。
+### 5.2 Panel B：严格单变量对照
+
+所有 benefit 均统一成“正值有利于 richer view”；W/T/L 是 richer 相对 control 的逐 context
+regret 胜/平/负。由于大量 contexts 的 top policy 不变，均值与 W/T/L 必须同时报告。
+
+| 因素 | Richer view | Control | Dev regret benefit | All regret benefit | Axis benefit | Repeat benefit | Dev W/T/L | All W/T/L |
+|---|---|---|---:|---:|---:|---:|---:|---:|
+| masks | FULL | No mask | 0.0293 | 0.0404 | -0.0417 | -0.0274 | 1/22/1 | 3/49/2 |
+| reward channel | No mask | Reward-free | -0.0050 | -0.0041 | 0.0000 | -0.0818 | 1/21/2 | 1/50/3 |
+| next-state pairing | Reward-free | RF shuffled-next | 0.0358 | 0.0378 | 0.0417 | 0.0023 | 1/23/0 | 4/50/0 |
+| next-state channel | Reward-free | State + action | 0.0000 | 0.0024 | 0.0000 | 0.1102 | 0/24/0 | 1/53/0 |
+| state delta | Delta + action | Action only | **0.2272** | **0.3682** | **0.5000** | **1.0811** | **13/7/4** | **37/12/5** |
+| action channel | State + action | State only | 0.0000 | -0.0150 | 0.0000 | -0.2705 | 0/24/0 | 0/53/1 |
+
+### 5.3 结果解释与旧表边界
+
+1. **Delta 是本轮同时强化 signal geometry 与 policy reuse 的最大幅度因素。** 相对 action-only，
+   它把 axis bracket@2 提高 `0.5000`、repeat ratio 提高 `1.0811`、dev regret 降低
+   `0.2272`。其 all regret `0.0413` 相对 FULL 的 `0.1040` 改善约 **60.3%**，也低于
+   `B3a` (`0.0923`)、`A-Env` (`0.1190`) 和 privileged kNN `B4a` (`0.0557`)；但仍未超过
+   privileged ridge `B4b` (`0.0276`)。这些是同一 development panel 上的描述性比较；由于
+   Delta view 也是在该 panel 上选出的，不能外推为胜过 privileged upper bound 的泛化结论。
+2. **coupling 比 next-state marginal presence 更关键。** 保持 `(o,a,o')` 同通道、只置乱
+   `o'` 后，dev/all regret 分别恶化 `0.0358/0.0378`；单纯删除 `o'` 则 dev regret 不变。
+   不过 pairing 的 W/T/L 为 `4/50/0`（all），说明效应集中在少数 contexts，不能包装成普遍改善。
+3. **mask 结果更符合跨 ABI/schema 路由，而不是更好的细粒度 dynamics 几何。** FULL 改善 all
+   regret `0.0404`，但 axis bracket 与 repeat separation 反而下降，而且 W/T/L 仅为
+   `3/49/2`；task/embodiment/ABI 在当前 panel 中又一一对应，因此这只是 consistent-with
+   evidence，不能写成独立因果识别。
+4. **reward 与 action marginal 未观察到稳健正收益。** reward channel 的 dev/all benefit 均为负；
+   `(o,a)` 相对 `(o)` 在 development 上完全持平。当前 evidence 更支持 state-change/coupling，
+   而不是 reward 或动作边际本身。
+
+旧 `transition_semantic_contract_comparison.{md,csv}` 与 22-cell/50-work Atlas 结果原样保留为
+legacy backup。旧表使用 Signal runner 的另一套 bandwidth/reduction protocol，不能与本表逐行
+拼数值；它只作为趋势交叉验证：旧结果同样把 Raw Delta + action 判为最强 dynamics 规约，并
+显示 task-SupCon R5 可能压缩同任务内 dynamics geometry。
 
 ## 6. 与学件理论及隐私口径的关系
 
@@ -172,48 +222,63 @@ learned encoder 不再是 v0.31 的主创新。当前 R5 与 competence 结果�
 
 1. **角色与命名冻结（本次完成）**：保留 artifact ID，更新代码中的 paper-role metadata、
    README、v0.3 superseding notice 与论文框架任务。
-2. **最小 view 对照**：复用现有 banks 与 selector，比较 FULL、reward-free `(o,a,o')`、
-   Delta + action `(o'-o,a)` 三个 Raw-RKME end-to-end policy ranking；不重训 policy/encoder。
-3. **confirmatory/extrapolation**：在新主方法上执行预先冻结的 confirmatory 与
-   extrapolation 评估，分开报告 source/dev/extrapolation，不只报告 pooled mean。
-4. **可选工程降本**：只有当独立复现需要时，才把 Raw-only runner 从 R5 checkpoint 的
-   非数值依赖中拆出；不得借机增加 schema、合同或全量测试。
-5. **论文更新**：方法、贡献与摘要以 Raw-RKME 为主，保留 `A-Env` 的 interpolation 优势、
-   FULL reward/mask shortcut、集中式 runner 与 reduced-support inversion 风险。
+2. **最小 view 对照（已完成）**：统一重算八个 fixed-Raw-RKME views，补齐 no-mask、
+   reward-free shuffled-next 与 clean action-only controls，并复用既有 oracle 完成 ranking。
+3. **confirmatory/extrapolation（下一步）**：冻结 Raw-Delta 为 primary candidate、FULL 为
+   historical comparator，在未读取的 confirmatory 与 extrapolation 上评估，分开报告
+   source/dev/extrapolation，不只报告 pooled mean。
+4. **Raw-only 工程降本（已完成）**：独立 runner 不加载 R5 checkpoint，不采新轨迹、不跑
+   policy/encoder；不得借机恢复 schema、合同或全量测试。
+5. **论文更新**：方法、贡献与摘要以 Raw-Delta RKME candidate 为主，FULL 作为 frozen
+   historical comparator；保留集中式 runner、development method selection 与
+   reduced-support inversion 风险。
 
 ### 明确不做
 
 - 不把 frozen `B3b` 改名为新的 artifact ID，也不伪造新的历史结果；
-- 不因本次角色变化重跑 policy、encoder、RKME reduction 或已完成 baselines；
+- 不重跑 policy、encoder 或历史 baselines；只执行重置 Table 1 必需的八组 Raw-RKME reductions；
 - 不恢复已剃除的审计/合同，不新增大规模单元测试；
 - 不把 development 结果包装为 formal superiority；
+- 不读取 confirmatory/extrapolation 来继续选择 transition view；
 - 不把当前 CORRO-style 失败外推为“所有 learned encoder 均无价值”。
 
 ## 9. 允许与禁止的当前论文表述
 
 当前允许：
 
-> 在本轮 development panel 中，canonical Raw-RKME 在无 target policy-return labels 的
-> RKME 方法中取得最低 pooled regret，并显著优于当前 learned EnvironmentSpec + global
-> competence 融合；Raw Delta + action 同时给出最强的同任务 dynamics 规约信号。
+> 在本轮 development panel 中，固定 Raw-RKME 后，Delta + action measurement 同时取得
+> 最强的同任务 dynamics 规约，并使 per-query 不读取 target policy-return labels 的 scorer
+> 取得最低 regret；其数值低于历史 FULL Raw-RKME 及当前 learned EnvironmentSpec + global
+> competence 融合。该 view 使用 development oracle 选出，仍需在未读取的
+> confirmatory/extrapolation 上验证。
 
 当前禁止：
 
 - “Raw-RKME 已在 confirmatory/extrapolation 上显著优于所有方法”；
 - “Raw-RKME 实现差分隐私、不可逆或绝对零泄漏”；
-- “Delta Raw-RKME 已在 end-to-end policy selection 上获胜”；
+- “Raw-Delta 的 view 是 method-selection-blind 预注册结果”或“已经 formal 获胜”；
+- “mask 改善证明了内在 dynamics 识别”（当前更符合 schema/ABI routing）；
 - “task、embodiment 与 ABI 已被独立识别”（当前 panel 中三者一一对应）；
 - “learned encoder 普遍无效”或“competence 在任何用途中都无效”。
 
 ## 10. 本次变更记录与完成条件
 
-- [x] 冻结 `B3b` 为历史 artifact ID，并登记为 v0.31 论文主方法；
+- [x] 冻结 `B3b` 为历史 artifact ID；完成 view 对照后将其登记为 FULL comparator；
 - [x] 将 `A-Env` 与 `M02/B5` 登记为比较变种；
 - [x] 更新 README 与 anonymous-market runtime note；
 - [x] 建立本文件作为唯一 v0.31 规划/报告；
 - [x] 在根目录 v0.3 规划末尾追加醒目的 superseding notice；
 - [x] 向任务“RL论文框架搭建”发送本轮结果和设计决议；
-- [x] 完成轻量一致性检查；本提交随后推送 `v03` 线上分支。
+- [x] 完成轻量一致性检查；
+- [x] 新增独立 Raw-only runner，不加载 R5、policy runtime 或 confirmatory 资产；
+- [x] 完成八个统一 production Raw-RKME view 对照及 30/24/54 覆盖验收；
+- [x] 生成重置版 Table 1 Panel A/B，旧表与旧运行原样保留；
+- [x] 将 Raw-Delta 登记为下一阶段 primary candidate，FULL 保留为历史 comparator。
 
-完成这些文档/元数据动作后，v0.31 的设计转向即落盘；后续最小 view 对照和
-confirmatory/extrapolation 属于实验推进，不阻断本次命名调整。
+权威 development 运行根：
+`/share/songyf/RL_Learnware/v03_main_runs/v031-raw-transition-controls-20260828-r1`。
+本地论文表与汇总位于 `v03_results_analysis/raw_rkme_transition_contract_table_v031.{md,csv}`
+及 `v03_results_analysis/raw/v031_table1_summary.json`；旧表文件没有删除或覆盖。
+
+至此 v0.31 development 设计转向与最小 view 对照均已落盘。下一项数值工作是冻结当前
+candidate 后执行 confirmatory/extrapolation；不得再用该 oracle 继续调 view。
