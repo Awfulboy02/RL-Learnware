@@ -131,26 +131,36 @@ LOGGER_FIELDS = (
 
 # The v02 exporter hard-gated its same-runtime golden replay at 1e-6.  The
 # frozen v03 source-market later showed that those float32 action bytes are not
-# portable across otherwise valid JAX/XLA backends: its 70 recorded replays
-# (aggregate SHA below) reached 2.27e-2 before tanh and 5.39e-3 after tanh,
-# while every scalar/compiled deployment comparison remained below 7.75e-7.
-# Keep the origin receipt and current compiled path strict; use this versioned
-# envelope only for the explicitly cross-backend diagnostic.
+# portable across otherwise valid JAX/XLA backends.  The v03 g0544 evidence
+# reached 2.27e-2 before tanh and 5.39e-3 after tanh.  A later read-only replay
+# of all 30 selected policies on the original m2 host's CPU reached 6.43e-2
+# and 2.86e-2 respectively, while every deterministic/transform/key invariant
+# passed and scalar/compiled error remained below 7.75e-7.  Keep the origin
+# receipt and current compiled path strict; this rounded envelope applies only
+# to stored-golden cross-backend diagnostics, which do not enter BI0 ranking.
 ORIGIN_PARITY_ATOL = 1.0e-6
 ORIGIN_PARITY_RTOL = 1.0e-6
 COMPILED_PARITY_SAMPLE_COUNT = 2
 CROSS_BACKEND_PARITY = {
-    "version": "v03-selected-market-f32-v1",
+    "version": "v04a-selected-market-f32-m2cpu-v2",
     "dtype": "float32",
-    "raw_atol": 2.5e-2,
-    "environment_atol": 6.0e-3,
+    "scope": "stored-golden-diagnostic-only; never ranking or asset identity",
+    "raw_atol": 7.0e-2,
+    "environment_atol": 3.0e-2,
     "rtol": 1.0e-5,
-    "evidence_file_count": 70,
-    "evidence_aggregate_sha256": (
+    "v03_evidence_file_count": 70,
+    "v03_evidence_aggregate_sha256": (
         "7892455fae56637dbc44c0bdd969cfc7c7182ec67af5a4db3b71b1d961911089"
     ),
-    "observed_raw_max_abs_error": 2.269744873046875e-2,
-    "observed_environment_max_abs_error": 5.387336015701294e-3,
+    "v03_observed_raw_max_abs_error": 2.269744873046875e-2,
+    "v03_observed_environment_max_abs_error": 5.387336015701294e-3,
+    "m2_cpu_evidence_sha256": (
+        "50ac5e13b021a415ab251f51672fabb61a334e79ae25f94e95d63c35a8f9fc46"
+    ),
+    "m2_cpu_evidence_candidate_count": 30,
+    "m2_cpu_evidence_commit": "de184808bc83fdeaba9ed81bdf548e364345402a",
+    "observed_raw_max_abs_error": 6.4258873462677e-2,
+    "observed_environment_max_abs_error": 2.8588712215423584e-2,
     "observed_compiled_max_abs_error": 7.748603820800781e-7,
 }
 

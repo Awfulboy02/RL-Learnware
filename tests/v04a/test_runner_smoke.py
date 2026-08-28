@@ -545,7 +545,31 @@ def test_deployment_audit_separates_determinism_from_cross_backend_float(
     assert result["status"] == "WARNING_CROSS_BACKEND_COMPATIBLE"
     assert result["compiled_parity"]["status"] == "PASS"
     assert result["cross_backend_golden_diagnostic"]["compatibility_envelope_passed"]
-    assert CROSS_BACKEND_PARITY["raw_atol"] < 0.03
+    assert CROSS_BACKEND_PARITY["raw_atol"] < 0.1
+    assert CROSS_BACKEND_PARITY["environment_atol"] < 0.05
+    assert (
+        CROSS_BACKEND_PARITY["observed_raw_max_abs_error"]
+        < CROSS_BACKEND_PARITY["raw_atol"]
+    )
+    assert (
+        CROSS_BACKEND_PARITY["observed_environment_max_abs_error"]
+        < CROSS_BACKEND_PARITY["environment_atol"]
+    )
+    assert (
+        CROSS_BACKEND_PARITY["m2_cpu_evidence_sha256"]
+        == "50ac5e13b021a415ab251f51672fabb61a334e79ae25f94e95d63c35a8f9fc46"
+    )
+
+    incompatible_raw = actual_raw + np.float32(0.2)
+    np.savez_compressed(
+        bundle / "golden_io.npz",
+        observation=observation,
+        prng_key_data=np.asarray([1, 2], dtype=np.uint32),
+        raw_action=incompatible_raw,
+        environment_action=np.tanh(incompatible_raw).astype(np.float32),
+    )
+    with pytest.raises(GateFailure, match="cross-backend action drift"):
+        _deployment_action_audit(FakePolicy(), SimpleNamespace(bundle_dir=bundle))
 
     class WrongTransformPolicy(FakePolicy):
         def act(self, observation, key, *, deterministic=True):
