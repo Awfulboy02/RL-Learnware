@@ -105,6 +105,8 @@ class PredictionRanking:
     config_digest: str
     source_model_manifest_digest: str
     authorized_query_manifest_digest: str
+    score_vector_digest: str
+    budget_ledger_digest: str
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -144,6 +146,8 @@ class PredictionRanking:
             "config_digest",
             "source_model_manifest_digest",
             "authorized_query_manifest_digest",
+            "score_vector_digest",
+            "budget_ledger_digest",
         ):
             object.__setattr__(
                 self,
@@ -180,6 +184,8 @@ class PredictionRanking:
             "config_digest": self.config_digest,
             "source_model_manifest_digest": self.source_model_manifest_digest,
             "authorized_query_manifest_digest": self.authorized_query_manifest_digest,
+            "score_vector_digest": self.score_vector_digest,
+            "budget_ledger_digest": self.budget_ledger_digest,
         }
 
     @classmethod
@@ -201,6 +207,8 @@ class PredictionRanking:
             "config_digest",
             "source_model_manifest_digest",
             "authorized_query_manifest_digest",
+            "score_vector_digest",
+            "budget_ledger_digest",
         }
         _exact_keys(payload, fields, "prediction ranking")
         return cls(**{field: payload[field] for field in fields})
@@ -789,6 +797,382 @@ def normalized_log2_budget_auc(
     return result
 
 
+def confusion_matrix(
+    truth_labels: Sequence[Any],
+    predicted_labels: Sequence[Any],
+    *,
+    label_order: Sequence[Any] | None = None,
+) -> dict[str, Any]:
+    """Return JSON-ready counts with rows=true and columns=predicted.
+
+    An explicit order is preserved exactly.  Otherwise the union of observed
+    canonical labels is sorted, making the result independent of row order.
+    """
+
+    if isinstance(truth_labels, (str, bytes)) or isinstance(
+        predicted_labels, (str, bytes)
+    ):
+        raise V05MetricError("confusion inputs must be label sequences")
+    try:
+        truth = tuple(_canonical_string(item, "truth label") for item in truth_labels)
+        predicted = tuple(
+            _canonical_string(item, "predicted label") for item in predicted_labels
+        )
+    except TypeError as error:
+        raise V05MetricError("confusion inputs must be label sequences") from error
+    if not truth or len(truth) != len(predicted):
+        raise V05MetricError(
+            "confusion inputs must be non-empty sequences of equal length"
+        )
+
+    if label_order is None:
+        labels = tuple(sorted(set(truth) | set(predicted)))
+    else:
+        if isinstance(label_order, (str, bytes)):
+            raise V05MetricError("confusion label_order must be a sequence")
+        try:
+            labels = tuple(
+                _canonical_string(item, "confusion label") for item in label_order
+            )
+        except TypeError as error:
+            raise V05MetricError("confusion label_order must be a sequence") from error
+        if not labels or len(labels) != len(set(labels)):
+            raise V05MetricError(
+                "confusion label_order must be non-empty and contain no duplicates"
+            )
+    unknown = (set(truth) | set(predicted)) - set(labels)
+    if unknown:
+        raise V05MetricError(
+            f"confusion label_order does not cover labels: {sorted(unknown)}"
+        )
+
+    positions = {label: index for index, label in enumerate(labels)}
+    counts = np.zeros((len(labels), len(labels)), dtype=np.int64)
+    for truth_label, predicted_label in zip(truth, predicted, strict=True):
+        counts[positions[truth_label], positions[predicted_label]] += 1
+    return {"label_order": list(labels), "counts": counts.tolist()}
+
+
+def macro_f1(confusion: Mapping[str, Any]) -> float:
+    """Compute class-equal macro-F1 from :func:`confusion_matrix` output.
+
+    A label with neither truth nor prediction mass contributes zero.  Callers
+    can compute this once per task and pass the values to ``task_equal_macro``
+    when the report requires class-then-task equal weighting.
+    """
+
+    _exact_keys(confusion, {"label_order", "counts"}, "confusion")
+    raw_labels = confusion["label_order"]
+    if not isinstance(raw_labels, (list, tuple)):
+        raise V05MetricError("confusion label_order must be a sequence")
+    labels = tuple(_canonical_string(item, "confusion label") for item in raw_labels)
+    if not labels or len(labels) != len(set(labels)):
+        raise V05MetricError(
+            "confusion label_order must be non-empty and contain no duplicates"
+        )
+    try:
+        counts = np.asarray(confusion["counts"])
+    except (TypeError, ValueError) as error:
+        raise V05MetricError(
+            "confusion counts must be a square numeric matrix"
+        ) from error
+    if counts.shape != (len(labels), len(labels)) or not np.issubdtype(
+        counts.dtype, np.number
+    ):
+        raise V05MetricError("confusion counts must be a square numeric matrix")
+    numeric = counts.astype(np.float64)
+    if (
+        not np.all(np.isfinite(numeric))
+        or np.any(numeric < 0.0)
+        or not np.array_equal(numeric, np.floor(numeric))
+    ):
+        raise V05MetricError("confusion counts must be finite nonnegative integers")
+
+    true_mass = np.sum(numeric, axis=1)
+    predicted_mass = np.sum(numeric, axis=0)
+    true_positive = np.diag(numeric)
+    denominator = true_mass + predicted_mass
+    per_class = np.divide(
+        2.0 * true_positive,
+        denominator,
+        out=np.zeros_like(true_positive),
+        where=denominator > 0.0,
+    )
+    return float(np.mean(per_class))
+
+
+def summarize_budget_auc_coverage(
+    rows: Iterable[Mapping[str, Any]],
+    *,
+    expected_method_ids: Sequence[str],
+    expected_endpoints: Sequence[str] = (MARKET_30_CERT, TASK_5_CERT),
+    expected_budgets: Sequence[int] = (1, 2, 4),
+) -> tuple[dict[str, Any], ...]:
+    """Validate one complete metric panel and summarize each budget curve.
+
+    Each input row supplies ``method_id``, ``endpoint``, ``budget_episodes``
+    and one finite ``value``.  The default domain is the actually authorized
+    development panel, not the seven-budget confirmatory schedule.
+    """
+
+    methods = tuple(
+        _canonical_string(item, "expected method ID") for item in expected_method_ids
+    )
+    endpoints = tuple(
+        _canonical_string(item, "expected endpoint") for item in expected_endpoints
+    )
+    budgets = tuple(_integer(item, "expected budget") for item in expected_budgets)
+    if not methods or len(methods) != len(set(methods)):
+        raise V05MetricError("expected method IDs must be non-empty and unique")
+    if (
+        not endpoints
+        or len(endpoints) != len(set(endpoints))
+        or not set(endpoints).issubset(_ENDPOINTS)
+    ):
+        raise V05MetricError("expected endpoints must be supported and unique")
+    if (
+        len(budgets) < 2
+        or len(budgets) != len(set(budgets))
+        or not set(budgets).issubset(BUDGET_EPISODES)
+    ):
+        raise V05MetricError(
+            "expected budgets must contain at least two unique frozen budgets"
+        )
+    budget_domain = tuple(sorted(budgets))
+
+    try:
+        raw_rows = tuple(rows)
+    except TypeError as error:
+        raise V05MetricError("budget results must be an iterable of rows") from error
+    if not raw_rows:
+        raise V05MetricError("budget results must not be empty")
+    required_fields = {"method_id", "endpoint", "budget_episodes", "value"}
+    values_by_cell: dict[tuple[str, str, int], float] = {}
+    for index, row in enumerate(raw_rows):
+        if not isinstance(row, Mapping) or not required_fields.issubset(row):
+            raise V05MetricError(
+                f"budget result row {index} must contain {sorted(required_fields)}"
+            )
+        method_id = _canonical_string(row["method_id"], "method_id")
+        endpoint = _canonical_string(row["endpoint"], "endpoint")
+        budget = _integer(row["budget_episodes"], "budget_episodes")
+        if method_id not in methods:
+            raise V05MetricError("budget result contains an unexpected method")
+        if endpoint not in endpoints:
+            raise V05MetricError("budget result contains an unexpected endpoint")
+        if budget not in budget_domain:
+            raise V05MetricError("budget result contains an unexpected budget")
+        cell = (method_id, endpoint, budget)
+        if cell in values_by_cell:
+            raise V05MetricError("budget results contain a duplicate cell")
+        values_by_cell[cell] = _finite(row["value"], "budget metric")
+
+    expected_cells = {
+        (method_id, endpoint, budget)
+        for method_id in methods
+        for endpoint in endpoints
+        for budget in budget_domain
+    }
+    if set(values_by_cell) != expected_cells:
+        missing = sorted(expected_cells - set(values_by_cell))
+        raise V05MetricError(f"budget result coverage is incomplete; missing={missing}")
+
+    summaries: list[dict[str, Any]] = []
+    for method_id in sorted(methods):
+        for endpoint in sorted(endpoints):
+            values = [
+                values_by_cell[(method_id, endpoint, budget)]
+                for budget in budget_domain
+            ]
+            summaries.append(
+                {
+                    "method_id": method_id,
+                    "endpoint": endpoint,
+                    "budget_episodes": list(budget_domain),
+                    "values": values,
+                    "normalized_log2_auc": normalized_log2_budget_auc(
+                        budget_domain, values
+                    ),
+                    "observed_cell_count": len(values),
+                    "expected_cell_count": len(budget_domain),
+                    "coverage": 1.0,
+                }
+            )
+    return tuple(summaries)
+
+
+def _task_equal_macro_f1(
+    rows: Sequence[Mapping[str, Any]],
+    kind: str,
+    label_order: tuple[str, ...],
+    labels_by_task: Mapping[str, tuple[str, ...]],
+) -> float:
+    positions = {label: index for index, label in enumerate(label_order)}
+    task_values = {}
+    for task_id, task_labels in labels_by_task.items():
+        task_rows = tuple(item for item in rows if item["task_id"] == task_id)
+        counts = np.asarray(
+            confusion_matrix(
+                [item[f"truth_{kind}_id"] for item in task_rows],
+                [item[f"top1_{kind}_id"] for item in task_rows],
+                label_order=label_order,
+            )["counts"],
+            dtype=np.float64,
+        )
+        indices = np.asarray(
+            [positions[label] for label in task_labels], dtype=np.int64
+        )
+        denominator = np.sum(counts, axis=1) + np.sum(counts, axis=0)
+        scores = np.divide(
+            2.0 * np.diag(counts),
+            denominator,
+            out=np.zeros(len(label_order), dtype=np.float64),
+            where=denominator > 0.0,
+        )
+        task_values[task_id] = (float(np.mean(scores[indices])),)
+    return task_equal_macro(task_values)
+
+
+def build_development_report(
+    prediction_seal: RankingSeal,
+    truth_join: Iterable[TruthBinding | Mapping[str, Any]],
+    certificate_manifest: CertifiedPolicyManifest,
+    expected_method_ids: Sequence[str],
+    expected_budgets: Sequence[int] = (1, 2, 4),
+) -> dict[str, Any]:
+    """Build the JSON-ready development report from one immutable seal."""
+
+    raw_truth = tuple(truth_join)
+    evaluation = evaluate_sealed_predictions(
+        prediction_seal,
+        raw_truth,
+        certificate_manifest,
+        expected_method_ids=expected_method_ids,
+        expected_budgets=expected_budgets,
+    )
+    budgets = tuple(
+        sorted(_integer(item, "expected budget") for item in expected_budgets)
+    )
+    if budgets != (1, 2, 4):
+        raise V05MetricError("development report requires exactly budgets (1, 2, 4)")
+
+    resolver = CertificateResolver(certificate_manifest)
+    truths = _truth_rows(raw_truth, resolver)
+    truth_by_query = {item.opaque_query_id: item for item in truths}
+    predictions = tuple(
+        PredictionRanking.from_dict(item)
+        for item in prediction_seal.rankings["predictions"]
+    )
+    long_rows: list[dict[str, Any]] = []
+    for prediction in sorted(predictions, key=lambda item: item.cell_key):
+        truth = truth_by_query[prediction.opaque_query_id]
+        anchor_rank = prediction.ranked_anchor_ids.index(truth.source_anchor_id) + 1
+        truth_policy = truth.opaque_certified_policy_id
+        policy_rank = prediction.ranked_policy_ids.index(truth_policy) + 1
+        long_rows.append(
+            {
+                "method_id": prediction.method_id,
+                "endpoint": prediction.endpoint,
+                "budget_episodes": prediction.budget_episodes,
+                "opaque_query_id": prediction.opaque_query_id,
+                "task_id": truth.task_id,
+                "truth_anchor_id": truth.source_anchor_id,
+                "top1_anchor_id": prediction.ranked_anchor_ids[0],
+                "anchor_rank": anchor_rank,
+                "truth_policy_id": truth_policy,
+                "top1_policy_id": prediction.ranked_policy_ids[0],
+                "policy_rank": policy_rank,
+            }
+        )
+
+    anchor_order = tuple(sorted(resolver.anchor_ids))
+    policy_order = tuple(sorted(resolver.policy_ids))
+    labels_by_task = {
+        task_id: (
+            tuple(
+                item.source_anchor_id
+                for item in certificate_manifest.bindings
+                if item.task_id == task_id
+            ),
+            tuple(
+                sorted(
+                    {
+                        item.opaque_certified_policy_id
+                        for item in certificate_manifest.bindings
+                        if item.task_id == task_id
+                    }
+                )
+            ),
+        )
+        for task_id in sorted({item.task_id for item in truths})
+    }
+
+    grouped: dict[tuple[str, str, int], list[dict[str, Any]]] = {}
+    for row in long_rows:
+        key = (row["method_id"], row["endpoint"], row["budget_episodes"])
+        grouped.setdefault(key, []).append(row)
+    confusion_rows: list[dict[str, Any]] = []
+    for (method_id, endpoint, budget), rows in sorted(grouped.items()):
+        anchor = confusion_matrix(
+            [item["truth_anchor_id"] for item in rows],
+            [item["top1_anchor_id"] for item in rows],
+            label_order=anchor_order,
+        )
+        policy = confusion_matrix(
+            [item["truth_policy_id"] for item in rows],
+            [item["top1_policy_id"] for item in rows],
+            label_order=policy_order,
+        )
+        confusion_rows.append(
+            {
+                "method_id": method_id,
+                "endpoint": endpoint,
+                "budget_episodes": budget,
+                "anchor_confusion": anchor,
+                "policy_confusion": policy,
+                "anchor_global_macro_f1": macro_f1(anchor),
+                "policy_global_macro_f1": macro_f1(policy),
+                "anchor_task_equal_macro_f1": _task_equal_macro_f1(
+                    rows,
+                    "anchor",
+                    anchor_order,
+                    {task: labels[0] for task, labels in labels_by_task.items()},
+                ),
+                "policy_task_equal_macro_f1": _task_equal_macro_f1(
+                    rows,
+                    "policy",
+                    policy_order,
+                    {task: labels[1] for task, labels in labels_by_task.items()},
+                ),
+            }
+        )
+
+    auc_rows: list[dict[str, Any]] = []
+    for metric_name in ("anchor_hit_at_1", "policy_hit_at_1"):
+        curve_rows = (
+            {
+                "method_id": item.method_id,
+                "endpoint": item.endpoint,
+                "budget_episodes": item.budget_episodes,
+                "value": getattr(item, metric_name),
+            }
+            for item in evaluation.metrics
+        )
+        summaries = summarize_budget_auc_coverage(
+            curve_rows,
+            expected_method_ids=expected_method_ids,
+            expected_budgets=budgets,
+        )
+        auc_rows += [{"metric": metric_name, **item} for item in summaries]
+    return {
+        "schema": "policy-learnware.v05-development-report.v1",
+        "evaluation": evaluation.to_dict(),
+        "per_query_rows": long_rows,
+        "confusion_rows": confusion_rows,
+        "budget_auc_rows": auc_rows,
+    }
+
+
 __all__ = [
     "MARKET_30_CERT",
     "PREDICTION_PAYLOAD_SCHEMA",
@@ -799,9 +1183,13 @@ __all__ = [
     "TaskRetrievalMetrics",
     "TruthBinding",
     "V05MetricError",
+    "build_development_report",
+    "confusion_matrix",
     "evaluate_sealed_predictions",
+    "macro_f1",
     "normalized_log2_budget_auc",
     "prediction_payload",
     "require_prediction_cell_coverage",
+    "summarize_budget_auc_coverage",
     "task_equal_macro",
 ]

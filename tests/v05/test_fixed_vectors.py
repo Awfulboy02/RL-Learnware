@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import inspect
 import math
 
@@ -10,12 +11,26 @@ from policy_learnware_v0.rkme.distance import empirical_to_reduced_distance
 from policy_learnware_v0.rkme.empirical import build_empirical_kme
 from policy_learnware_v0.rkme.gaussian import GaussianKernel
 from policy_learnware_v0.rkme.reducer import ReducerConfig
+from policy_learnware_v0.v04a.protocol import seal_rankings
 from policy_learnware_v0.v05.classifiers import (
     EmpiricalMMDNN,
     EpisodeBank,
     KMEKRR,
     RawDeltaRKMENN,
     SummaryLogReg,
+)
+from policy_learnware_v0.v05.labels import project_certificate_manifest
+from policy_learnware_v0.v05.metrics import (
+    MARKET_30_CERT,
+    TASK_5_CERT,
+    PredictionRanking,
+    TruthBinding,
+    V05MetricError,
+    build_development_report,
+    confusion_matrix,
+    macro_f1,
+    prediction_payload,
+    summarize_budget_auc_coverage,
 )
 from policy_learnware_v0.v05.specifications import (
     RFFMap,
@@ -259,12 +274,12 @@ def test_swe_uses_equal_episode_mixture_before_quantiles() -> None:
     query = _b2_query()
 
     # The one-row and three-row episodes each contribute mass 1/2. Quantiles
-    # are constructed after mixing them, not by transition pooling.
+    # are constructed after mixing them, not by averaging per-episode sketches.
     actual = public_map.embed(query.points, query.episode_offsets).vector
     expected = np.array([0.0, 0.5, 1.5, 2.0])
-    transition_pooled = np.array([0.0, 1.0, 2.0, 2.0])
+    per_episode_sketch_mean = np.array([1.0, 1.0, 1.0, 1.0])
     np.testing.assert_allclose(actual, expected, rtol=0.0, atol=1.0e-14)
-    assert not np.allclose(actual, transition_pooled, rtol=0.0, atol=1.0e-8)
+    assert not np.allclose(actual, per_episode_sketch_mean, rtol=0.0, atol=1.0e-8)
 
 
 def test_swe_npz_round_trip_for_map_and_specification(tmp_path) -> None:
@@ -410,6 +425,197 @@ def test_public_arrays_must_replay_their_frozen_map() -> None:
             quantile_count=4,
             public_seed=11,
             quantile_grid=mismatched_grid,
+        )
+
+
+def test_confusion_and_macro_f1_use_one_stable_label_order() -> None:
+    truth = ("label-b", "label-a", "label-c", "label-a")
+    predicted = ("label-a", "label-a", "label-c", "label-b")
+    confusion = confusion_matrix(
+        truth,
+        predicted,
+        label_order=("label-c", "label-a", "label-b"),
+    )
+    assert confusion == {
+        "label_order": ["label-c", "label-a", "label-b"],
+        "counts": [[1, 0, 0], [0, 1, 1], [0, 1, 0]],
+    }
+    assert macro_f1(confusion) == pytest.approx(0.5)
+
+    inferred = confusion_matrix(truth[::-1], predicted[::-1])
+    assert inferred["label_order"] == ["label-a", "label-b", "label-c"]
+    assert macro_f1(inferred) == pytest.approx(0.5)
+    with pytest.raises(V05MetricError, match="does not cover"):
+        confusion_matrix(truth, predicted, label_order=("label-a", "label-b"))
+
+
+def test_budget_auc_coverage_requires_the_actual_complete_panel() -> None:
+    rows = [
+        {
+            "method_id": "METHOD",
+            "endpoint": MARKET_30_CERT,
+            "budget_episodes": budget,
+            "value": value,
+        }
+        for budget, value in ((4, 0.0), (1, 0.0), (2, 1.0))
+    ] + [
+        {
+            "method_id": "METHOD",
+            "endpoint": TASK_5_CERT,
+            "budget_episodes": budget,
+            "value": value,
+        }
+        for budget, value in ((2, 0.5), (4, 0.75), (1, 0.25))
+    ]
+    summaries = summarize_budget_auc_coverage(
+        rows,
+        expected_method_ids=("METHOD",),
+    )
+    assert [(row["endpoint"], row["budget_episodes"]) for row in summaries] == [
+        (MARKET_30_CERT, [1, 2, 4]),
+        (TASK_5_CERT, [1, 2, 4]),
+    ]
+    assert [row["normalized_log2_auc"] for row in summaries] == pytest.approx(
+        [0.5, 0.5]
+    )
+    assert all(
+        row["coverage"] == 1.0
+        and row["observed_cell_count"] == row["expected_cell_count"] == 3
+        for row in summaries
+    )
+
+    with pytest.raises(V05MetricError, match="coverage is incomplete"):
+        summarize_budget_auc_coverage(rows[:-1], expected_method_ids=("METHOD",))
+    with pytest.raises(V05MetricError, match="duplicate cell"):
+        summarize_budget_auc_coverage([*rows, rows[0]], expected_method_ids=("METHOD",))
+    nonfinite = [dict(row) for row in rows]
+    nonfinite[0]["value"] = float("nan")
+    with pytest.raises(V05MetricError, match="finite"):
+        summarize_budget_auc_coverage(nonfinite, expected_method_ids=("METHOD",))
+    budget_seven = [dict(row) for row in rows]
+    budget_seven[0]["budget_episodes"] = 7
+    with pytest.raises(V05MetricError, match="unexpected budget"):
+        summarize_budget_auc_coverage(budget_seven, expected_method_ids=("METHOD",))
+
+
+def test_development_report_uses_one_seal_stable_confusions_and_actual_budgets() -> None:
+    def digest(value: str) -> str:
+        return hashlib.sha256(value.encode()).hexdigest()
+
+    policies = {
+        "anchor-a1": "lw-" + digest("policy-a1")[:20],
+        "anchor-a2": "lw-" + digest("policy-a2")[:20],
+        "anchor-b1": "lw-" + digest("policy-b1")[:20],
+    }
+    tasks = {"anchor-a1": "task-a", "anchor-a2": "task-a", "anchor-b1": "task-b"}
+    manifest = project_certificate_manifest(
+        policies,
+        task_by_anchor=tasks,
+        policy_bundle_digest_by_policy={
+            policy: digest(f"bundle-{anchor}") for anchor, policy in policies.items()
+        },
+        championization_admission_digest_by_anchor={
+            anchor: digest(f"champion-{anchor}") for anchor in policies
+        },
+        execution_abi_digest_by_policy={
+            policies[anchor]: digest(f"abi-{tasks[anchor]}") for anchor in policies
+        },
+    )
+    anchors = tuple(sorted(policies))
+
+    def ranking(top: str, candidates: tuple[str, ...]) -> tuple[str, ...]:
+        return (top, *(item for item in candidates if item != top))
+
+    rows = []
+    market_top = {
+        1: {anchor: "anchor-a1" for anchor in anchors},
+        2: {
+            "anchor-a1": "anchor-a1",
+            "anchor-a2": "anchor-a2",
+            "anchor-b1": "anchor-a1",
+        },
+        4: {anchor: anchor for anchor in anchors},
+    }
+    for budget in (1, 2, 4):
+        for anchor in anchors:
+            query_id = f"query-{anchor}"
+            common = {
+                "probe_protocol_digest": digest("probe"),
+                "reward_free_bank_sha256": digest(f"bank-{query_id}"),
+                "canonical_query_bank_digest": digest(f"canonical-{query_id}-{budget}"),
+                "source_train_membership_digest": digest("train"),
+                "source_validation_membership_digest": digest("validation"),
+                "target_membership_digest": digest(f"target-{query_id}"),
+                "normalization_digest": digest("normalization"),
+                "config_digest": digest("config"),
+                "source_model_manifest_digest": digest("source-model"),
+                "authorized_query_manifest_digest": digest(f"manifest-{query_id}"),
+                "score_vector_digest": digest(f"scores-{query_id}-{budget}"),
+                "budget_ledger_digest": digest(f"ledger-{query_id}-{budget}"),
+            }
+            top = market_top[budget][anchor]
+            rows.append(
+                PredictionRanking(
+                    "METHOD",
+                    MARKET_30_CERT,
+                    budget,
+                    query_id,
+                    ranking(top, anchors),
+                    ranking(policies[top], tuple(sorted(policies.values()))),
+                    **common,
+                )
+            )
+            task_anchors = tuple(
+                item for item in anchors if tasks[item] == tasks[anchor]
+            )
+            task_policies = tuple(sorted(policies[item] for item in task_anchors))
+            rows.append(
+                PredictionRanking(
+                    "METHOD",
+                    TASK_5_CERT,
+                    budget,
+                    query_id,
+                    ranking(anchor, task_anchors),
+                    ranking(policies[anchor], task_policies),
+                    **common,
+                )
+            )
+    seal = seal_rankings(prediction_payload(rows))
+    truth = tuple(
+        TruthBinding(
+            f"query-{anchor}",
+            anchor,
+            tasks[anchor],
+            policies[anchor],
+            digest(f"manifest-query-{anchor}"),
+            seal.rankings_digest,
+        )
+        for anchor in anchors
+    )
+    report = build_development_report(seal, truth, manifest, ("METHOD",))
+
+    assert len(report["per_query_rows"]) == 18
+    market_b2 = next(
+        item
+        for item in report["confusion_rows"]
+        if item["endpoint"] == MARKET_30_CERT and item["budget_episodes"] == 2
+    )
+    assert market_b2["anchor_confusion"] == {
+        "label_order": list(anchors),
+        "counts": [[1, 0, 0], [0, 1, 0], [1, 0, 0]],
+    }
+    assert market_b2["anchor_global_macro_f1"] == pytest.approx(5.0 / 9.0)
+    assert market_b2["anchor_task_equal_macro_f1"] == pytest.approx(0.5)
+    auc = {
+        (item["metric"], item["endpoint"]): item["normalized_log2_auc"]
+        for item in report["budget_auc_rows"]
+    }
+    assert auc[("anchor_hit_at_1", MARKET_30_CERT)] == pytest.approx(0.5625)
+    assert auc[("policy_hit_at_1", MARKET_30_CERT)] == pytest.approx(0.5625)
+    assert auc[("anchor_hit_at_1", TASK_5_CERT)] == pytest.approx(1.0)
+    with pytest.raises(V05MetricError, match="frozen|exactly"):
+        build_development_report(
+            seal, truth, manifest, ("METHOD",), expected_budgets=(1, 2, 7)
         )
 
 

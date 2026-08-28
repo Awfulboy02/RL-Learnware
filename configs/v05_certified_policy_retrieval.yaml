@@ -40,6 +40,7 @@ measurement:
   channels: [delta_observation, action]
   reward_masked: true
   episode_measure: equal_episode_then_equal_transition_within_episode
+  normalizer_std_floor: 0.000001
   gaussian_bandwidth:
     rule: source_balanced_median_pair_distance
     calibration_pairs: 10000
@@ -124,3 +125,59 @@ privacy:
     KME_KRR: full_support_control
   joint_benchmark_artifact: trusted_joint_artifact_contains_full_support_views_for_controls
   process_and_storage_level_raw_isolation: deferred_not_claimed
+
+development:
+  budgets: [1, 2, 4]
+  source_count: 30
+  task_count: 6
+  candidates_per_task: 5
+  source_bank_episodes: 32
+  visible_transitions_per_episode: 64
+  evidence_scope: reused_v04a_r4_source_held_repeat
+  actual_new_acquisition_steps: 0
+  sanity_budget_7_in_primary_auc: false
+  bootstrap_ci_status: DEFERRED
+  probability_calibration_status: DEFERRED
+  association_destruction_status: DEFERRED
+  market_growth_status: DEFERRED
+
+frozen_assets:
+  r4:
+    source_fit_manifest:
+      relative_path: source_fit_manifest.json
+      file_sha256: 4f468f6b885b7680cf3d186edb1fd70baf90c2c3c95c687373359a8d713296cf
+    probe_membership:
+      relative_path: probe_membership.json
+      file_sha256: dc372cbc59578f66462afac1e4bb3ee7f9d157f6aeae1dafffb4594e60e8d600
+    source_task_layout:
+      relative_path: source_task_layout.json
+      file_sha256: 6946b80663b6e8f4b63b2c4d63e0e83f0d57c41e5dc24a441d3c0fb93cb704e1
+    asset_census:
+      relative_path: asset_census.json
+      file_sha256: ba6bed976f7fddbecede507c170c224ed512e199995f67264b3782de3cf5abe5
+    raw_delta_adapter:
+      relative_path: raw_delta_adapter.json
+      file_sha256: 77d9f59129b885c367f14427fdc082eb2300a22565c73997715049424153f98a
+    source_fit_bank_directory: source_fit_banks
+    source_fit_bank_npz_keys:
+      - observation
+      - action
+      - next_observation
+      - episode_offsets
+      - probe_membership_digest
+  v03:
+    root_relative_to_r4: ../../v03_main_runs/v03-main-20260827-r0
+    deployment_private_registry:
+      relative_path: source-market/deployment_private_registry.json
+      file_sha256: cfcd8f7cdd251be73cd3e2f8d9903ebc5b08e1ffa13e175092b602579a7a9108
+    championization:
+      relative_path: source-market/championization.json
+      file_sha256: 94e822fd6912de82c0c5fc588af8568937cf951c91e5f0997bfb84bbecd70754
+      championization_digest: 45515da9ab3eed4e6293c9dbc0918be76edac5dd16ebdc711cec36674c62c88f
+    competence_mode: OBSERVE
+    selection_rule: max_mean_within_tolerance_then_min_std_bundle_digest_candidate_id
+    attestation_plan_digest: null
+    certificate_scope: FROZEN_V03_DEVELOPMENT_CHAMPIONIZATION_OBSERVE
+    formal_eligible: false
+    expected_passed_count: 23
+    expected_failed_count: 7

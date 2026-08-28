@@ -4,6 +4,7 @@ from collections.abc import Mapping
 from dataclasses import replace
 import hashlib
 import inspect
+import shutil
 from types import SimpleNamespace
 from pathlib import Path
 import sys
@@ -13,7 +14,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from policy_learnware_v0.hashing import canonical_json_bytes, sha256_json
+from policy_learnware_v0.hashing import canonical_json_bytes, sha256_file, sha256_json
 from policy_learnware_v0.io import atomic_write_json, read_json
 from policy_learnware_v0.rkme.reducer import ReducerConfig
 from policy_learnware_v0.v04a.protocol import (
@@ -44,8 +45,10 @@ from policy_learnware_v0.v05.metrics import (
     normalized_log2_budget_auc,
     prediction_payload,
 )
+from policy_learnware_v0.v05.specifications import RFFMap, SWEMap
 from server.repro_fpo_ppo_v05 import exact_repeat_collector
 from server.repro_fpo_ppo_v05 import blind_query_bank as blind_query_module
+from server.repro_fpo_ppo_v05 import environment_classifier_runner as runner_module
 from server.repro_fpo_ppo_v05.blind_query_bank import (
     AuthorizedQueryViews,
     V05BlindError,
@@ -79,6 +82,8 @@ ROW_BINDING = {
     "config_digest": _digest("config"),
     "source_model_manifest_digest": _digest("source-model-manifest"),
     "authorized_query_manifest_digest": _digest("authorized-query-manifest"),
+    "score_vector_digest": _digest("score-vector"),
+    "budget_ledger_digest": _digest("budget-ledger"),
 }
 
 
@@ -881,11 +886,15 @@ def test_runner_binds_all_p0_to_one_panel_then_masks_ranks_and_seals(
             expected_candidate_count=1,
         )
 
+    timings = {}
     predictions, rows = score_query(
         panel,
         query_views,
         expected_task_candidate_count=1,
+        timings=timings,
     )
+    assert set(timings) == set(P0_METHOD_IDS)
+    assert all(np.isfinite(value) and value >= 0.0 for value in timings.values())
     with pytest.raises(V05RunnerError, match="authorized query subset"):
         score_query(
             panel,
@@ -1186,3 +1195,536 @@ def test_collector_q0_has_no_policy_surface_and_preserves_nested_dual_costs(
         collection, output_dir=output, resume=True
     )
     assert resumed["index_digest"] == index["index_digest"]
+
+
+def test_canonical_source_stage_persists_fit_roles_only_then_blinds_repeat(
+    tmp_path, monkeypatch
+) -> None:
+    anchors = tuple(f"source-{index:02d}" for index in range(30))
+    task_by_anchor = {
+        anchor: f"task-{index // 5}" for index, anchor in enumerate(anchors)
+    }
+    policy_by_anchor = {
+        anchor: "lw-" + _digest(f"policy-{anchor}")[:20] for anchor in anchors
+    }
+    certificate_manifest = project_certificate_manifest(
+        policy_by_anchor,
+        task_by_anchor=task_by_anchor,
+        policy_bundle_digest_by_policy={
+            policy: _digest(f"bundle-{policy}") for policy in policy_by_anchor.values()
+        },
+        championization_admission_digest_by_anchor={
+            anchor: _digest(f"champion-{anchor}") for anchor in anchors
+        },
+        execution_abi_digest_by_policy={
+            policy_by_anchor[anchor]: _digest(f"abi-{task_by_anchor[anchor]}")
+            for anchor in anchors
+        },
+        expected_anchor_ids=anchors,
+    )
+
+    row = np.arange(32 * 64, dtype=np.float64)[:, None]
+    coordinate = np.arange(29, dtype=np.float64)[None, :]
+    base_observation = row / 2_048.0 + coordinate / 29.0
+    base_action = np.sin(row / 31.0)
+    arrays_by_anchor = {}
+    memberships = {}
+    contexts = {}
+    for index, anchor in enumerate(anchors):
+        context = f"context-{index:02d}"
+        observation = base_observation + index / 100.0
+        arrays_by_anchor[anchor] = {
+            "observation": observation,
+            "action": base_action + index / 1_000.0,
+            "next_observation": observation + 0.05 + coordinate / 10_000.0,
+            "episode_offsets": np.arange(33, dtype=np.int64) * 64,
+        }
+        memberships[anchor] = derive_probe_membership(context, 50_500)
+        contexts[anchor] = context
+
+    assets = runner_module.FrozenR4Assets(
+        config={"measurement": {"normalizer_std_floor": 1.0e-6}},
+        config_digest=_digest("canonical-source-config"),
+        r4_root=tmp_path / "synthetic-r4",
+        v03_root=tmp_path / "synthetic-v03",
+        arrays_by_anchor=arrays_by_anchor,
+        membership_by_anchor=memberships,
+        context_by_anchor=contexts,
+        task_by_anchor=task_by_anchor,
+        parent_asset_sha256={
+            anchor: _digest(f"parent-asset-{anchor}") for anchor in anchors
+        },
+        parent_membership_digest={
+            anchor: memberships[anchor].membership_digest for anchor in anchors
+        },
+        native_schema_by_task={
+            task: _digest(f"native-schema-{task}")
+            for task in set(task_by_anchor.values())
+        },
+        certificate_manifest=certificate_manifest,
+        probe_protocol_digest=_digest("canonical-source-probe"),
+        provenance={"fixture": "synthetic-frozen-r4"},
+    )
+    run_dir = tmp_path / "run"
+    full_banks, complete = runner_module._canonical_source_stage(
+        assets, run_dir, resume=False
+    )
+
+    assert set(full_banks) == set(anchors)
+    assert all(
+        bank.points.shape == (32 * 64, 30)
+        and bank.episode_offsets.shape == (33,)
+        and np.array_equal(np.diff(bank.episode_offsets), np.full(32, 64))
+        for bank in full_banks.values()
+    )
+    canonical_root = run_dir / "source_fit" / "canonical"
+    npz_paths = {
+        path.relative_to(canonical_root).as_posix()
+        for path in canonical_root.rglob("*.npz")
+    }
+    assert npz_paths == {
+        "normalizer_state.npz",
+        *(f"fit_banks/{anchor}.npz" for anchor in anchors),
+    }
+    for anchor in anchors:
+        with np.load(canonical_root / "fit_banks" / f"{anchor}.npz") as archive:
+            assert set(archive.files) == {"points", "episode_offsets"}
+            assert archive["points"].shape == (25 * 64, 30)
+            assert archive["episode_offsets"].shape == (26,)
+            np.testing.assert_array_equal(
+                np.diff(archive["episode_offsets"]), np.full(25, 64)
+            )
+
+    assert complete["persisted_roles"] == ["source_train", "source_validation"]
+    assert complete["persisted_episode_count_per_anchor"] == 25
+    assert complete["held_repeat_persisted"] is False
+
+    def nested_keys(value):
+        if isinstance(value, Mapping):
+            for key, item in value.items():
+                yield str(key)
+                yield from nested_keys(item)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                yield from nested_keys(item)
+
+    complete_keys = tuple(nested_keys(complete))
+    assert not any("full" in key.lower() for key in complete_keys)
+    assert [key for key in complete_keys if "repeat" in key.lower()] == [
+        "held_repeat_persisted"
+    ]
+
+    projection = project_verified_source_banks(
+        full_banks,
+        parent_asset_sha256=assets.parent_asset_sha256,
+        parent_membership_digest=assets.parent_membership_digest,
+        expected_source_count=30,
+    )
+    complete_values = set()
+
+    def collect_strings(value):
+        if isinstance(value, Mapping):
+            for item in value.values():
+                collect_strings(item)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                collect_strings(item)
+        elif isinstance(value, str):
+            complete_values.add(value)
+
+    collect_strings(complete)
+    assert {
+        *(bank.bank_digest for bank in full_banks.values()),
+        *(bank.bank_digest for bank in projection.source_repeat.values()),
+    }.isdisjoint(complete_values)
+
+    rff_map = RFFMap(
+        input_dim=30,
+        bandwidth=1.0,
+        normalization_digest=complete["normalizer_digest"],
+        frequency_count=4,
+        public_seed=50_501,
+    )
+    swe_map = SWEMap(
+        input_dim=30,
+        normalization_digest=complete["normalizer_digest"],
+        direction_count=2,
+        quantile_count=4,
+        public_seed=50_502,
+    )
+    truth_anchor = anchors[0]
+    query = prepare_blinded_episode_bank(
+        episode_bank=projection.source_repeat[truth_anchor],
+        parent_source_role_manifest=projection.manifest,
+        expected_source_role_manifest_digest=projection.manifest[
+            "source_role_manifest_digest"
+        ],
+        parent_asset_sha256=assets.parent_asset_sha256[truth_anchor],
+        parent_membership_digest=assets.parent_membership_digest[truth_anchor],
+        probe_protocol_digest=assets.probe_protocol_digest,
+        public_parent=tmp_path / "opaque-public",
+        private_binding_root=tmp_path / "private-bindings",
+        truth_source_anchor_id=truth_anchor,
+        certificate_manifest=assets.certificate_manifest,
+        blinding_nonce="0123456789abcdef-source-stage-test",
+        normalization_digest=complete["normalizer_digest"],
+        rff_map=rff_map,
+        swe_map=swe_map,
+        authorized_budgets=(1, 2, 4),
+    )
+    assert query.opaque_query_id.startswith("q-")
+    assert query.authorized_budgets == (1, 2, 4)
+    assert truth_anchor.encode() not in canonical_json_bytes(query.manifest)
+
+    missing_fit_bank = canonical_root / "fit_banks" / f"{anchors[0]}.npz"
+    missing_fit_bank.unlink()
+    write_attempts = []
+
+    def forbid_resume_write(path, *unused_args, **unused_kwargs):
+        write_attempts.append(Path(path))
+        raise AssertionError("COMPLETE canonical resume attempted a write")
+
+    monkeypatch.setattr(runner_module, "atomic_write_npz", forbid_resume_write)
+    monkeypatch.setattr(runner_module, "atomic_write_json", forbid_resume_write)
+    with pytest.raises(V05RunnerError):
+        runner_module._canonical_source_stage(assets, run_dir, resume=True)
+    assert write_attempts == []
+    assert not missing_fit_bank.exists()
+
+
+def test_production_entry_and_invalid_public_seal_cannot_reach_private_capability(
+    tmp_path, monkeypatch
+) -> None:
+    assert tuple(inspect.signature(runner_module.run_development).parameters) == (
+        "config_path",
+        "r4_root",
+        "new_run_dir",
+        "resume",
+    )
+    score_signature = inspect.signature(runner_module.score_precommitted_queries)
+    assert tuple(score_signature.parameters) == (
+        "panel",
+        "query_index_path",
+        "scoring_root",
+        "resume",
+    )
+    assert "AuthorizedQueryViews" not in str(score_signature)
+
+    query_ids = tuple(f"q-{index:064x}" for index in range(30))
+    index = {
+        "queries": {
+            query_id: _digest(f"manifest-{query_id}") for query_id in query_ids
+        },
+        "index_digest": _digest("public-query-index"),
+    }
+    monkeypatch.setattr(runner_module, "_read_query_index", lambda *unused: index)
+
+    class RunRootCapabilityTrap:
+        private_touched = False
+
+        def __truediv__(self, child):
+            if child == "private":
+                self.private_touched = True
+                raise AssertionError("private path capability was materialized")
+            return tmp_path / str(child)
+
+    incomplete_receipt = {
+        "schema": "policy-learnware.v05-global-development-seal.v1",
+        "status": "SEALED",
+        "query_index_digest": index["index_digest"],
+        "query_count": 29,
+        "prediction_cell_count": 1080,
+        "score_rows_digest": _digest("score-rows"),
+        "budget_ledger_digest": _digest("budget-ledger"),
+        "cell_files": {},
+        "prediction_seal": {},
+        "global_seal_digest": _digest("global-seal"),
+    }
+    for receipt in ({}, incomplete_receipt):
+        loaded_paths = []
+        seal_path = tmp_path / "scoring" / "global_seal.json"
+        if receipt:
+            atomic_write_json(seal_path, {"placeholder": True})
+
+        def public_json_only(path):
+            materialized = Path(path)
+            loaded_paths.append(materialized)
+            if (
+                materialized.name == "blinding_nonce.json"
+                or "query_bindings" in materialized.parts
+            ):
+                raise AssertionError(
+                    "private JSON was read before public seal validation"
+                )
+            return receipt
+
+        monkeypatch.setattr(runner_module, "load_strict_json", public_json_only)
+        run_root = RunRootCapabilityTrap()
+        with pytest.raises(V05RunnerError):
+            runner_module._evaluate_after_persisted_seal(
+                object(),
+                {},
+                {},
+                run_root,
+                tmp_path / "scoring",
+                source_input_bytes=0,
+                resume=False,
+            )
+        assert run_root.private_touched is False
+        assert loaded_paths == ([] if not receipt else [seal_path])
+
+
+def test_completed_source_fit_checkpoint_closure_is_immutable_on_resume(
+    tmp_path, monkeypatch
+) -> None:
+    anchors = tuple(f"checkpoint-source-{index:02d}" for index in range(30))
+    task_by_anchor = {
+        anchor: f"checkpoint-task-{index // 5}" for index, anchor in enumerate(anchors)
+    }
+    policy_by_anchor = {
+        anchor: "lw-" + _digest(f"checkpoint-policy-{anchor}")[:20]
+        for anchor in anchors
+    }
+    certificate_manifest = project_certificate_manifest(
+        policy_by_anchor,
+        task_by_anchor=task_by_anchor,
+        policy_bundle_digest_by_policy={
+            policy: _digest(f"checkpoint-bundle-{policy}")
+            for policy in policy_by_anchor.values()
+        },
+        championization_admission_digest_by_anchor={
+            anchor: _digest(f"checkpoint-champion-{anchor}") for anchor in anchors
+        },
+        execution_abi_digest_by_policy={
+            policy_by_anchor[anchor]: _digest(
+                f"checkpoint-abi-{task_by_anchor[anchor]}"
+            )
+            for anchor in anchors
+        },
+        expected_anchor_ids=anchors,
+    )
+    reducer = ReducerConfig(support_budget=1, support_steps=0, kmeans_steps=0)
+    reducer_config = {
+        name: getattr(reducer, name) for name in ReducerConfig.__dataclass_fields__
+    }
+    config = {
+        "measurement": {
+            "gaussian_bandwidth": {
+                "rule": "source_balanced_median_pair_distance",
+                "calibration_pairs": 10,
+                "public_seed": 50_500,
+            }
+        },
+        "raw_delta_rkme": reducer_config,
+        "summary_logreg": {
+            "l2_grid": [0.1],
+            "max_iter": 1,
+            "gradient_tolerance": 1.0e-9,
+        },
+        "kme_krr": {"ridge_grid": [0.1]},
+        "rff_kme_nn": {
+            "frequency_count": 1,
+            "output_dimension": 2,
+            "public_seed": 50_501,
+        },
+        "swe_nn": {
+            "direction_count": 1,
+            "quantile_count": 2,
+            "output_dimension": 2,
+            "public_seed": 50_502,
+        },
+    }
+    assets = runner_module.FrozenR4Assets(
+        config=config,
+        config_digest=_digest("checkpoint-config"),
+        r4_root=tmp_path / "unused-r4",
+        v03_root=tmp_path / "unused-v03",
+        arrays_by_anchor={},
+        membership_by_anchor={},
+        context_by_anchor={},
+        task_by_anchor=task_by_anchor,
+        parent_asset_sha256={
+            anchor: _digest(f"checkpoint-parent-{anchor}") for anchor in anchors
+        },
+        parent_membership_digest={
+            anchor: _digest(f"checkpoint-membership-{anchor}") for anchor in anchors
+        },
+        native_schema_by_task={},
+        certificate_manifest=certificate_manifest,
+        probe_protocol_digest=_digest("checkpoint-probe"),
+        provenance={},
+    )
+    full_bank = EpisodeBank(
+        np.zeros((32 * 64, 30), dtype=np.float64),
+        np.arange(33, dtype=np.int64) * 64,
+    )
+    full_banks = {anchor: full_bank for anchor in anchors}
+    canonical_receipt = {
+        "complete_digest": _digest("checkpoint-canonical-complete"),
+        "normalizer_digest": _digest("checkpoint-normalizer"),
+    }
+    classes = tuple(sorted(policy_by_anchor.values()))
+    summary_model = runner_module.SummaryLogReg(
+        class_ids=classes,
+        feature_mean=np.zeros(60),
+        feature_scale=np.ones(60),
+        weights=np.zeros((60, 30)),
+        intercept=np.zeros(30),
+        selected_l2=0.1,
+        training_iterations=1,
+    )
+    stacked_train = EpisodeBank(
+        np.zeros((30 * 19 * 64, 30), dtype=np.float64),
+        np.arange(30 * 19 + 1, dtype=np.int64) * 64,
+    )
+    krr_model = runner_module.KMEKRR(
+        class_ids=classes,
+        training_bank=stacked_train,
+        alpha=np.zeros((30 * 19, 30)),
+        bandwidth=1.0,
+        selected_ridge=0.1,
+    )
+
+    def cheap_empirical(
+        points,
+        kernel,
+        *,
+        episode_offsets,
+        protocol_id,
+        dataset_digest,
+        source_task="",
+        **unused,
+    ):
+        point_array = np.asarray(points, dtype=np.float64)
+        return runner_module.EmpiricalKME(
+            points=point_array,
+            weights=np.full(point_array.shape[0], 1.0 / point_array.shape[0]),
+            episode_offsets=episode_offsets,
+            bandwidth=kernel.bandwidth,
+            norm2=1.0,
+            protocol_id=protocol_id,
+            dataset_digest=dataset_digest,
+            source_task=source_task,
+        )
+
+    def cheap_reduced(empirical, reduction_config):
+        return runner_module.ReducedRKME(
+            supports=np.zeros((1, 30)),
+            beta=np.ones(1),
+            bandwidth=empirical.bandwidth,
+            rkme_norm2=1.0,
+            empirical_norm2=empirical.norm2,
+            reduction_error=0.0,
+            protocol_id=empirical.protocol_id,
+            source_dataset_digest=empirical.dataset_digest,
+            ridge=reduction_config.ridge,
+            condition_number=1.0,
+            source_task=empirical.source_task,
+        )
+
+    monkeypatch.setattr(runner_module, "calibrate_bandwidth", lambda *a, **k: 1.0)
+    monkeypatch.setattr(runner_module, "build_empirical_kme", cheap_empirical)
+    monkeypatch.setattr(runner_module, "reduce_kme", cheap_reduced)
+    monkeypatch.setattr(
+        runner_module.SummaryLogReg,
+        "fit",
+        classmethod(lambda cls, *args, **kwargs: summary_model),
+    )
+    monkeypatch.setattr(
+        runner_module.KMEKRR,
+        "fit",
+        classmethod(lambda cls, *args, **kwargs: krr_model),
+    )
+
+    baseline_run = tmp_path / "source-fit-baseline"
+    panel, projection = runner_module._source_fit_stage(
+        assets,
+        full_banks,
+        canonical_receipt,
+        baseline_run,
+        resume=False,
+    )
+    assert isinstance(panel, runner_module.P0Panel)
+    model_root = baseline_run / "source_fit" / "models"
+    assert len(tuple(model_root.rglob("*.npz"))) == 65
+    assert len(read_json(model_root / "progress.json")["models"]) == 65
+    monkeypatch.setattr(
+        runner_module,
+        "project_verified_source_banks",
+        lambda *args, **kwargs: projection,
+    )
+
+    def tree_state(root):
+        return {
+            path.relative_to(root).as_posix(): (
+                sha256_file(path),
+                path.stat().st_mtime_ns,
+            )
+            for path in root.rglob("*")
+            if path.is_file()
+        }
+
+    before = tree_state(model_root)
+    write_attempts = []
+
+    def forbid_write(path, *unused_args, **unused_kwargs):
+        write_attempts.append(Path(path))
+        raise AssertionError("completed source fit attempted a write")
+
+    monkeypatch.setattr(runner_module, "atomic_write_json", forbid_write)
+    monkeypatch.setattr(runner_module, "atomic_write_npz", forbid_write)
+    for model_type in (
+        runner_module.EmpiricalKME,
+        runner_module.ReducedRKME,
+        runner_module.SummaryLogReg,
+        runner_module.KMEKRR,
+        runner_module.RFFMap,
+        runner_module.SWEMap,
+    ):
+        monkeypatch.setattr(model_type, "save_npz", forbid_write)
+
+    resumed_panel, _ = runner_module._source_fit_stage(
+        assets,
+        full_banks,
+        canonical_receipt,
+        baseline_run,
+        resume=True,
+    )
+    assert isinstance(resumed_panel, runner_module.P0Panel)
+    assert write_attempts == []
+    assert tree_state(model_root) == before
+
+    corrupt_runs = {}
+    for name in (
+        "orphan_path_without_progress",
+        "missing_npz_with_progress",
+        "extra_npz",
+        "tampered_npz",
+    ):
+        destination = tmp_path / name
+        shutil.copytree(baseline_run, destination)
+        corrupt_runs[name] = destination
+
+    orphan_root = corrupt_runs["orphan_path_without_progress"] / "source_fit" / "models"
+    orphan_progress = read_json(orphan_root / "progress.json")
+    orphan_progress["models"].pop(f"empirical/{anchors[0]}")
+    atomic_write_json(orphan_root / "progress.json", orphan_progress, overwrite=True)
+    missing_root = corrupt_runs["missing_npz_with_progress"] / "source_fit" / "models"
+    (missing_root / "raw" / f"{anchors[0]}.npz").unlink()
+    extra_root = corrupt_runs["extra_npz"] / "source_fit" / "models"
+    shutil.copy2(extra_root / "rff_map.npz", extra_root / "extra.npz")
+    tampered_root = corrupt_runs["tampered_npz"] / "source_fit" / "models"
+    tampered_path = tampered_root / "summary_logreg.npz"
+    tampered_path.write_bytes(tampered_path.read_bytes() + b"tamper")
+
+    for name, corrupt_run in corrupt_runs.items():
+        write_attempts.clear()
+        with pytest.raises(V05RunnerError):
+            runner_module._source_fit_stage(
+                assets,
+                full_banks,
+                canonical_receipt,
+                corrupt_run,
+                resume=True,
+            )
+        assert write_attempts == [], name
