@@ -1,0 +1,117 @@
+schema: policy-learnware.v05-certified-policy-retrieval-config.v1
+engineering_base_commit: 084bb9c0e52c23c141940d94eb675dbd2995adc6
+coding_plan_sha256: d088596c9dc05aabc1d49f07bedb8e60ae3de7268a82209ebf81ae3d088efa3c
+
+objective:
+  task: reward_free_environment_classification_for_certified_policy_retrieval
+  primary_endpoint: MARKET_30_CERT
+  conditional_endpoint: TASK_5_CERT
+  target_return_selection: false
+
+probe:
+  protocol_id: Q0_COMMON_GAUSSIAN_OPEN_LOOP
+  action_rule: clipped_gaussian
+  sigma: 1.0
+  action_low: -1.0
+  action_high: 1.0
+  feedback_mode: open_loop
+  full_episode_draw: true
+  state_access_for_action: false
+  reward_access: false
+  label_access: false
+  candidate_policy_access: false
+  candidate_conditioned_steps: 0
+  reward_queries: 0
+  rng_backend: jax_threefry_full_episode_v0
+  native_steps_per_episode: 1000
+  visible_transitions_per_episode: 64
+  budget_episodes: [1, 2, 4, 8, 16, 24, 32]
+
+source_evidence:
+  train_episodes_per_anchor: 19
+  validation_episodes_per_anchor: 6
+  repeat_report_episodes_per_anchor: 7
+  split_unit: complete_episode
+  transition_random_split: false
+  normalizer_fit_roles: [source_train, source_validation]
+  target_fit_access: false
+
+measurement:
+  channels: [delta_observation, action]
+  reward_masked: true
+  episode_measure: equal_episode_then_equal_transition_within_episode
+  gaussian_bandwidth:
+    rule: source_balanced_median_pair_distance
+    calibration_pairs: 10000
+    public_seed: 50500
+
+methods:
+  p0:
+    - RAW_DELTA_RKME
+    - EMPIRICAL_MMD_NN
+    - SUMMARY_LOGREG
+    - KME_KRR
+    - RFF_KME_NN
+    - SWE_NN
+  p1_status: DEFERRED_NOT_IMPLEMENTED
+  p1: []
+
+raw_delta_rkme:
+  support_budget: 100
+  init: weighted_kmeans
+  support_steps: 1000
+  learning_rate: 0.01
+  pinv_rcond: 1.0e-8
+  ridge: 1.0e-6
+  kmeans_steps: 25
+  negative_tolerance: 1.0e-8
+  optimizer_backend: numpy
+
+empirical_mmd_nn:
+  estimator: biased_v_statistic
+  include_self_diagonal: true
+  target_aggregation: equal_episode_mixture_then_one_mmd
+
+summary_logreg:
+  summary: [episode_mean, episode_std_ddof0]
+  l2_grid: [0.0001, 0.001, 0.01, 0.1, 1.0]
+  max_iter: 3000
+  gradient_tolerance: 1.0e-9
+  target_aggregation: arithmetic_mean_episode_logits
+
+kme_krr:
+  gram: exact_episode_expected_gaussian_kernel
+  ridge_grid: [1.0e-6, 0.0001, 0.01, 1.0]
+  target_aggregation: arithmetic_mean_episode_class_scores
+
+rff_kme_nn:
+  frequency_count: 512
+  output_dimension: 1024
+  public_seed: 50501
+  dtype: float64
+  layout: all_cos_then_all_sin
+  scaling: one_over_sqrt_frequency_count
+  target_aggregation: equal_mean_episode_feature_means
+  inherits_raw_bandwidth: true
+
+swe_nn:
+  direction_count: 64
+  quantile_count: 64
+  output_dimension: 4096
+  public_seed: 50502
+  dtype: float64
+  quantile_grid: interior_midpoints
+  interpolation: weighted_linear_midpoint_knots_duplicate_coalesced_constant_endpoints
+  scaling: one_over_sqrt_direction_count_times_quantile_count
+  target_aggregation: equal_episode_mixture_then_one_sketch
+  adaptation_status: fixed_projection_fixed_grid_retrieval_adaptation
+
+ranking:
+  score_direction: larger_is_better
+  endpoint_mask_after_budget_aggregation: true
+  tie_rule: v04a_config_digest_hash
+  seal_before_target_label_join: true
+
+privacy:
+  formal_dp: false
+  claim: specification_mediated_raw_data_non_disclosure_and_data_minimization_only
