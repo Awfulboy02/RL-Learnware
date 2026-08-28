@@ -2391,16 +2391,43 @@ def _prepare_query_index(
 ) -> Path:
     """Privileged one-time projection of the seven held-repeat episodes."""
 
-    public_root = run_dir / "public"
+    run_root = Path(run_dir).expanduser()
+    public_root = run_root / "public"
+    private_root = run_root / "private"
+    queries_root = public_root / "queries"
+    binding_root = private_root / "query_bindings"
     index_path = public_root / "query_index.json"
+    nonce_path = private_root / "blinding_nonce.json"
+    progress_path = private_root / "query_prepare_progress.json"
+    directories = (run_root, public_root, private_root, queries_root, binding_root)
+    files = (nonce_path, progress_path, index_path)
+    if (
+        any(path.is_symlink() for path in (*directories, *files))
+        or any(path.exists() and not path.is_dir() for path in directories)
+        or any(path.exists() and not path.is_file() for path in files)
+    ):
+        raise V05RunnerError("query preparation path is absent or unsafe")
+    resolved_run = run_root.resolve()
+    resolved_public = public_root.resolve()
+    resolved_private = private_root.resolve()
+    if (
+        resolved_public == resolved_run
+        or not resolved_public.is_relative_to(resolved_run)
+        or resolved_private == resolved_run
+        or not resolved_private.is_relative_to(resolved_run)
+        or resolved_public == resolved_private
+        or resolved_public.is_relative_to(resolved_private)
+        or resolved_private.is_relative_to(resolved_public)
+        or not queries_root.resolve().is_relative_to(resolved_public)
+        or not binding_root.resolve().is_relative_to(resolved_private)
+    ):
+        raise V05RunnerError("public/private query roots overlap or escape run_dir")
     if index_path.exists():
         if not resume:
             raise V05RunnerError("public query index already exists")
         _read_query_index(panel, index_path)
         return index_path
-    private_root = run_dir / "private"
     private_root.mkdir(parents=True, exist_ok=True, mode=0o700)
-    nonce_path = private_root / "blinding_nonce.json"
     if nonce_path.exists():
         if not resume:
             raise V05RunnerError("private blinding nonce already exists")
@@ -2422,7 +2449,6 @@ def _prepare_query_index(
             },
         )
         os.chmod(nonce_path, 0o600)
-    progress_path = private_root / "query_prepare_progress.json"
     progress = load_strict_json(progress_path) if progress_path.exists() else {}
     anchor_to_query = dict(progress.get("anchor_to_query", {}))
     if anchor_to_query and (
@@ -2433,9 +2459,11 @@ def _prepare_query_index(
     manifest_by_query: dict[str, str] = {}
     for source_id in sorted(projection.source_repeat):
         if source_id in anchor_to_query:
-            query_root = public_root / "queries" / anchor_to_query[source_id]
+            prepared_query_root = queries_root / anchor_to_query[source_id]
             views = load_authorized_query(
-                query_root, rff_map=panel.rff.rff_map, swe_map=panel.swe.swe_map
+                prepared_query_root,
+                rff_map=panel.rff.rff_map,
+                swe_map=panel.swe.swe_map,
             )
         else:
             views = prepare_blinded_episode_bank(
@@ -2447,8 +2475,8 @@ def _prepare_query_index(
                 parent_asset_sha256=assets.parent_asset_sha256[source_id],
                 parent_membership_digest=assets.parent_membership_digest[source_id],
                 probe_protocol_digest=assets.probe_protocol_digest,
-                public_parent=public_root / "queries",
-                private_binding_root=private_root / "query_bindings",
+                public_parent=queries_root,
+                private_binding_root=binding_root,
                 truth_source_anchor_id=source_id,
                 certificate_manifest=panel.certificate_manifest,
                 blinding_nonce=nonce,

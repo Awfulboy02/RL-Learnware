@@ -1474,6 +1474,58 @@ def test_production_entry_and_invalid_public_seal_cannot_reach_private_capabilit
         assert loaded_paths == ([] if not receipt else [seal_path])
 
 
+def test_query_prepare_rejects_public_or_private_ancestor_symlink_before_writes(
+    tmp_path, monkeypatch
+) -> None:
+    cases = []
+    for linked_name in ("public", "private"):
+        outside = tmp_path / f"outside-{linked_name}"
+        outside.mkdir()
+        (outside / "sentinel.txt").write_text("unchanged", encoding="utf-8")
+        run_dir = tmp_path / f"run-with-{linked_name}-link"
+        run_dir.mkdir()
+        (run_dir / linked_name).symlink_to(outside, target_is_directory=True)
+        cases.append((run_dir, outside))
+
+    def outside_state(root):
+        return {
+            path.relative_to(root).as_posix(): (
+                sha256_file(path),
+                path.stat().st_mtime_ns,
+            )
+            for path in root.rglob("*")
+            if path.is_file()
+        }
+
+    before = {outside: outside_state(outside) for _, outside in cases}
+    write_attempts = []
+
+    def forbid_write(path, *unused_args, **unused_kwargs):
+        write_attempts.append(Path(path))
+        raise AssertionError("query prepare attempted a write through a symlink")
+
+    monkeypatch.setattr(runner_module, "atomic_write_json", forbid_write)
+    monkeypatch.setattr(runner_module, "prepare_blinded_episode_bank", forbid_write)
+    monkeypatch.setattr(runner_module.Path, "mkdir", forbid_write)
+    monkeypatch.setattr(runner_module.os, "chmod", forbid_write)
+    inaccessible = SimpleNamespace(
+        __getattribute__=lambda *unused: (_ for _ in ()).throw(
+            AssertionError("query data was accessed before symlink rejection")
+        )
+    )
+    for run_dir, outside in cases:
+        with pytest.raises(V05RunnerError):
+            runner_module._prepare_query_index(
+                inaccessible,
+                inaccessible,
+                inaccessible,
+                run_dir,
+                resume=True,
+            )
+        assert write_attempts == []
+        assert outside_state(outside) == before[outside]
+
+
 def test_completed_source_fit_checkpoint_closure_is_immutable_on_resume(
     tmp_path, monkeypatch
 ) -> None:
