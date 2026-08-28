@@ -36,6 +36,7 @@ from server.repro_fpo_ppo_v04a.bpr_runner import (
     _load_config,
     _deployment_action_audit,
     _method_cards,
+    _origin_pool_acceptance,
     _origin_parity_receipt,
     _parser,
     _publish,
@@ -247,6 +248,7 @@ def test_prepare_missing_real_assets_fails_closed_with_metadata(tmp_path: Path) 
             context_index=tmp_path / "missing-context-index.json",
             public_policy_market=tmp_path / "missing-public-market.json",
             deployment_private_registry=tmp_path / "missing-private-registry.json",
+            origin_pool_acceptance=tmp_path / "missing-pool-acceptance.json",
             raw_delta_root=raw_root,
             fpo_root=tmp_path / "missing-fpo-runtime",
         )
@@ -282,6 +284,8 @@ def test_no_go_prepare_returns_nonzero_process_status(tmp_path: Path) -> None:
             str(tmp_path / "missing-public.json"),
             "--deployment-private-registry",
             str(tmp_path / "missing-private.json"),
+            "--origin-pool-acceptance",
+            str(tmp_path / "missing-pool-acceptance.json"),
             "--raw-delta-root",
             str(tmp_path / "missing-raw"),
             "--fpo-root",
@@ -294,7 +298,9 @@ def test_no_go_prepare_returns_nonzero_process_status(tmp_path: Path) -> None:
 def test_origin_parity_receipt_remains_digest_bound_at_one_e_minus_six(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    bundle = tmp_path / "attempt_001" / "checkpoints" / "outer_000001"
+    job_id = "v02j-fixture"
+    attempt = tmp_path / "jobs" / job_id / "attempt_001"
+    bundle = attempt / "checkpoints" / "outer_000001"
     bundle.mkdir(parents=True)
     golden = {
         "passed": True,
@@ -314,7 +320,7 @@ def test_origin_parity_receipt_remains_digest_bound_at_one_e_minus_six(
     compiled["report_digest"] = sha256_json(compiled)
     record = {
         "schema": "policy-learnware.v02-training-record.v1",
-        "state": "succeeded",
+        "state": "recovered",
         "promoted_outer_iteration": 1,
         "promoted_environment_steps": 100,
         "checkpoint_bundles": [
@@ -327,11 +333,11 @@ def test_origin_parity_receipt_remains_digest_bound_at_one_e_minus_six(
         ],
     }
     record["record_digest"] = sha256_json(record)
-    _publish(tmp_path / "attempt_001" / "training_record.json", record)
+    _publish(attempt / "training_record.json", record)
     _publish(
-        tmp_path / "attempt_001" / "status.json",
+        attempt / "status.json",
         {
-            "state": "completed",
+            "state": "recovered",
             "training_record_digest": record["record_digest"],
             "promoted_outer_iteration": 1,
             "promoted_environment_steps": 100,
@@ -342,6 +348,7 @@ def test_origin_parity_receipt_remains_digest_bound_at_one_e_minus_six(
         bundle_digest="a" * 64,
         outer_iteration=1,
         environment_steps=100,
+        training_seed=2,
         provenance={
             "job_digest": "b" * 64,
             "attempt_digest": "c" * 64,
@@ -351,10 +358,48 @@ def test_origin_parity_receipt_remains_digest_bound_at_one_e_minus_six(
             "execution_purpose": "test",
         },
     )
+    accepted_cell = {
+        "resolution": "direct_terminal_record",
+        "job_id": job_id,
+        "job_digest": "b" * 64,
+        "attempt_digest": "c" * 64,
+        "bundle_path": str(bundle),
+        "bundle_digest": "a" * 64,
+        "outer_iteration": 1,
+        "environment_steps": 100,
+        "seed": 2,
+        "training_record_digest": record["record_digest"],
+        "terminal_record_state": "recovered",
+        "golden_parity_digest": golden["report_digest"],
+        "compiled_parity_digest": compiled["report_digest"],
+    }
     monkeypatch.setattr(
         runner_module, "validate_success_record", lambda *a, **k: record
     )
-    assert _origin_parity_receipt(metadata)["status"] == "PASS"
+    assert _origin_parity_receipt(metadata, accepted_cell)["status"] == "PASS"
+
+    (attempt / "status.json").unlink()
+    _publish(
+        attempt / "status.json",
+        {
+            "state": "completed",
+            "training_record_digest": record["record_digest"],
+            "promoted_outer_iteration": 1,
+            "promoted_environment_steps": 100,
+        },
+    )
+    with pytest.raises(GateFailure, match="training status"):
+        _origin_parity_receipt(metadata, accepted_cell)
+    (attempt / "status.json").unlink()
+    _publish(
+        attempt / "status.json",
+        {
+            "state": "recovered",
+            "training_record_digest": record["record_digest"],
+            "promoted_outer_iteration": 1,
+            "promoted_environment_steps": 100,
+        },
+    )
 
     tampered = dict(record)
     tampered["checkpoint_bundles"] = [
@@ -363,13 +408,98 @@ def test_origin_parity_receipt_remains_digest_bound_at_one_e_minus_six(
             "golden_parity": {**golden, "passed": False},
         }
     ]
-    (tmp_path / "attempt_001" / "training_record.json").unlink()
-    _publish(tmp_path / "attempt_001" / "training_record.json", tampered)
+    (attempt / "training_record.json").unlink()
+    _publish(attempt / "training_record.json", tampered)
     monkeypatch.setattr(
         runner_module, "validate_success_record", lambda *a, **k: tampered
     )
     with pytest.raises(GateFailure, match="origin parity"):
-        _origin_parity_receipt(metadata)
+        _origin_parity_receipt(metadata, accepted_cell)
+
+
+def test_origin_pool_acceptance_replays_canonical_semantics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    handoff = tmp_path / "experiment" / "policy_pool_handoff_fixture"
+    acceptance_path = handoff / "policy_pool_acceptance.json"
+    promotion_path = handoff / "compiled_parity_promotions.json"
+    plan_path = (
+        tmp_path
+        / "experiment"
+        / "training_private"
+        / "plans"
+        / "server_training_plan.json"
+    )
+    (tmp_path / "experiment" / "training_private" / "server_runs").mkdir(parents=True)
+    stored = {
+        "schema": "policy-learnware.v02-policy-pool-acceptance.v0",
+        "decision": "PASS",
+        "accepted_at": "frozen",
+        "direct_terminal_record_count": 84,
+        "compiled_parity_fallback_promotion_count": 6,
+        "cells": {"v02j-fixture": {"resolution": "direct_terminal_record"}},
+    }
+    stored["report_digest"] = sha256_json(stored)
+    _publish(acceptance_path, stored)
+    _publish(promotion_path, {"manifest_digest": "a" * 64})
+    _publish(plan_path, {"plan": "fixture"})
+    acceptance_path.chmod(0o444)
+    promotion_path.chmod(0o444)
+    replayed = {**stored, "accepted_at": "replayed", "report_digest": "b" * 64}
+    monkeypatch.setattr(runner_module, "accept_policy_pool", lambda **kwargs: replayed)
+
+    cells, receipt = _origin_pool_acceptance(acceptance_path)
+    assert cells == stored["cells"]
+    assert receipt["canonical_replay"] == "PASS"
+
+    monkeypatch.setattr(
+        runner_module,
+        "accept_policy_pool",
+        lambda **kwargs: {**replayed, "decision": "NO_GO"},
+    )
+    with pytest.raises(GateFailure, match="differs from canonical replay"):
+        _origin_pool_acceptance(acceptance_path)
+
+
+def test_origin_parity_receipt_requires_canonical_fallback_promotion(
+    tmp_path: Path,
+) -> None:
+    job_id = "v02j-promoted"
+    attempt = tmp_path / "jobs" / job_id / "attempt_003"
+    bundle = attempt / "checkpoints" / "outer_000060"
+    bundle.mkdir(parents=True)
+    _publish(attempt / "status.json", {"state": "failed"})
+    metadata = SimpleNamespace(
+        bundle_dir=bundle,
+        bundle_digest="a" * 64,
+        outer_iteration=60,
+        environment_steps=6000,
+        training_seed=1,
+        provenance={"job_digest": "b" * 64, "attempt_digest": "c" * 64},
+    )
+    accepted_cell = {
+        "resolution": "compiled_parity_fallback_promotion",
+        "job_id": job_id,
+        "job_digest": "b" * 64,
+        "attempt_digest": "c" * 64,
+        "bundle_path": str(bundle),
+        "bundle_digest": "a" * 64,
+        "outer_iteration": 60,
+        "environment_steps": 6000,
+        "seed": 1,
+        "golden_parity_digest": "d" * 64,
+        "compiled_parity_digest": "e" * 64,
+        "promotion_entry_digest": "f" * 64,
+        "failure_trace_digest": "1" * 64,
+    }
+    receipt = _origin_parity_receipt(metadata, accepted_cell)
+    assert receipt["resolution"] == "compiled_parity_fallback_promotion"
+    assert receipt["training_record_digest"] is None
+
+    with pytest.raises(GateFailure, match="origin parity receipt is absent"):
+        _origin_parity_receipt(
+            metadata, {**accepted_cell, "resolution": "direct_terminal_record"}
+        )
 
 
 def test_deployment_audit_separates_determinism_from_cross_backend_float(

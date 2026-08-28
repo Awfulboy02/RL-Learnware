@@ -93,8 +93,11 @@ from server.repro_fpo_ppo_v03.signal_bank_runner import (
 )
 from server.repro_fpo_ppo_v02.provenance import (
     ContractError as V02ContractError,
+    load_strict_json,
+    validate_self_digest,
     validate_success_record,
 )
+from server.repro_fpo_ppo_v02.pool_acceptance import accept_policy_pool
 
 
 SCHEMA = "policy-learnware.v04a-fixed-probe-run.v1"
@@ -621,13 +624,135 @@ def _raw_root(root: Path) -> Path:
     )
 
 
-def _origin_parity_receipt(metadata: Any) -> dict[str, Any]:
-    """Verify the immutable v02 same-runtime parity receipt for one bundle."""
+def _origin_pool_acceptance(path: Path) -> tuple[Mapping[str, Any], dict[str, Any]]:
+    """Revalidate the immutable v02 84-direct + 6-promotion pool once."""
+
+    handoff_root = path.parent
+    experiment_root = handoff_root.parent
+    promotion_path = handoff_root / "compiled_parity_promotions.json"
+    plan_path = (
+        experiment_root / "training_private" / "plans" / "server_training_plan.json"
+    )
+    runs_root = experiment_root / "training_private" / "server_runs"
+    files = (path, promotion_path, plan_path)
+    if (
+        any(item.is_symlink() or not item.is_file() for item in files)
+        or runs_root.is_symlink()
+        or not runs_root.is_dir()
+        or (path.stat().st_mode & 0o777) != 0o444
+        or (promotion_path.stat().st_mode & 0o777) != 0o444
+    ):
+        raise GateFailure(
+            "NO_GO_MARKET_OR_TASK5_ABI",
+            "frozen v02 policy-pool acceptance authority is absent or writable",
+        )
+    try:
+        stored = load_strict_json(path)
+        validate_self_digest(
+            stored, key="report_digest", where="policy-pool acceptance"
+        )
+        promotion = load_strict_json(promotion_path)
+        plan = load_strict_json(plan_path)
+        recomputed = accept_policy_pool(
+            server_plan=plan,
+            runs_root=runs_root,
+            promotion_manifest=promotion,
+        )
+    except (OSError, KeyError, V02ContractError, ValueError) as error:
+        raise GateFailure(
+            "NO_GO_MARKET_OR_TASK5_ABI",
+            f"cannot revalidate frozen v02 policy-pool acceptance: {error}",
+        ) from error
+    ignored = {"accepted_at", "report_digest"}
+    stored_semantics = {
+        key: value for key, value in stored.items() if key not in ignored
+    }
+    recomputed_semantics = {
+        key: value for key, value in recomputed.items() if key not in ignored
+    }
+    if stored_semantics != recomputed_semantics:
+        raise GateFailure(
+            "NO_GO_MARKET_OR_TASK5_ABI",
+            "stored v02 policy-pool acceptance differs from canonical replay",
+        )
+    cells = stored.get("cells")
+    if not isinstance(cells, Mapping):
+        raise GateFailure(
+            "NO_GO_MARKET_OR_TASK5_ABI",
+            "v02 policy-pool acceptance has no cell mapping",
+        )
+    return cells, {
+        "status": "PASS",
+        "scope": "frozen-v02-development-attestation",
+        "policy_pool_acceptance_path": str(path),
+        "policy_pool_acceptance_sha256": sha256_file(path),
+        "policy_pool_acceptance_report_digest": stored["report_digest"],
+        "compiled_parity_promotions_path": str(promotion_path),
+        "compiled_parity_promotions_sha256": sha256_file(promotion_path),
+        "compiled_parity_promotions_digest": promotion["manifest_digest"],
+        "server_training_plan_path": str(plan_path),
+        "server_training_plan_sha256": sha256_file(plan_path),
+        "canonical_replay": "PASS",
+        "direct_terminal_record_count": stored["direct_terminal_record_count"],
+        "compiled_parity_fallback_promotion_count": stored[
+            "compiled_parity_fallback_promotion_count"
+        ],
+    }
+
+
+def _origin_parity_receipt(
+    metadata: Any, accepted_cell: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Verify one bundle against its canonical v02 pool-acceptance cell."""
 
     attempt_root = metadata.bundle_dir.parents[1]
+    job_id = metadata.bundle_dir.parents[2].name
     record_path = attempt_root / "training_record.json"
     status_path = attempt_root / "status.json"
-    if any(
+    bundle_root = metadata.bundle_dir.resolve()
+    if (
+        accepted_cell.get("job_id") != job_id
+        or accepted_cell.get("job_digest") != metadata.provenance.get("job_digest")
+        or accepted_cell.get("attempt_digest")
+        != metadata.provenance.get("attempt_digest")
+        or Path(str(accepted_cell.get("bundle_path", ""))).resolve() != bundle_root
+        or accepted_cell.get("bundle_digest") != metadata.bundle_digest
+        or accepted_cell.get("outer_iteration") != metadata.outer_iteration
+        or accepted_cell.get("environment_steps") != metadata.environment_steps
+        or accepted_cell.get("seed") != metadata.training_seed
+    ):
+        raise GateFailure(
+            "NO_GO_MARKET_OR_TASK5_ABI",
+            f"policy-pool acceptance cell differs for {metadata.bundle_dir}",
+        )
+    resolution = accepted_cell.get("resolution")
+    if resolution == "compiled_parity_fallback_promotion":
+        if (
+            status_path.is_symlink()
+            or not status_path.is_file()
+            or record_path.is_symlink()
+            or record_path.exists()
+            or _json(status_path).get("state") != "failed"
+            or not isinstance(accepted_cell.get("promotion_entry_digest"), str)
+            or not isinstance(accepted_cell.get("failure_trace_digest"), str)
+        ):
+            raise GateFailure(
+                "NO_GO_MARKET_OR_TASK5_ABI",
+                f"canonical fallback promotion differs for {metadata.bundle_dir}",
+            )
+        return {
+            "status": "PASS",
+            "resolution": resolution,
+            "training_record_sha256": None,
+            "training_record_digest": None,
+            "golden_report_digest": accepted_cell["golden_parity_digest"],
+            "compiled_report_digest": accepted_cell["compiled_parity_digest"],
+            "promotion_entry_digest": accepted_cell["promotion_entry_digest"],
+            "failure_trace_digest": accepted_cell["failure_trace_digest"],
+            "atol": ORIGIN_PARITY_ATOL,
+            "rtol": ORIGIN_PARITY_RTOL,
+        }
+    if resolution != "direct_terminal_record" or any(
         path.is_symlink() or not path.is_file() for path in (record_path, status_path)
     ):
         raise GateFailure(
@@ -655,18 +780,20 @@ def _origin_parity_receipt(metadata: Any) -> dict[str, Any]:
         ) from error
     record_digest = record["record_digest"]
     status = _json(status_path)
+    expected_status = "completed" if record["state"] == "succeeded" else "recovered"
     if (
-        status.get("state") != "completed"
+        status.get("state") != expected_status
         or status.get("training_record_digest") != record_digest
         or status.get("promoted_outer_iteration") != metadata.outer_iteration
         or status.get("promoted_environment_steps") != metadata.environment_steps
+        or accepted_cell.get("training_record_digest") != record_digest
+        or accepted_cell.get("terminal_record_state") != record["state"]
     ):
         raise GateFailure(
             "NO_GO_MARKET_OR_TASK5_ABI",
             f"origin training status differs for {metadata.bundle_dir}",
         )
     checkpoints = record.get("checkpoint_bundles")
-    bundle_root = metadata.bundle_dir.resolve()
     matching = [
         row
         for row in checkpoints
@@ -692,6 +819,8 @@ def _origin_parity_receipt(metadata: Any) -> dict[str, Any]:
         or compiled.get("next_keys_equal") is not True
         or float(compiled.get("atol", float("nan"))) != ORIGIN_PARITY_ATOL
         or float(compiled.get("rtol", float("nan"))) != ORIGIN_PARITY_RTOL
+        or accepted_cell.get("golden_parity_digest") != golden.get("report_digest")
+        or accepted_cell.get("compiled_parity_digest") != compiled.get("report_digest")
     ):
         raise GateFailure(
             "NO_GO_MARKET_OR_TASK5_ABI",
@@ -699,6 +828,7 @@ def _origin_parity_receipt(metadata: Any) -> dict[str, Any]:
         )
     return {
         "status": "PASS",
+        "resolution": resolution,
         "training_record_sha256": sha256_file(record_path),
         "training_record_digest": record_digest,
         "golden_report_digest": golden["report_digest"],
@@ -889,6 +1019,7 @@ def inspect_assets(
     context_index: Path,
     public_policy_market: Path,
     deployment_private_registry: Path,
+    origin_pool_acceptance: Path,
     raw_delta_root: Path,
     fpo_root: Path,
     split_seed: int,
@@ -923,6 +1054,7 @@ def inspect_assets(
             "v0.4a development runner refuses confirmatory or extrapolation contexts",
         )
     market = _market(public_policy_market, deployment_private_registry)
+    accepted_cells, origin_acceptance = _origin_pool_acceptance(origin_pool_acceptance)
     if fpo_root.is_symlink() or not fpo_root.is_dir():
         raise GateFailure(
             "NO_GO_MARKET_OR_TASK5_ABI",
@@ -979,6 +1111,15 @@ def inspect_assets(
             type_id = str(source["context_id"])
             opaque = task["paired_policy_by_type"][type_id]
             private = market.deployment_private[opaque]
+            accepted_cell = accepted_cells.get(private.candidate_id)
+            if (
+                not isinstance(accepted_cell, Mapping)
+                or accepted_cell.get("source_anchor_id") != private.source_anchor_id
+            ):
+                raise GateFailure(
+                    "NO_GO_MARKET_OR_TASK5_ABI",
+                    f"policy market differs from accepted v02 pool: {opaque}",
+                )
             bundle_path = Path(private.bundle_path).expanduser()
             if not bundle_path.is_absolute():
                 bundle_path = deployment_private_registry.parent / bundle_path
@@ -997,7 +1138,7 @@ def inspect_assets(
                     expected_environment_steps=private.environment_steps,
                     runtime_only=True,
                 )
-                origin_parity = _origin_parity_receipt(metadata)
+                origin_parity = _origin_parity_receipt(metadata, accepted_cell)
                 policy = load_policy(
                     metadata,
                     fpo_root=fpo_root,
@@ -1170,6 +1311,7 @@ def inspect_assets(
         "policy_bundle_and_abi": {
             "status": "PASS",
             "runtime_only_bundle_validation": True,
+            "origin_pool_acceptance": origin_acceptance,
             "origin_same_runtime_golden_parity": "digest-bound PASS at 1e-6",
             "current_backend_deployment_determinism": "hard-gated",
             "cross_backend_float32_golden_replay": (
@@ -1277,6 +1419,7 @@ def _available_input_metadata(
     context_index: Path,
     public_policy_market: Path,
     deployment_private_registry: Path,
+    origin_pool_acceptance: Path,
     raw_delta_root: Path,
 ) -> dict[str, Any]:
     """Describe only verifiably present inputs for a failed local census."""
@@ -1285,6 +1428,7 @@ def _available_input_metadata(
         "context_index": context_index,
         "public_policy_market": public_policy_market,
         "deployment_private_registry": deployment_private_registry,
+        "origin_pool_acceptance": origin_pool_acceptance,
     }
     result: dict[str, Any] = {
         name: {
@@ -1333,6 +1477,7 @@ def _record_prepare_failure(
         args.context_index,
         args.public_policy_market,
         args.deployment_private_registry,
+        args.origin_pool_acceptance,
     )
     resolved_status = status
     if resolved_status is None:
@@ -1355,6 +1500,7 @@ def _record_prepare_failure(
             context_index=args.context_index,
             public_policy_market=args.public_policy_market,
             deployment_private_registry=args.deployment_private_registry,
+            origin_pool_acceptance=args.origin_pool_acceptance,
             raw_delta_root=args.raw_delta_root,
         ),
     }
@@ -1441,6 +1587,7 @@ def prepare(args: argparse.Namespace) -> Mapping[str, Any]:
         args.context_index,
         args.public_policy_market,
         args.deployment_private_registry,
+        args.origin_pool_acceptance,
         args.raw_delta_root,
         args.fpo_root,
     )
@@ -1450,6 +1597,7 @@ def prepare(args: argparse.Namespace) -> Mapping[str, Any]:
             context_index=args.context_index,
             public_policy_market=args.public_policy_market,
             deployment_private_registry=args.deployment_private_registry,
+            origin_pool_acceptance=args.origin_pool_acceptance,
             raw_delta_root=args.raw_delta_root,
             fpo_root=args.fpo_root,
             split_seed=int(config["split_seed"]),
@@ -3771,6 +3919,7 @@ def _parser() -> argparse.ArgumentParser:
     prepare_parser.add_argument(
         "--deployment-private-registry", type=_path, required=True
     )
+    prepare_parser.add_argument("--origin-pool-acceptance", type=_path, required=True)
     prepare_parser.add_argument("--raw-delta-root", type=_path, required=True)
     prepare_parser.add_argument("--fpo-root", type=_path, required=True)
     prepare_parser.set_defaults(handler=prepare)
