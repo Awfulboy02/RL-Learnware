@@ -44,6 +44,7 @@ from policy_learnware_v0.v05.labels import (
 )
 from policy_learnware_v0.v05.metrics import (
     MARKET_30_CERT,
+    PREDICTION_PAYLOAD_SCHEMA,
     TASK_5_CERT,
     PredictionRanking,
     TruthBinding,
@@ -124,6 +125,7 @@ _VIEW_FIELDS = frozenset(
         "scorer_visible_raw_rows",
     }
 )
+_HELD_DEVELOPMENT_BUDGETS = (1, 2, 4)
 
 
 class V05BlindError(ValueError):
@@ -1163,13 +1165,79 @@ def load_authorized_query(
 def load_private_truth_binding(
     binding_file: str | Path,
     *,
+    opaque_query_id: str,
+    authorized_query_manifest_digest: str,
     prediction_seal: RankingSeal,
     certificate_manifest: CertifiedPolicyManifest,
     blinding_nonce: str,
 ) -> TruthBinding:
     """Privileged post-seal loader; scorer code has no reason to call this."""
 
+    opaque_query_id = _text(opaque_query_id, "opaque_query_id")
+    if not opaque_query_id.startswith("q-") or len(opaque_query_id) < 22:
+        raise V05BlindError("opaque_query_id is not an opaque query")
+    try:
+        int(opaque_query_id[2:], 16)
+    except ValueError as error:
+        raise V05BlindError("opaque_query_id is not an opaque query") from error
+    expected_public_manifest_digest = _digest(
+        authorized_query_manifest_digest,
+        "authorized_query_manifest_digest",
+    )
+    if not isinstance(certificate_manifest, CertifiedPolicyManifest):
+        raise V05BlindError("private truth loading requires a certificate manifest")
+    if not isinstance(prediction_seal, RankingSeal):
+        raise V05BlindError("private truth loading requires a ranking seal")
+    sealed_budgets = _HELD_DEVELOPMENT_BUDGETS
+    try:
+        sealed_payload = prediction_seal.rankings
+        verify_ranking_seal(prediction_seal, sealed_payload)
+        if (
+            not isinstance(sealed_payload, Mapping)
+            or set(sealed_payload) != {"schema", "predictions"}
+            or sealed_payload.get("schema") != PREDICTION_PAYLOAD_SCHEMA
+            or not isinstance(sealed_payload.get("predictions"), list)
+        ):
+            raise V05BlindError("sealed prediction payload schema differs")
+        rows = tuple(
+            PredictionRanking.from_dict(item) for item in sealed_payload["predictions"]
+        )
+        query_rows = tuple(
+            item for item in rows if item.opaque_query_id == opaque_query_id
+        )
+        require_prediction_cell_coverage(
+            query_rows,
+            expected_method_ids=P0_METHOD_IDS,
+            expected_endpoints=(MARKET_30_CERT, TASK_5_CERT),
+            expected_budgets=sealed_budgets,
+        )
+    except V05BlindError:
+        raise
+    except (
+        KeyError,
+        TypeError,
+        V04AProtocolError,
+        V05MetricError,
+        ValueError,
+    ) as error:
+        raise V05BlindError(
+            "sealed query rows lack complete P0 prediction coverage"
+        ) from error
+    sealed_manifest_digests = {
+        item.authorized_query_manifest_digest for item in query_rows
+    }
+    if tuple(sorted({item.budget_episodes for item in query_rows})) != sealed_budgets:
+        raise V05BlindError("sealed query rows do not cover development budgets")
+    if sealed_manifest_digests != {expected_public_manifest_digest}:
+        raise V05BlindError(
+            "sealed query rows differ from the authorized public manifest"
+        )
+
+    # The private path capability is materialized only after every truth-free
+    # seal, cell, query, budget, and public-manifest check has passed.
     path = Path(binding_file).expanduser()
+    if path.name != f"{opaque_query_id}.json":
+        raise V05BlindError("private truth binding filename differs")
     if path.is_symlink() or not path.is_file():
         raise V05BlindError("private truth binding is absent or unsafe")
     value = read_json(path)
@@ -1192,8 +1260,8 @@ def load_private_truth_binding(
     unsigned = {key: item for key, item in binding.items() if key != "binding_digest"}
     if binding.get("binding_digest") != sha256_json(unsigned):
         raise V05BlindError("private truth binding digest changed")
-    opaque_query_id = _text(binding.get("opaque_query_id"), "opaque_query_id")
-    if path.name != f"{opaque_query_id}.json":
+    bound_query_id = _text(binding.get("opaque_query_id"), "opaque_query_id")
+    if bound_query_id != opaque_query_id:
         raise V05BlindError("private truth binding filename differs")
     evidence = binding.get("private_evidence")
     q_payload = binding.get("query_identity_payload")
@@ -1237,20 +1305,9 @@ def load_private_truth_binding(
     )
     if expected_query_id != opaque_query_id:
         raise V05BlindError("opaque query HMAC does not match private truth")
-    public_manifest_digest = _digest(
+    private_public_manifest_digest = _digest(
         binding.get("public_manifest_digest"), "public_manifest_digest"
     )
-    if not isinstance(prediction_seal, RankingSeal):
-        raise V05BlindError("private truth loading requires a ranking seal")
-    try:
-        sealed_payload = prediction_seal.rankings
-        verify_ranking_seal(prediction_seal, sealed_payload)
-        raw_rows = sealed_payload["predictions"]
-        rows = tuple(PredictionRanking.from_dict(item) for item in raw_rows)
-    except (KeyError, TypeError, V04AProtocolError, ValueError) as error:
-        raise V05BlindError("sealed prediction payload is invalid") from error
-    query_rows = tuple(item for item in rows if item.opaque_query_id == opaque_query_id)
-    sealed_budgets = tuple(sorted({item.budget_episodes for item in query_rows}))
     claimed_budgets = _authorized_budget_tuple(
         q_payload.get("authorized_budgets", ()),
         episode_count=max(BUDGET_EPISODES),
@@ -1291,23 +1348,10 @@ def load_private_truth_binding(
     else:
         raise V05BlindError("private evidence kind is unsupported")
     if (
-        not query_rows
-        or sealed_budgets != claimed_budgets
-        or {item.authorized_query_manifest_digest for item in query_rows}
-        != {public_manifest_digest}
+        sealed_budgets != claimed_budgets
+        or private_public_manifest_digest != expected_public_manifest_digest
     ):
         raise V05BlindError("sealed query rows differ from the private binding")
-    try:
-        require_prediction_cell_coverage(
-            query_rows,
-            expected_method_ids=P0_METHOD_IDS,
-            expected_endpoints=(MARKET_30_CERT, TASK_5_CERT),
-            expected_budgets=claimed_budgets,
-        )
-    except V05MetricError as error:
-        raise V05BlindError(
-            "sealed query rows lack complete P0 prediction coverage"
-        ) from error
     resolver = CertificateResolver(certificate_manifest)
     certificate = resolver.record_for_anchor(binding["source_anchor_id"])
     if (
@@ -1321,7 +1365,8 @@ def load_private_truth_binding(
         source_anchor_id=certificate.source_anchor_id,
         task_id=certificate.task_id,
         opaque_certified_policy_id=certificate.opaque_certified_policy_id,
-        authorized_query_manifest_digest=public_manifest_digest,
+        authorized_query_manifest_digest=private_public_manifest_digest,
+        prediction_seal_digest=prediction_seal.rankings_digest,
     )
 
 

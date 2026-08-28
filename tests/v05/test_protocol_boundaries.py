@@ -45,6 +45,7 @@ from policy_learnware_v0.v05.metrics import (
     prediction_payload,
 )
 from server.repro_fpo_ppo_v05 import exact_repeat_collector
+from server.repro_fpo_ppo_v05 import blind_query_bank as blind_query_module
 from server.repro_fpo_ppo_v05.blind_query_bank import (
     AuthorizedQueryViews,
     V05BlindError,
@@ -73,7 +74,6 @@ ROW_BINDING = {
     "canonical_query_bank_digest": _digest("canonical-query-bank"),
     "source_train_membership_digest": _digest("source-train-membership"),
     "source_validation_membership_digest": _digest("source-validation-membership"),
-    "source_repeat_membership_digest": _digest("source-repeat-membership"),
     "target_membership_digest": _digest("target-membership"),
     "normalization_digest": _digest("normalization"),
     "config_digest": _digest("config"),
@@ -133,6 +133,7 @@ def many_to_one_manifest() -> CertifiedPolicyManifest:
 
 @pytest.fixture
 def truth_join() -> tuple[TruthBinding, ...]:
+    seal_digest = seal_rankings(prediction_payload(_prediction_rows())).rankings_digest
     return (
         TruthBinding(
             "query-a1",
@@ -140,6 +141,7 @@ def truth_join() -> tuple[TruthBinding, ...]:
             "task-a",
             POLICY_A,
             _query_binding("query-a1")["authorized_query_manifest_digest"],
+            seal_digest,
         ),
         TruthBinding(
             "query-a2",
@@ -147,6 +149,7 @@ def truth_join() -> tuple[TruthBinding, ...]:
             "task-a",
             POLICY_A,
             _query_binding("query-a2")["authorized_query_manifest_digest"],
+            seal_digest,
         ),
         TruthBinding(
             "query-b1",
@@ -154,6 +157,7 @@ def truth_join() -> tuple[TruthBinding, ...]:
             "task-b",
             POLICY_B,
             _query_binding("query-b1")["authorized_query_manifest_digest"],
+            seal_digest,
         ),
     )
 
@@ -288,6 +292,28 @@ def test_ranking_requires_seal_before_truth_join(
     assert result.prediction_seal_digest == sealed.rankings_digest
     assert result.certificate_manifest_digest == many_to_one_manifest.manifest_digest
 
+    dummy_rows = tuple(
+        replace(
+            row,
+            ranked_anchor_ids=tuple(reversed(row.ranked_anchor_ids)),
+            ranked_policy_ids=tuple(reversed(row.ranked_policy_ids)),
+        )
+        for row in _prediction_rows()
+    )
+    dummy_seal = seal_rankings(prediction_payload(dummy_rows))
+    dummy_release = tuple(
+        replace(item, prediction_seal_digest=dummy_seal.rankings_digest)
+        for item in truth_join
+    )
+    with pytest.raises(V05MetricError, match="another prediction seal"):
+        evaluate_sealed_predictions(
+            sealed,
+            dummy_release,
+            many_to_one_manifest,
+            expected_method_ids=("METHOD",),
+            expected_budgets=(1,),
+        )
+
     swapped_truth = (
         replace(truth_join[0], opaque_query_id=truth_join[1].opaque_query_id),
         replace(truth_join[1], opaque_query_id=truth_join[0].opaque_query_id),
@@ -360,10 +386,15 @@ def test_nan_duplicate_rank_and_missing_coverage_fail_closed(
 
     rows = _prediction_rows()
     missing_query = tuple(row for row in rows if row.opaque_query_id != "query-b1")
+    missing_query_seal = seal_rankings(prediction_payload(missing_query))
+    missing_query_truth = tuple(
+        replace(item, prediction_seal_digest=missing_query_seal.rankings_digest)
+        for item in truth_join
+    )
     with pytest.raises(V05MetricError, match="cover"):
         evaluate_sealed_predictions(
-            seal_rankings(prediction_payload(missing_query)),
-            truth_join,
+            missing_query_seal,
+            missing_query_truth,
             many_to_one_manifest,
             expected_method_ids=("METHOD",),
             expected_budgets=(1,),
@@ -390,10 +421,15 @@ def test_nan_duplicate_rank_and_missing_coverage_fail_closed(
         original.ranked_policy_ids,
         **_query_binding(original.opaque_query_id),
     )
+    bad_candidate_seal = seal_rankings(prediction_payload(bad_candidate))
+    bad_candidate_truth = tuple(
+        replace(item, prediction_seal_digest=bad_candidate_seal.rankings_digest)
+        for item in truth_join
+    )
     with pytest.raises(V05MetricError, match="candidate set"):
         evaluate_sealed_predictions(
-            seal_rankings(prediction_payload(bad_candidate)),
-            truth_join,
+            bad_candidate_seal,
+            bad_candidate_truth,
             many_to_one_manifest,
             expected_method_ids=("METHOD",),
             expected_budgets=(1,),
@@ -401,7 +437,7 @@ def test_nan_duplicate_rank_and_missing_coverage_fail_closed(
 
 
 def test_runner_binds_all_p0_to_one_panel_then_masks_ranks_and_seals(
-    tmp_path,
+    tmp_path, monkeypatch
 ) -> None:
     anchors = ("anchor-a", "anchor-b")
     manifest = project_certificate_manifest(
@@ -513,18 +549,60 @@ def test_runner_binds_all_p0_to_one_panel_then_masks_ranks_and_seals(
         card["source_binding"] == panel.source_binding for card in panel.method_cards
     )
     assert panel.source_model_manifest["source_binding"] == panel.source_binding
-    assert (
-        panel.source_role_manifest["sources"]["anchor-a"]["parent_asset_sha256"]
-        == parent_asset_sha256["anchor-a"]
-    )
-    assert (
-        panel.source_role_manifest["sources"]["anchor-a"]["parent_membership_digest"]
-        == parent_membership_digest["anchor-a"]
-    )
+    assert set(panel.source_role_manifest["roles"]) == {
+        "source_train",
+        "source_validation",
+    }
+    assert not any("repeat" in key.lower() for key in panel.source_binding)
     assert (
         panel.source_model_manifest["source_role_manifest"]
         == panel.source_role_manifest
     )
+    scorer_surface = {
+        "source_binding": panel.source_binding,
+        "source_role_manifest": panel.source_role_manifest,
+        "source_model_manifest": panel.source_model_manifest,
+    }
+
+    def nested_keys(value):
+        if isinstance(value, Mapping):
+            for key, item in value.items():
+                yield str(key)
+                yield from nested_keys(item)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                yield from nested_keys(item)
+
+    assert not any("repeat" in key.lower() for key in nested_keys(scorer_surface))
+    private_repeat_digests = {
+        projection.manifest["roles"]["source_repeat_report"]["membership_digest"],
+        projection.manifest["roles"]["source_repeat_report"]["bank_digest"],
+        *(
+            row["roles"]["source_repeat_report"][field]
+            for row in projection.manifest["sources"].values()
+            for field in ("membership_digest", "bank_digest")
+        ),
+    }
+    scorer_bytes = canonical_json_bytes(scorer_surface)
+    assert all(value.encode() not in scorer_bytes for value in private_repeat_digests)
+    with pytest.raises(V05RunnerError, match="source binding fields"):
+        replace(
+            panel,
+            source_binding={
+                **dict(panel.source_binding),
+                "held_evidence": next(iter(private_repeat_digests)),
+            },
+        )
+    with pytest.raises(V05RunnerError, match="episode counts"):
+        replace(
+            panel,
+            source_binding={
+                **dict(panel.source_binding),
+                "episode_counts_per_anchor": {
+                    "held": next(iter(private_repeat_digests))
+                },
+            },
+        )
     model_digest = panel.source_model_manifest["source_model_manifest_digest"]
     with pytest.raises(V05RunnerError, match="bandwidth"):
         replace(panel, kme_krr=replace(panel.kme_krr, bandwidth=0.9))
@@ -567,7 +645,11 @@ def test_runner_binds_all_p0_to_one_panel_then_masks_ranks_and_seals(
     tampered_role_manifest = dict(panel.source_role_manifest)
     tampered_sources = dict(tampered_role_manifest["sources"])
     tampered_anchor = dict(tampered_sources["anchor-a"])
-    tampered_anchor["parent_asset_sha256"] = _digest("tampered-parent-file")
+    tampered_roles = dict(tampered_anchor["roles"])
+    tampered_train = dict(tampered_roles["source_train"])
+    tampered_train["bank_digest"] = _digest("tampered-train-bank")
+    tampered_roles["source_train"] = tampered_train
+    tampered_anchor["roles"] = tampered_roles
     tampered_sources["anchor-a"] = tampered_anchor
     tampered_role_manifest["sources"] = tampered_sources
     with pytest.raises(V05RunnerError, match="manifest digest changed"):
@@ -580,7 +662,7 @@ def test_runner_binds_all_p0_to_one_panel_then_masks_ranks_and_seals(
     query_views = prepare_blinded_episode_bank(
         episode_bank=projection.source_repeat["anchor-a"],
         parent_source_role_manifest=projection.manifest,
-        expected_source_role_manifest_digest=panel.source_binding[
+        expected_source_role_manifest_digest=projection.manifest[
             "source_role_manifest_digest"
         ],
         parent_asset_sha256=parent_asset_sha256["anchor-a"],
@@ -641,6 +723,36 @@ def test_runner_binds_all_p0_to_one_panel_then_masks_ranks_and_seals(
         for key in public_keys(query_views.manifest)
         for token in forbidden_public_tokens
     )
+
+    def string_values(value):
+        if isinstance(value, Mapping):
+            for item in value.values():
+                yield from string_values(item)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                yield from string_values(item)
+        elif isinstance(value, str):
+            yield value
+
+    public_query_tokens = {
+        query_views.manifest["target_membership_digest"],
+        query_views.manifest["canonical_query_bank_digest"],
+        query_views.manifest["reward_free_bank_sha256"],
+        query_views.manifest["manifest_digest"],
+        *query_views.manifest["canonical_budget_bank_digests"].values(),
+        *(
+            value
+            for row in query_views.manifest["authorized_views"].values()
+            for key, value in row.items()
+            if key in {"artifact_sha256", "arrays_digest"}
+        ),
+    }
+    scorer_digest_values = {
+        value
+        for value in string_values(scorer_surface)
+        if len(value) == 64 and value == value.lower()
+    }
+    assert public_query_tokens.isdisjoint(scorer_digest_values)
     private_binding = read_json(
         private_binding_root / f"{query_views.opaque_query_id}.json"
     )
@@ -687,7 +799,7 @@ def test_runner_binds_all_p0_to_one_panel_then_masks_ranks_and_seals(
         prepare_blinded_episode_bank(
             episode_bank=projection.source_repeat["anchor-a"],
             parent_source_role_manifest=projection.manifest,
-            expected_source_role_manifest_digest=panel.source_binding[
+            expected_source_role_manifest_digest=projection.manifest[
                 "source_role_manifest_digest"
             ],
             parent_asset_sha256=parent_asset_sha256["anchor-a"],
@@ -708,7 +820,7 @@ def test_runner_binds_all_p0_to_one_panel_then_masks_ranks_and_seals(
         prepare_blinded_episode_bank(
             episode_bank=projection.source_repeat["anchor-a"],
             parent_source_role_manifest=projection.manifest,
-            expected_source_role_manifest_digest=panel.source_binding[
+            expected_source_role_manifest_digest=projection.manifest[
                 "source_role_manifest_digest"
             ],
             parent_asset_sha256=parent_asset_sha256["anchor-a"],
@@ -730,7 +842,7 @@ def test_runner_binds_all_p0_to_one_panel_then_masks_ranks_and_seals(
         prepare_blinded_episode_bank(
             episode_bank=projection.source_repeat["anchor-a"],
             parent_source_role_manifest=projection.manifest,
-            expected_source_role_manifest_digest=panel.source_binding[
+            expected_source_role_manifest_digest=projection.manifest[
                 "source_role_manifest_digest"
             ],
             parent_asset_sha256=parent_asset_sha256["anchor-a"],
@@ -751,7 +863,7 @@ def test_runner_binds_all_p0_to_one_panel_then_masks_ranks_and_seals(
         prepare_blinded_episode_bank(
             episode_bank=projection.source_repeat["anchor-a"],
             parent_source_role_manifest=projection.manifest,
-            expected_source_role_manifest_digest=panel.source_binding[
+            expected_source_role_manifest_digest=projection.manifest[
                 "source_role_manifest_digest"
             ],
             parent_asset_sha256=parent_asset_sha256["anchor-a"],
@@ -876,6 +988,8 @@ def test_runner_binds_all_p0_to_one_panel_then_masks_ranks_and_seals(
     private_binding_file = private_binding_root / f"{query_views.opaque_query_id}.json"
     loaded_truth = load_private_truth_binding(
         private_binding_file,
+        opaque_query_id=query_views.opaque_query_id,
+        authorized_query_manifest_digest=query_views.manifest["manifest_digest"],
         prediction_seal=ranking_seal,
         certificate_manifest=manifest,
         blinding_nonce=blinding_nonce,
@@ -885,20 +999,72 @@ def test_runner_binds_all_p0_to_one_panel_then_masks_ranks_and_seals(
         loaded_truth.authorized_query_manifest_digest
         == query_views.manifest["manifest_digest"]
     )
+    assert loaded_truth.prediction_seal_digest == ranking_seal.rankings_digest
     incomplete_rows = tuple(
         item for item in predictions if item.method_id == P0_METHOD_IDS[0]
     )
     incomplete_seal = seal_rankings(prediction_payload(incomplete_rows))
+    private_reads = []
+    real_read_json = blind_query_module.read_json
+
+    def track_private_read(path):
+        private_reads.append(Path(path))
+        return real_read_json(path)
+
+    class PrivatePathTrap:
+        def __fspath__(self):
+            raise AssertionError("private path capability was materialized")
+
+    monkeypatch.setattr(blind_query_module, "read_json", track_private_read)
     with pytest.raises(V05BlindError, match="complete P0 prediction coverage"):
         load_private_truth_binding(
-            private_binding_file,
+            PrivatePathTrap(),
+            opaque_query_id=query_views.opaque_query_id,
+            authorized_query_manifest_digest=query_views.manifest["manifest_digest"],
             prediction_seal=incomplete_seal,
             certificate_manifest=manifest,
             blinding_nonce=blinding_nonce,
         )
+    one_budget_seal = seal_rankings(
+        prediction_payload(
+            tuple(item for item in predictions if item.budget_episodes == 1)
+        )
+    )
+    with pytest.raises(V05BlindError, match="complete P0 prediction coverage"):
+        load_private_truth_binding(
+            PrivatePathTrap(),
+            opaque_query_id=query_views.opaque_query_id,
+            authorized_query_manifest_digest=query_views.manifest["manifest_digest"],
+            prediction_seal=one_budget_seal,
+            certificate_manifest=manifest,
+            blinding_nonce=blinding_nonce,
+        )
+    with pytest.raises(V05BlindError, match="authorized public manifest"):
+        load_private_truth_binding(
+            PrivatePathTrap(),
+            opaque_query_id=query_views.opaque_query_id,
+            authorized_query_manifest_digest=_digest("wrong-public-manifest"),
+            prediction_seal=ranking_seal,
+            certificate_manifest=manifest,
+            blinding_nonce=blinding_nonce,
+        )
+    with pytest.raises(TypeError, match="expected_budgets"):
+        load_private_truth_binding(
+            PrivatePathTrap(),
+            opaque_query_id=query_views.opaque_query_id,
+            authorized_query_manifest_digest=query_views.manifest["manifest_digest"],
+            prediction_seal=one_budget_seal,
+            certificate_manifest=manifest,
+            blinding_nonce=blinding_nonce,
+            expected_budgets=(1,),
+        )
+    assert private_reads == []
+    monkeypatch.setattr(blind_query_module, "read_json", real_read_json)
     with pytest.raises(V05BlindError, match="HMAC"):
         load_private_truth_binding(
             private_binding_file,
+            opaque_query_id=query_views.opaque_query_id,
+            authorized_query_manifest_digest=query_views.manifest["manifest_digest"],
             prediction_seal=ranking_seal,
             certificate_manifest=manifest,
             blinding_nonce="fedcba9876543210-wrong",
@@ -919,6 +1085,8 @@ def test_runner_binds_all_p0_to_one_panel_then_masks_ranks_and_seals(
     with pytest.raises(V05BlindError, match="sealed query rows"):
         load_private_truth_binding(
             tampered_binding_file,
+            opaque_query_id=query_views.opaque_query_id,
+            authorized_query_manifest_digest=query_views.manifest["manifest_digest"],
             prediction_seal=ranking_seal,
             certificate_manifest=manifest,
             blinding_nonce=blinding_nonce,

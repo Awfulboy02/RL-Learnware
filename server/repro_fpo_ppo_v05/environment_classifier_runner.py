@@ -62,6 +62,7 @@ from server.repro_fpo_ppo_v05.blind_query_bank import (
 
 Q0_COMMON_GAUSSIAN_OPEN_LOOP = "Q0_COMMON_GAUSSIAN_OPEN_LOOP"
 P1_STATUS = "DEFERRED_NOT_IMPLEMENTED"
+SCORER_SOURCE_FIT_SCHEMA = "policy-learnware.v05-scorer-source-fit.v1"
 _OPAQUE_QUERY_ID = re.compile(r"^q-[0-9a-f]{20,64}$")
 
 
@@ -89,6 +90,34 @@ def _freeze_json(value: Any) -> Any:
     return value
 
 
+def _scorer_source_fit_manifest(role_manifest: Mapping[str, Any]) -> dict[str, Any]:
+    """Project only train/validation provenance into the scorer-visible panel."""
+
+    try:
+        roles = {
+            role: dict(role_manifest["roles"][role])
+            for role in ("source_train", "source_validation")
+        }
+        sources = {
+            source_id: {
+                "roles": {
+                    role: dict(row["roles"][role])
+                    for role in ("source_train", "source_validation")
+                }
+            }
+            for source_id, row in role_manifest["sources"].items()
+        }
+    except (AttributeError, KeyError, TypeError) as error:
+        raise V05RunnerError("privileged source role manifest is malformed") from error
+    unsigned = {
+        "schema": SCORER_SOURCE_FIT_SCHEMA,
+        "source_count": role_manifest.get("source_count"),
+        "roles": roles,
+        "sources": sources,
+    }
+    return {**unsigned, "source_fit_provenance_digest": sha256_json(unsigned)}
+
+
 @dataclass(frozen=True)
 class P0Panel:
     """The six fitted models plus their one shared source-evidence binding."""
@@ -114,19 +143,26 @@ class P0Panel:
         if not isinstance(self.source_binding, Mapping):
             raise V05RunnerError("source_binding must be a mapping")
         binding = dict(self.source_binding)
-        for field in (
+        digest_fields = (
             "probe_protocol_digest",
             "normalization_digest",
-            "source_full_bank_digest",
-            "source_parent_asset_binding_digest",
-            "source_role_manifest_digest",
+            "source_fit_provenance_digest",
             "source_train_membership_digest",
             "source_validation_membership_digest",
-            "source_repeat_membership_digest",
             "source_train_bank_digest",
             "source_validation_bank_digest",
-            "source_repeat_bank_digest",
+        )
+        if set(binding) != {*digest_fields, "episode_counts_per_anchor"}:
+            raise V05RunnerError("scorer source binding fields differ")
+        counts = binding["episode_counts_per_anchor"]
+        if (
+            not isinstance(counts, (list, tuple))
+            or any(type(value) is not int for value in counts)
+            or tuple(counts) != (19, 6)
         ):
+            raise V05RunnerError("scorer source episode counts differ")
+        binding["episode_counts_per_anchor"] = (19, 6)
+        for field in digest_fields:
             binding[field] = _digest(binding.get(field), field)
         object.__setattr__(self, "source_binding", MappingProxyType(binding))
         if not isinstance(self.source_role_manifest, Mapping):
@@ -135,17 +171,61 @@ class P0Panel:
         unsigned_role_manifest = {
             key: value
             for key, value in role_manifest.items()
-            if key != "source_role_manifest_digest"
+            if key != "source_fit_provenance_digest"
         }
-        if role_manifest.get("source_role_manifest_digest") != sha256_json(
-            unsigned_role_manifest
+        if (
+            set(role_manifest)
+            != {
+                "schema",
+                "source_count",
+                "roles",
+                "sources",
+                "source_fit_provenance_digest",
+            }
+            or role_manifest.get("schema") != SCORER_SOURCE_FIT_SCHEMA
+            or set(role_manifest.get("roles", ()))
+            != {"source_train", "source_validation"}
+            or any("repeat" in str(key).lower() for key in role_manifest)
+            or role_manifest.get("source_fit_provenance_digest")
+            != sha256_json(unsigned_role_manifest)
         ):
-            raise V05RunnerError("source role manifest digest changed")
+            raise V05RunnerError("scorer source-fit manifest digest changed")
         try:
+            expected_positions = {
+                "source_train": list(range(0, 19)),
+                "source_validation": list(range(19, 25)),
+            }
+            for role, positions in expected_positions.items():
+                aggregate = role_manifest["roles"][role]
+                if set(aggregate) != {
+                    "episode_count",
+                    "membership_digest",
+                    "bank_digest",
+                } or aggregate["episode_count"] != len(positions):
+                    raise V05RunnerError("scorer source-fit aggregate fields differ")
+                memberships = {}
+                banks = {}
+                for source_id, row in role_manifest["sources"].items():
+                    role_row = row["roles"][role]
+                    if set(role_row) != {
+                        "episode_positions",
+                        "membership_digest",
+                        "bank_digest",
+                    } or tuple(role_row["episode_positions"]) != tuple(positions):
+                        raise V05RunnerError("scorer source-fit source fields differ")
+                    memberships[source_id] = _digest(
+                        role_row["membership_digest"], "role membership digest"
+                    )
+                    banks[source_id] = _digest(
+                        role_row["bank_digest"], "role bank digest"
+                    )
+                if aggregate["membership_digest"] != sha256_json(
+                    memberships
+                ) or aggregate["bank_digest"] != sha256_json(banks):
+                    raise V05RunnerError("scorer source-fit aggregate binding differs")
             manifest_binding = {
-                "source_full_bank_digest": role_manifest["full_bank_digest"],
-                "source_parent_asset_binding_digest": role_manifest[
-                    "parent_asset_binding_digest"
+                "source_fit_provenance_digest": role_manifest[
+                    "source_fit_provenance_digest"
                 ],
                 "source_train_membership_digest": role_manifest["roles"][
                     "source_train"
@@ -153,30 +233,27 @@ class P0Panel:
                 "source_validation_membership_digest": role_manifest["roles"][
                     "source_validation"
                 ]["membership_digest"],
-                "source_repeat_membership_digest": role_manifest["roles"][
-                    "source_repeat_report"
-                ]["membership_digest"],
                 "source_train_bank_digest": role_manifest["roles"]["source_train"][
                     "bank_digest"
                 ],
                 "source_validation_bank_digest": role_manifest["roles"][
                     "source_validation"
                 ]["bank_digest"],
-                "source_repeat_bank_digest": role_manifest["roles"][
-                    "source_repeat_report"
-                ]["bank_digest"],
             }
         except (KeyError, TypeError) as error:
-            raise V05RunnerError("source role manifest is malformed") from error
+            raise V05RunnerError("scorer source-fit manifest is malformed") from error
         if (
-            role_manifest.get("source_role_manifest_digest")
-            != binding["source_role_manifest_digest"]
-            or any(binding[key] != value for key, value in manifest_binding.items())
+            any(binding[key] != value for key, value in manifest_binding.items())
             or role_manifest.get("source_count")
             != len(self.certificate_manifest.bindings)
             or set(role_manifest.get("sources", ())) != set(self.resolver.anchor_ids)
+            or any(
+                set(row) != {"roles"}
+                or set(row["roles"]) != {"source_train", "source_validation"}
+                for row in role_manifest.get("sources", {}).values()
+            )
         ):
-            raise V05RunnerError("source role manifest binding differs")
+            raise V05RunnerError("scorer source-fit manifest binding differs")
         object.__setattr__(self, "source_role_manifest", _freeze_json(role_manifest))
         bandwidth = float(self.bandwidth)
         if not math.isfinite(bandwidth) or bandwidth <= 0.0:
@@ -330,15 +407,12 @@ def fit_p0_panel(
     )
     train = dict(projection.source_train)
     validation = dict(projection.source_validation)
-    repeat = dict(projection.source_repeat)
-    role_manifest = projection.manifest
+    role_manifest = _scorer_source_fit_manifest(projection.manifest)
     resolver = CertificateResolver(certificate_manifest)
     if set(resolver.anchor_ids) != set(train):
         raise V05RunnerError("certificate/source anchor coverage differs")
     widths = {
-        bank.input_dim
-        for banks in (train, validation, repeat)
-        for bank in banks.values()
+        bank.input_dim for banks in (train, validation) for bank in banks.values()
     }
     if len(widths) != 1:
         raise V05RunnerError("source roles have different canonical point widths")
@@ -367,19 +441,12 @@ def fit_p0_panel(
             probe_protocol_digest, "probe_protocol_digest"
         ),
         "normalization_digest": normalizer,
-        "source_full_bank_digest": role_manifest["full_bank_digest"],
-        "source_parent_asset_binding_digest": role_manifest[
-            "parent_asset_binding_digest"
-        ],
-        "source_role_manifest_digest": role_manifest["source_role_manifest_digest"],
+        "source_fit_provenance_digest": role_manifest["source_fit_provenance_digest"],
         "source_train_membership_digest": role_manifest["roles"]["source_train"][
             "membership_digest"
         ],
         "source_validation_membership_digest": role_manifest["roles"][
             "source_validation"
-        ]["membership_digest"],
-        "source_repeat_membership_digest": role_manifest["roles"][
-            "source_repeat_report"
         ]["membership_digest"],
         "source_train_bank_digest": role_manifest["roles"]["source_train"][
             "bank_digest"
@@ -387,10 +454,7 @@ def fit_p0_panel(
         "source_validation_bank_digest": role_manifest["roles"]["source_validation"][
             "bank_digest"
         ],
-        "source_repeat_bank_digest": role_manifest["roles"]["source_repeat_report"][
-            "bank_digest"
-        ],
-        "episode_counts_per_anchor": [19, 6, 7],
+        "episode_counts_per_anchor": [19, 6],
     }
     return P0Panel(
         certificate_manifest=certificate_manifest,
@@ -633,9 +697,6 @@ def score_query(
                         ],
                         source_validation_membership_digest=panel.source_binding[
                             "source_validation_membership_digest"
-                        ],
-                        source_repeat_membership_digest=panel.source_binding[
-                            "source_repeat_membership_digest"
                         ],
                         target_membership_digest=target_binding[
                             "target_membership_digest"

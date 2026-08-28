@@ -116,8 +116,11 @@ privacy:
   formal_dp: false
   claim: reward_policy_label_channel_exclusion_and_role_separation
   method_scope:
-    RFF_KME_NN: fixed_vector_raw_non_disclosure_interface_only
-    SWE_NN: fixed_vector_raw_non_disclosure_interface_only
+    RFF_KME_NN: method_level_fixed_vector_scoring_interface_only
+    SWE_NN: method_level_fixed_vector_scoring_interface_only
     RAW_DELTA_RKME: source_reduced_target_full_support_or_local_scoring
     EMPIRICAL_MMD_NN: full_support_control
+    SUMMARY_LOGREG: episode_summary_scoring_interface_from_joint_artifact
     KME_KRR: full_support_control
+  joint_benchmark_artifact: trusted_joint_artifact_contains_full_support_views_for_controls
+  process_and_storage_level_raw_isolation: deferred_not_claimed

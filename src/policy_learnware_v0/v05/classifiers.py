@@ -973,6 +973,10 @@ def p0_method_cards() -> tuple[dict[str, Any], ...]:
             **common,
             "method_id": RFF_KME_NN,
             "access_tier": "FIXED_VECTOR_SPEC",
+            "isolation_scope": (
+                "method-level fixed-vector scoring interface only; the trusted "
+                "joint benchmark artifact also contains full-support controls"
+            ),
             "source_fit": "per-anchor equal mean of bounded public cos/sin episode means",
             "target_aggregation": "equal mean of the B per-episode RFF means",
             "score": "negative L2 to source RFF mean",
@@ -982,6 +986,10 @@ def p0_method_cards() -> tuple[dict[str, Any], ...]:
             **common,
             "method_id": SWE_NN,
             "access_tier": "FIXED_VECTOR_SPEC",
+            "isolation_scope": (
+                "method-level fixed-vector scoring interface only; the trusted "
+                "joint benchmark artifact also contains full-support controls"
+            ),
             "source_fit": "per-anchor fixed public-direction quantile sketch",
             "target_aggregation": "mix B episodes with equal mass, then sketch once",
             "score": "negative L2 to source SWE vector",

@@ -18,7 +18,7 @@ from ..v04a.protocol import (
 from .labels import CertificateResolver, CertifiedPolicyManifest
 
 
-PREDICTION_PAYLOAD_SCHEMA = "policy-learnware.v05-sealed-predictions.v1"
+PREDICTION_PAYLOAD_SCHEMA = "policy-learnware.v05-sealed-predictions.v2"
 MARKET_30_CERT = "MARKET_30_CERT"
 TASK_5_CERT = "TASK_5_CERT"
 _ENDPOINTS = frozenset({MARKET_30_CERT, TASK_5_CERT})
@@ -100,7 +100,6 @@ class PredictionRanking:
     canonical_query_bank_digest: str
     source_train_membership_digest: str
     source_validation_membership_digest: str
-    source_repeat_membership_digest: str
     target_membership_digest: str
     normalization_digest: str
     config_digest: str
@@ -140,7 +139,6 @@ class PredictionRanking:
             "canonical_query_bank_digest",
             "source_train_membership_digest",
             "source_validation_membership_digest",
-            "source_repeat_membership_digest",
             "target_membership_digest",
             "normalization_digest",
             "config_digest",
@@ -177,7 +175,6 @@ class PredictionRanking:
             "source_validation_membership_digest": (
                 self.source_validation_membership_digest
             ),
-            "source_repeat_membership_digest": self.source_repeat_membership_digest,
             "target_membership_digest": self.target_membership_digest,
             "normalization_digest": self.normalization_digest,
             "config_digest": self.config_digest,
@@ -199,7 +196,6 @@ class PredictionRanking:
             "canonical_query_bank_digest",
             "source_train_membership_digest",
             "source_validation_membership_digest",
-            "source_repeat_membership_digest",
             "target_membership_digest",
             "normalization_digest",
             "config_digest",
@@ -219,6 +215,7 @@ class TruthBinding:
     task_id: str
     opaque_certified_policy_id: str
     authorized_query_manifest_digest: str
+    prediction_seal_digest: str
 
     def __post_init__(self) -> None:
         for field_name in (
@@ -240,6 +237,11 @@ class TruthBinding:
                 "authorized_query_manifest_digest",
             ),
         )
+        object.__setattr__(
+            self,
+            "prediction_seal_digest",
+            _digest(self.prediction_seal_digest, "prediction_seal_digest"),
+        )
 
     @property
     def certified_policy_id(self) -> str:
@@ -252,6 +254,7 @@ class TruthBinding:
             "task_id": self.task_id,
             "opaque_certified_policy_id": self.opaque_certified_policy_id,
             "authorized_query_manifest_digest": self.authorized_query_manifest_digest,
+            "prediction_seal_digest": self.prediction_seal_digest,
         }
 
     @classmethod
@@ -262,6 +265,7 @@ class TruthBinding:
             "task_id",
             "opaque_certified_policy_id",
             "authorized_query_manifest_digest",
+            "prediction_seal_digest",
         }
         _exact_keys(payload, fields, "truth binding")
         return cls(**{field: payload[field] for field in fields})
@@ -437,7 +441,6 @@ def require_prediction_cell_coverage(
         "probe_protocol_digest",
         "source_train_membership_digest",
         "source_validation_membership_digest",
-        "source_repeat_membership_digest",
         "normalization_digest",
         "config_digest",
         "source_model_manifest_digest",
@@ -672,6 +675,11 @@ def evaluate_sealed_predictions(
     ks = tuple(sorted(ks))
     resolver = CertificateResolver(certificate_manifest)
     truths = _truth_rows(truth_join, resolver)
+    if any(
+        item.prediction_seal_digest != prediction_seal.rankings_digest
+        for item in truths
+    ):
+        raise V05MetricError("truth release belongs to another prediction seal")
 
     predictions_by_query: dict[str, list[PredictionRanking]] = {}
     for item in predictions:
