@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import replace
 import hashlib
 import inspect
@@ -12,6 +13,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from policy_learnware_v0.hashing import canonical_json_bytes, sha256_json
+from policy_learnware_v0.io import atomic_write_json, read_json
 from policy_learnware_v0.rkme.reducer import ReducerConfig
 from policy_learnware_v0.v04a.protocol import (
     BUDGET_EPISODES,
@@ -21,9 +24,7 @@ from policy_learnware_v0.v04a.protocol import (
     tie_break_key,
 )
 from policy_learnware_v0.v05.classifiers import (
-    KME_KRR,
     P0_METHOD_IDS,
-    SUMMARY_LOGREG,
     EpisodeBank,
 )
 from policy_learnware_v0.v05.labels import (
@@ -44,6 +45,13 @@ from policy_learnware_v0.v05.metrics import (
     prediction_payload,
 )
 from server.repro_fpo_ppo_v05 import exact_repeat_collector
+from server.repro_fpo_ppo_v05.blind_query_bank import (
+    AuthorizedQueryViews,
+    V05BlindError,
+    load_private_truth_binding,
+    prepare_blinded_episode_bank,
+    project_verified_source_banks,
+)
 from server.repro_fpo_ppo_v05.environment_classifier_runner import (
     P1_STATUS,
     V05RunnerError,
@@ -70,13 +78,22 @@ ROW_BINDING = {
     "normalization_digest": _digest("normalization"),
     "config_digest": _digest("config"),
     "source_model_manifest_digest": _digest("source-model-manifest"),
+    "authorized_query_manifest_digest": _digest("authorized-query-manifest"),
 }
 
 
+def _query_binding(query_id: str) -> dict[str, str]:
+    return {
+        **ROW_BINDING,
+        "authorized_query_manifest_digest": _digest(f"{query_id}-authorized-manifest"),
+    }
+
+
 def _bank(*episodes: list[float]) -> EpisodeBank:
-    arrays = [
-        np.asarray(episode, dtype=np.float64).reshape(-1, 1) for episode in episodes
-    ]
+    arrays = []
+    for episode in episodes:
+        array = np.asarray(episode, dtype=np.float64)
+        arrays.append(array.reshape(-1, 1) if array.ndim == 1 else array)
     return EpisodeBank(
         np.concatenate(arrays),
         np.concatenate(
@@ -117,9 +134,27 @@ def many_to_one_manifest() -> CertifiedPolicyManifest:
 @pytest.fixture
 def truth_join() -> tuple[TruthBinding, ...]:
     return (
-        TruthBinding("query-a1", "anchor-a1", "task-a", POLICY_A),
-        TruthBinding("query-a2", "anchor-a2", "task-a", POLICY_A),
-        TruthBinding("query-b1", "anchor-b1", "task-b", POLICY_B),
+        TruthBinding(
+            "query-a1",
+            "anchor-a1",
+            "task-a",
+            POLICY_A,
+            _query_binding("query-a1")["authorized_query_manifest_digest"],
+        ),
+        TruthBinding(
+            "query-a2",
+            "anchor-a2",
+            "task-a",
+            POLICY_A,
+            _query_binding("query-a2")["authorized_query_manifest_digest"],
+        ),
+        TruthBinding(
+            "query-b1",
+            "anchor-b1",
+            "task-b",
+            POLICY_B,
+            _query_binding("query-b1")["authorized_query_manifest_digest"],
+        ),
     )
 
 
@@ -138,7 +173,7 @@ def _prediction_rows(budget: int = 1) -> tuple[PredictionRanking, ...]:
                 query_id,
                 ("anchor-a1", "anchor-a2", "anchor-b1"),
                 (POLICY_A, POLICY_B),
-                **ROW_BINDING,
+                **_query_binding(query_id),
             )
         )
         rows.append(
@@ -149,7 +184,7 @@ def _prediction_rows(budget: int = 1) -> tuple[PredictionRanking, ...]:
                 query_id,
                 (("anchor-a1", "anchor-a2") if task_id == "task-a" else ("anchor-b1",)),
                 (POLICY_A,) if task_id == "task-a" else (POLICY_B,),
-                **ROW_BINDING,
+                **_query_binding(query_id),
             )
         )
     return tuple(rows)
@@ -253,6 +288,20 @@ def test_ranking_requires_seal_before_truth_join(
     assert result.prediction_seal_digest == sealed.rankings_digest
     assert result.certificate_manifest_digest == many_to_one_manifest.manifest_digest
 
+    swapped_truth = (
+        replace(truth_join[0], opaque_query_id=truth_join[1].opaque_query_id),
+        replace(truth_join[1], opaque_query_id=truth_join[0].opaque_query_id),
+        truth_join[2],
+    )
+    with pytest.raises(V05MetricError, match="manifest binding"):
+        evaluate_sealed_predictions(
+            sealed,
+            swapped_truth,
+            many_to_one_manifest,
+            expected_method_ids=("METHOD",),
+            expected_budgets=(1,),
+        )
+
 
 def test_market_and_task_endpoints_use_task_equal_macro(
     many_to_one_manifest: CertifiedPolicyManifest,
@@ -339,7 +388,7 @@ def test_nan_duplicate_rank_and_missing_coverage_fail_closed(
         original.opaque_query_id,
         ("anchor-a1", "anchor-a2"),
         original.ranked_policy_ids,
-        **ROW_BINDING,
+        **_query_binding(original.opaque_query_id),
     )
     with pytest.raises(V05MetricError, match="candidate set"):
         evaluate_sealed_predictions(
@@ -351,7 +400,9 @@ def test_nan_duplicate_rank_and_missing_coverage_fail_closed(
         )
 
 
-def test_runner_binds_all_p0_to_one_panel_then_masks_ranks_and_seals() -> None:
+def test_runner_binds_all_p0_to_one_panel_then_masks_ranks_and_seals(
+    tmp_path,
+) -> None:
     anchors = ("anchor-a", "anchor-b")
     manifest = project_certificate_manifest(
         {"anchor-a": POLICY_A, "anchor-b": POLICY_B},
@@ -369,28 +420,79 @@ def test_runner_binds_all_p0_to_one_panel_then_masks_ranks_and_seals() -> None:
             POLICY_B: _digest("abi-b"),
         },
     )
-    # Identical anchor evidence makes tie handling observable without changing
-    # the fact that every method receives exactly the same role banks.
-    train = {anchor: _bank([0.0, 0.1], [0.2, 0.3]) for anchor in anchors}
-    validation = {anchor: _bank([0.1, 0.2]) for anchor in anchors}
-    repeat = {anchor: _bank([0.15, 0.25]) for anchor in anchors}
+    full_banks = {
+        anchor: _bank(
+            *(
+                np.column_stack(
+                    (
+                        anchor_index + episode * 0.01 + np.linspace(0.0, 0.005, 64),
+                        np.linspace(-0.2, 0.2, 64),
+                    )
+                )
+                for episode in range(32)
+            )
+        )
+        for anchor_index, anchor in enumerate(anchors)
+    }
+    parent_asset_sha256 = {
+        anchor: _digest(f"{anchor}-parent-file") for anchor in anchors
+    }
+    parent_membership_digest = {
+        anchor: _digest(f"{anchor}-parent-membership") for anchor in anchors
+    }
+    projection = project_verified_source_banks(
+        full_banks,
+        parent_asset_sha256=parent_asset_sha256,
+        parent_membership_digest=parent_membership_digest,
+        expected_source_count=2,
+    )
+    assert {
+        role: row["episode_count"] for role, row in projection.manifest["roles"].items()
+    } == {
+        "source_train": 19,
+        "source_validation": 6,
+        "source_repeat_report": 7,
+    }
+    role_positions = [
+        set(row["episode_positions"])
+        for row in projection.manifest["sources"]["anchor-a"]["roles"].values()
+    ]
+    assert set.union(*role_positions) == set(range(32))
+    assert all(
+        not role_positions[left].intersection(role_positions[right])
+        for left in range(3)
+        for right in range(left)
+    )
+    with pytest.raises(V05BlindError, match="frozen slice"):
+        replace(
+            projection,
+            source_validation={
+                **dict(projection.source_validation),
+                "anchor-a": projection.source_repeat["anchor-a"],
+            },
+        )
+    with pytest.raises(V05BlindError, match="frozen slice"):
+        replace(
+            projection,
+            source_validation={
+                **dict(projection.source_validation),
+                "anchor-a": projection.source_validation["anchor-b"],
+            },
+        )
+
     config_digest = _digest("runner-config")
-    probe_digest = _digest("q0-probe")
+    probe_digest = sha256_json(exact_repeat_collector.q0_probe_protocol(sigma=0.35))
     normalization_digest = _digest("source-normalizer")
     panel = fit_p0_panel(
-        train,
-        validation,
-        repeat,
+        full_banks,
         manifest,
         config_digest=config_digest,
         probe_protocol_digest=probe_digest,
         normalization_digest=normalization_digest,
-        source_train_membership_digest=_digest("train-membership"),
-        source_validation_membership_digest=_digest("validation-membership"),
-        source_repeat_membership_digest=_digest("repeat-membership"),
+        source_parent_asset_sha256=parent_asset_sha256,
+        source_parent_membership_digest=parent_membership_digest,
         bandwidth=0.8,
         expected_source_count=2,
-        expected_episode_counts=(2, 1, 1),
         reducer_config=ReducerConfig(
             support_budget=4,
             support_steps=0,
@@ -411,6 +513,18 @@ def test_runner_binds_all_p0_to_one_panel_then_masks_ranks_and_seals() -> None:
         card["source_binding"] == panel.source_binding for card in panel.method_cards
     )
     assert panel.source_model_manifest["source_binding"] == panel.source_binding
+    assert (
+        panel.source_role_manifest["sources"]["anchor-a"]["parent_asset_sha256"]
+        == parent_asset_sha256["anchor-a"]
+    )
+    assert (
+        panel.source_role_manifest["sources"]["anchor-a"]["parent_membership_digest"]
+        == parent_membership_digest["anchor-a"]
+    )
+    assert (
+        panel.source_model_manifest["source_role_manifest"]
+        == panel.source_role_manifest
+    )
     model_digest = panel.source_model_manifest["source_model_manifest_digest"]
     with pytest.raises(V05RunnerError, match="bandwidth"):
         replace(panel, kme_krr=replace(panel.kme_krr, bandwidth=0.9))
@@ -433,7 +547,8 @@ def test_runner_binds_all_p0_to_one_panel_then_masks_ranks_and_seals() -> None:
     )
     empirical_source = panel.empirical_mmd.sources["anchor-a"]
     empirical_weights = empirical_source.weights.copy()
-    empirical_weights[:2] += np.asarray([0.01, -0.01])
+    weight_shift = 0.5 * empirical_weights[1]
+    empirical_weights[:2] += np.asarray([weight_shift, -weight_shift])
     empirical_tampered = replace(
         panel,
         empirical_mmd=replace(
@@ -449,21 +564,227 @@ def test_runner_binds_all_p0_to_one_panel_then_masks_ranks_and_seals() -> None:
         != model_digest
     )
 
+    tampered_role_manifest = dict(panel.source_role_manifest)
+    tampered_sources = dict(tampered_role_manifest["sources"])
+    tampered_anchor = dict(tampered_sources["anchor-a"])
+    tampered_anchor["parent_asset_sha256"] = _digest("tampered-parent-file")
+    tampered_sources["anchor-a"] = tampered_anchor
+    tampered_role_manifest["sources"] = tampered_sources
+    with pytest.raises(V05RunnerError, match="manifest digest changed"):
+        replace(panel, source_role_manifest=tampered_role_manifest)
+
+    public_parent = tmp_path / "new-opaque-public-root"
+    private_binding_root = tmp_path / "private-truth-bindings"
+    blinding_nonce = "0123456789abcdef-v05-test"
+    authorized_budgets = (1, 2, 4)
+    query_views = prepare_blinded_episode_bank(
+        episode_bank=projection.source_repeat["anchor-a"],
+        parent_source_role_manifest=projection.manifest,
+        expected_source_role_manifest_digest=panel.source_binding[
+            "source_role_manifest_digest"
+        ],
+        parent_asset_sha256=parent_asset_sha256["anchor-a"],
+        parent_membership_digest=parent_membership_digest["anchor-a"],
+        probe_protocol_digest=probe_digest,
+        public_parent=public_parent,
+        private_binding_root=private_binding_root,
+        truth_source_anchor_id="anchor-a",
+        certificate_manifest=manifest,
+        blinding_nonce=blinding_nonce,
+        normalization_digest=normalization_digest,
+        rff_map=panel.rff.rff_map,
+        swe_map=panel.swe.swe_map,
+        authorized_budgets=authorized_budgets,
+        expected_candidate_count=1,
+    )
+    assert isinstance(query_views, AuthorizedQueryViews)
+    assert query_views.manifest["market_order_digest"] == sha256_json(list(anchors))
+    assert query_views.manifest["candidate_mask"] == [True, False]
+    assert query_views.authorized_budgets == authorized_budgets
+    assert {bank.episode_count for bank in query_views.banks.values()} == {4}
+    assert query_views.summary_rows.shape[0] == 4
+    assert set(query_views.manifest["canonical_budget_bank_digests"]) == {
+        "1",
+        "2",
+        "4",
+    }
+    public_bytes = canonical_json_bytes(query_views.manifest)
+    for private_value in (
+        "anchor-a",
+        POLICY_A,
+        parent_asset_sha256["anchor-a"],
+        parent_membership_digest["anchor-a"],
+    ):
+        assert private_value.encode() not in public_bytes
+
+    def public_keys(value):
+        if isinstance(value, Mapping):
+            yield from value
+            for item in value.values():
+                yield from public_keys(item)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                yield from public_keys(item)
+
+    forbidden_public_tokens = (
+        "anchor",
+        "path",
+        "policy",
+        "factor",
+        "return",
+        "expected",
+        "label",
+        "truth",
+    )
+    assert not any(
+        token in key.lower()
+        for key in public_keys(query_views.manifest)
+        for token in forbidden_public_tokens
+    )
+    private_binding = read_json(
+        private_binding_root / f"{query_views.opaque_query_id}.json"
+    )
+    assert private_binding["source_anchor_id"] == "anchor-a"
+    assert private_binding["opaque_certified_policy_id"] == POLICY_A
+    assert private_binding["private_evidence"]["parent_asset_sha256"] == (
+        parent_asset_sha256["anchor-a"]
+    )
+    assert private_binding["private_evidence"]["parent_membership_digest"] == (
+        parent_membership_digest["anchor-a"]
+    )
+    assert private_binding["private_evidence"]["source_repeat_bank_digest"] == (
+        projection.source_repeat["anchor-a"].bank_digest
+    )
+
+    unsafe_manifest = dict(query_views.manifest)
+    unsafe_manifest["source_anchor_id"] = "anchor-a"
+    unsafe_manifest["manifest_digest"] = sha256_json(
+        {
+            key: value
+            for key, value in unsafe_manifest.items()
+            if key != "manifest_digest"
+        }
+    )
+    with pytest.raises(V05BlindError, match="forbidden"):
+        replace(query_views, manifest=unsafe_manifest)
+
+    bad_budget_manifest = dict(query_views.manifest)
+    bad_budget_manifest["canonical_budget_bank_digests"] = {
+        **dict(query_views.manifest["canonical_budget_bank_digests"]),
+        "1": _digest("tampered-budget-bank"),
+    }
+    bad_budget_manifest["manifest_digest"] = sha256_json(
+        {
+            key: value
+            for key, value in bad_budget_manifest.items()
+            if key != "manifest_digest"
+        }
+    )
+    with pytest.raises(V05BlindError, match="budget bank digest changed"):
+        replace(query_views, manifest=bad_budget_manifest)
+
+    with pytest.raises(V05BlindError, match="nested frozen subset"):
+        prepare_blinded_episode_bank(
+            episode_bank=projection.source_repeat["anchor-a"],
+            parent_source_role_manifest=projection.manifest,
+            expected_source_role_manifest_digest=panel.source_binding[
+                "source_role_manifest_digest"
+            ],
+            parent_asset_sha256=parent_asset_sha256["anchor-a"],
+            parent_membership_digest=parent_membership_digest["anchor-a"],
+            probe_protocol_digest=probe_digest,
+            public_parent=tmp_path / "unauthorized-eight-public",
+            private_binding_root=tmp_path / "unauthorized-eight-private",
+            truth_source_anchor_id="anchor-a",
+            certificate_manifest=manifest,
+            blinding_nonce=blinding_nonce,
+            normalization_digest=normalization_digest,
+            rff_map=panel.rff.rff_map,
+            swe_map=panel.swe.swe_map,
+            authorized_budgets=(1, 2, 4, 8),
+            expected_candidate_count=1,
+        )
+    with pytest.raises(V05BlindError, match="must equal"):
+        prepare_blinded_episode_bank(
+            episode_bank=projection.source_repeat["anchor-a"],
+            parent_source_role_manifest=projection.manifest,
+            expected_source_role_manifest_digest=panel.source_binding[
+                "source_role_manifest_digest"
+            ],
+            parent_asset_sha256=parent_asset_sha256["anchor-a"],
+            parent_membership_digest=parent_membership_digest["anchor-a"],
+            probe_protocol_digest=probe_digest,
+            public_parent=tmp_path / "underspecified-public",
+            private_binding_root=tmp_path / "underspecified-private",
+            truth_source_anchor_id="anchor-a",
+            certificate_manifest=manifest,
+            blinding_nonce=blinding_nonce,
+            normalization_digest=normalization_digest,
+            rff_map=panel.rff.rff_map,
+            swe_map=panel.swe.swe_map,
+            authorized_budgets=(1, 2),
+            expected_candidate_count=1,
+        )
+    overlap_root = tmp_path / "overlap-root"
+    with pytest.raises(V05BlindError, match="overlap"):
+        prepare_blinded_episode_bank(
+            episode_bank=projection.source_repeat["anchor-a"],
+            parent_source_role_manifest=projection.manifest,
+            expected_source_role_manifest_digest=panel.source_binding[
+                "source_role_manifest_digest"
+            ],
+            parent_asset_sha256=parent_asset_sha256["anchor-a"],
+            parent_membership_digest=parent_membership_digest["anchor-a"],
+            probe_protocol_digest=probe_digest,
+            public_parent=overlap_root,
+            private_binding_root=overlap_root / "private",
+            truth_source_anchor_id="anchor-a",
+            certificate_manifest=manifest,
+            blinding_nonce=blinding_nonce,
+            normalization_digest=normalization_digest,
+            rff_map=panel.rff.rff_map,
+            swe_map=panel.swe.swe_map,
+            authorized_budgets=authorized_budgets,
+            expected_candidate_count=1,
+        )
+    with pytest.raises(V05BlindError, match="overwrite"):
+        prepare_blinded_episode_bank(
+            episode_bank=projection.source_repeat["anchor-a"],
+            parent_source_role_manifest=projection.manifest,
+            expected_source_role_manifest_digest=panel.source_binding[
+                "source_role_manifest_digest"
+            ],
+            parent_asset_sha256=parent_asset_sha256["anchor-a"],
+            parent_membership_digest=parent_membership_digest["anchor-a"],
+            probe_protocol_digest=probe_digest,
+            public_parent=public_parent,
+            private_binding_root=private_binding_root,
+            truth_source_anchor_id="anchor-a",
+            certificate_manifest=manifest,
+            blinding_nonce=blinding_nonce,
+            normalization_digest=normalization_digest,
+            rff_map=panel.rff.rff_map,
+            swe_map=panel.swe.swe_map,
+            authorized_budgets=authorized_budgets,
+            expected_candidate_count=1,
+        )
+
     predictions, rows = score_query(
         panel,
-        _bank([0.1, 0.2], [1.5, 1.6]),
-        opaque_query_id="q-" + _digest("query")[:20],
-        candidate_anchor_ids=("anchor-a",),
-        probe_protocol_digest=probe_digest,
-        reward_free_bank_sha256=_digest("query-bank"),
-        target_membership_digest=_digest("target-membership"),
-        normalization_digest=normalization_digest,
-        budgets=(1, 2),
+        query_views,
         expected_task_candidate_count=1,
     )
-    assert len(predictions) == len(rows) == 24
+    with pytest.raises(V05RunnerError, match="authorized query subset"):
+        score_query(
+            panel,
+            query_views,
+            budgets=(1, 2, 4, 8),
+            expected_task_candidate_count=1,
+        )
+    assert "candidate_anchor_ids" not in inspect.signature(score_query).parameters
+    assert len(predictions) == len(rows) == 36
     assert all(row["source_binding"] == panel.source_binding for row in rows)
-    for budget in (1, 2):
+    for budget in authorized_budgets:
         budget_rows = [row for row in rows if row["budget_episodes"] == budget]
         assert all(
             row["target_binding"] == budget_rows[0]["target_binding"]
@@ -472,6 +793,11 @@ def test_runner_binds_all_p0_to_one_panel_then_masks_ranks_and_seals() -> None:
     assert all(
         prediction.source_model_manifest_digest
         == panel.source_model_manifest["source_model_manifest_digest"]
+        for prediction in predictions
+    )
+    assert all(
+        prediction.canonical_query_bank_digest
+        == query_views.canonical_bank_digest_for_budget(prediction.budget_episodes)
         for prediction in predictions
     )
     assert {
@@ -483,6 +809,7 @@ def test_runner_binds_all_p0_to_one_panel_then_masks_ranks_and_seals() -> None:
     } == {
         (64, 1_000),
         (128, 2_000),
+        (256, 4_000),
     }
 
     indexed_rows = {
@@ -492,19 +819,14 @@ def test_runner_binds_all_p0_to_one_panel_then_masks_ranks_and_seals() -> None:
         (item.method_id, item.budget_episodes, item.endpoint): item
         for item in predictions
     }
-    anchor_to_policy = panel.resolver.anchor_to_policy
     for method_id in P0_METHOD_IDS:
-        for budget in (1, 2):
+        for budget in authorized_budgets:
             market = indexed_rows[(method_id, budget, MARKET_30_CERT)]
             masked = indexed_rows[(method_id, budget, TASK_5_CERT)]
             assert market["scores_before_mask"] == masked["scores_before_mask"]
             assert len(market["scores_before_mask"]) == 2
             scores = market["scores_before_mask"]
-            anchor_scores = (
-                {anchor: scores[anchor_to_policy[anchor]] for anchor in anchors}
-                if method_id in {SUMMARY_LOGREG, KME_KRR}
-                else scores
-            )
+            anchor_scores = dict(zip(anchors, scores, strict=True))
             expected_rank = tuple(
                 sorted(
                     anchors,
@@ -529,8 +851,78 @@ def test_runner_binds_all_p0_to_one_panel_then_masks_ranks_and_seals() -> None:
         != indexed_rows[(P0_METHOD_IDS[0], 2, MARKET_30_CERT)]["scores_before_mask"]
     )
 
-    payload, ranking_seal = seal_prediction_rows(predictions, expected_budgets=(1, 2))
+    other_group_manifest = dict(query_views.manifest)
+    other_group_manifest["candidate_mask"] = [False, True]
+    other_group_manifest["manifest_digest"] = sha256_json(
+        {
+            key: value
+            for key, value in other_group_manifest.items()
+            if key != "manifest_digest"
+        }
+    )
+    other_group_views = replace(query_views, manifest=other_group_manifest)
+    with pytest.raises(V05RunnerError, match="task/ABI binding"):
+        score_query(
+            panel,
+            other_group_views,
+            budgets=(1,),
+            expected_task_candidate_count=1,
+        )
+
+    payload, ranking_seal = seal_prediction_rows(
+        predictions, expected_budgets=authorized_budgets
+    )
     assert ranking_seal.verify(payload)
+    private_binding_file = private_binding_root / f"{query_views.opaque_query_id}.json"
+    loaded_truth = load_private_truth_binding(
+        private_binding_file,
+        prediction_seal=ranking_seal,
+        certificate_manifest=manifest,
+        blinding_nonce=blinding_nonce,
+    )
+    assert loaded_truth.source_anchor_id == "anchor-a"
+    assert (
+        loaded_truth.authorized_query_manifest_digest
+        == query_views.manifest["manifest_digest"]
+    )
+    incomplete_rows = tuple(
+        item for item in predictions if item.method_id == P0_METHOD_IDS[0]
+    )
+    incomplete_seal = seal_rankings(prediction_payload(incomplete_rows))
+    with pytest.raises(V05BlindError, match="complete P0 prediction coverage"):
+        load_private_truth_binding(
+            private_binding_file,
+            prediction_seal=incomplete_seal,
+            certificate_manifest=manifest,
+            blinding_nonce=blinding_nonce,
+        )
+    with pytest.raises(V05BlindError, match="HMAC"):
+        load_private_truth_binding(
+            private_binding_file,
+            prediction_seal=ranking_seal,
+            certificate_manifest=manifest,
+            blinding_nonce="fedcba9876543210-wrong",
+        )
+    tampered_binding = dict(private_binding)
+    tampered_binding["public_manifest_digest"] = _digest("tampered-public-manifest")
+    tampered_binding["binding_digest"] = sha256_json(
+        {
+            key: value
+            for key, value in tampered_binding.items()
+            if key != "binding_digest"
+        }
+    )
+    tampered_binding_file = (
+        tmp_path / "tampered-private" / f"{query_views.opaque_query_id}.json"
+    )
+    atomic_write_json(tampered_binding_file, tampered_binding)
+    with pytest.raises(V05BlindError, match="sealed query rows"):
+        load_private_truth_binding(
+            tampered_binding_file,
+            prediction_seal=ranking_seal,
+            certificate_manifest=manifest,
+            blinding_nonce=blinding_nonce,
+        )
 
 
 def test_collector_q0_has_no_policy_surface_and_preserves_nested_dual_costs(

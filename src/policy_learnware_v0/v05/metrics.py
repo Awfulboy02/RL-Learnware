@@ -105,6 +105,7 @@ class PredictionRanking:
     normalization_digest: str
     config_digest: str
     source_model_manifest_digest: str
+    authorized_query_manifest_digest: str
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -144,6 +145,7 @@ class PredictionRanking:
             "normalization_digest",
             "config_digest",
             "source_model_manifest_digest",
+            "authorized_query_manifest_digest",
         ):
             object.__setattr__(
                 self,
@@ -180,6 +182,7 @@ class PredictionRanking:
             "normalization_digest": self.normalization_digest,
             "config_digest": self.config_digest,
             "source_model_manifest_digest": self.source_model_manifest_digest,
+            "authorized_query_manifest_digest": self.authorized_query_manifest_digest,
         }
 
     @classmethod
@@ -201,6 +204,7 @@ class PredictionRanking:
             "normalization_digest",
             "config_digest",
             "source_model_manifest_digest",
+            "authorized_query_manifest_digest",
         }
         _exact_keys(payload, fields, "prediction ranking")
         return cls(**{field: payload[field] for field in fields})
@@ -214,6 +218,7 @@ class TruthBinding:
     source_anchor_id: str
     task_id: str
     opaque_certified_policy_id: str
+    authorized_query_manifest_digest: str
 
     def __post_init__(self) -> None:
         for field_name in (
@@ -227,6 +232,14 @@ class TruthBinding:
                 field_name,
                 _canonical_string(getattr(self, field_name), field_name),
             )
+        object.__setattr__(
+            self,
+            "authorized_query_manifest_digest",
+            _digest(
+                self.authorized_query_manifest_digest,
+                "authorized_query_manifest_digest",
+            ),
+        )
 
     @property
     def certified_policy_id(self) -> str:
@@ -238,6 +251,7 @@ class TruthBinding:
             "source_anchor_id": self.source_anchor_id,
             "task_id": self.task_id,
             "opaque_certified_policy_id": self.opaque_certified_policy_id,
+            "authorized_query_manifest_digest": self.authorized_query_manifest_digest,
         }
 
     @classmethod
@@ -247,6 +261,7 @@ class TruthBinding:
             "source_anchor_id",
             "task_id",
             "opaque_certified_policy_id",
+            "authorized_query_manifest_digest",
         }
         _exact_keys(payload, fields, "truth binding")
         return cls(**{field: payload[field] for field in fields})
@@ -440,9 +455,14 @@ def require_prediction_cell_coverage(
         target_binding = (
             query_rows[0].reward_free_bank_sha256,
             query_rows[0].target_membership_digest,
+            query_rows[0].authorized_query_manifest_digest,
         )
         if any(
-            (item.reward_free_bank_sha256, item.target_membership_digest)
+            (
+                item.reward_free_bank_sha256,
+                item.target_membership_digest,
+                item.authorized_query_manifest_digest,
+            )
             != target_binding
             for item in query_rows[1:]
         ):
@@ -652,6 +672,23 @@ def evaluate_sealed_predictions(
     ks = tuple(sorted(ks))
     resolver = CertificateResolver(certificate_manifest)
     truths = _truth_rows(truth_join, resolver)
+
+    predictions_by_query: dict[str, list[PredictionRanking]] = {}
+    for item in predictions:
+        predictions_by_query.setdefault(item.opaque_query_id, []).append(item)
+    truths_by_query = {item.opaque_query_id: item for item in truths}
+    if set(predictions_by_query) != set(truths_by_query):
+        raise V05MetricError(
+            "sealed predictions and truth join cover different opaque queries"
+        )
+    for query_id, query_rows in predictions_by_query.items():
+        truth_digest = truths_by_query[query_id].authorized_query_manifest_digest
+        if any(
+            item.authorized_query_manifest_digest != truth_digest for item in query_rows
+        ):
+            raise V05MetricError(
+                f"query {query_id} truth/authorized manifest binding differs"
+            )
 
     grouped: dict[tuple[str, str, int], list[PredictionRanking]] = {}
     for item in predictions:

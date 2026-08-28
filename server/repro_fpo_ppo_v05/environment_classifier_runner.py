@@ -54,6 +54,10 @@ from policy_learnware_v0.v05.metrics import (
     require_prediction_cell_coverage,
 )
 from policy_learnware_v0.v05.specifications import RFFMap, SWEMap
+from server.repro_fpo_ppo_v05.blind_query_bank import (
+    AuthorizedQueryViews,
+    project_verified_source_banks,
+)
 
 
 Q0_COMMON_GAUSSIAN_OPEN_LOOP = "Q0_COMMON_GAUSSIAN_OPEN_LOOP"
@@ -75,30 +79,14 @@ def _digest(value: Any, where: str) -> str:
     return value
 
 
-def _banks(
-    values: Mapping[str, EpisodeBank], *, expected_episodes: int, role: str
-) -> dict[str, EpisodeBank]:
-    if not isinstance(values, Mapping) or not values:
-        raise V05RunnerError(f"{role} must be a non-empty mapping")
-    result: dict[str, EpisodeBank] = {}
-    for source_id in sorted(values):
-        if not isinstance(source_id, str) or not source_id:
-            raise V05RunnerError(f"{role} source IDs must be non-empty strings")
-        bank = values[source_id]
-        if not isinstance(bank, EpisodeBank):
-            raise V05RunnerError(f"{role} values must be EpisodeBank objects")
-        if bank.episode_count != expected_episodes:
-            raise V05RunnerError(
-                f"{role} must contain exactly {expected_episodes} episodes per source"
-            )
-        result[source_id] = bank
-    return result
-
-
-def _role_bank_digest(values: Mapping[str, EpisodeBank]) -> str:
-    return sha256_json(
-        {source_id: bank.bank_digest for source_id, bank in sorted(values.items())}
-    )
+def _freeze_json(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return MappingProxyType(
+            {key: _freeze_json(item) for key, item in value.items()}
+        )
+    if isinstance(value, list):
+        return tuple(_freeze_json(item) for item in value)
+    return value
 
 
 @dataclass(frozen=True)
@@ -108,6 +96,7 @@ class P0Panel:
     certificate_manifest: CertifiedPolicyManifest
     config_digest: str
     source_binding: Mapping[str, Any]
+    source_role_manifest: Mapping[str, Any]
     bandwidth: float
     raw: RawDeltaRKMENN
     empirical_mmd: EmpiricalMMDNN
@@ -128,6 +117,9 @@ class P0Panel:
         for field in (
             "probe_protocol_digest",
             "normalization_digest",
+            "source_full_bank_digest",
+            "source_parent_asset_binding_digest",
+            "source_role_manifest_digest",
             "source_train_membership_digest",
             "source_validation_membership_digest",
             "source_repeat_membership_digest",
@@ -137,6 +129,55 @@ class P0Panel:
         ):
             binding[field] = _digest(binding.get(field), field)
         object.__setattr__(self, "source_binding", MappingProxyType(binding))
+        if not isinstance(self.source_role_manifest, Mapping):
+            raise V05RunnerError("source_role_manifest must be a mapping")
+        role_manifest = dict(self.source_role_manifest)
+        unsigned_role_manifest = {
+            key: value
+            for key, value in role_manifest.items()
+            if key != "source_role_manifest_digest"
+        }
+        if role_manifest.get("source_role_manifest_digest") != sha256_json(
+            unsigned_role_manifest
+        ):
+            raise V05RunnerError("source role manifest digest changed")
+        try:
+            manifest_binding = {
+                "source_full_bank_digest": role_manifest["full_bank_digest"],
+                "source_parent_asset_binding_digest": role_manifest[
+                    "parent_asset_binding_digest"
+                ],
+                "source_train_membership_digest": role_manifest["roles"][
+                    "source_train"
+                ]["membership_digest"],
+                "source_validation_membership_digest": role_manifest["roles"][
+                    "source_validation"
+                ]["membership_digest"],
+                "source_repeat_membership_digest": role_manifest["roles"][
+                    "source_repeat_report"
+                ]["membership_digest"],
+                "source_train_bank_digest": role_manifest["roles"]["source_train"][
+                    "bank_digest"
+                ],
+                "source_validation_bank_digest": role_manifest["roles"][
+                    "source_validation"
+                ]["bank_digest"],
+                "source_repeat_bank_digest": role_manifest["roles"][
+                    "source_repeat_report"
+                ]["bank_digest"],
+            }
+        except (KeyError, TypeError) as error:
+            raise V05RunnerError("source role manifest is malformed") from error
+        if (
+            role_manifest.get("source_role_manifest_digest")
+            != binding["source_role_manifest_digest"]
+            or any(binding[key] != value for key, value in manifest_binding.items())
+            or role_manifest.get("source_count")
+            != len(self.certificate_manifest.bindings)
+            or set(role_manifest.get("sources", ())) != set(self.resolver.anchor_ids)
+        ):
+            raise V05RunnerError("source role manifest binding differs")
+        object.__setattr__(self, "source_role_manifest", _freeze_json(role_manifest))
         bandwidth = float(self.bandwidth)
         if not math.isfinite(bandwidth) or bandwidth <= 0.0:
             raise V05RunnerError("bandwidth must be finite and positive")
@@ -192,6 +233,7 @@ class P0Panel:
                 self.certificate_manifest.certificate_manifest_digest
             ),
             "source_binding": dict(self.source_binding),
+            "source_role_manifest": self.source_role_manifest,
             "bandwidth": self.bandwidth,
             "model_digests": {
                 RAW_DELTA_RKME: sha256_ndarrays(raw_arrays),
@@ -253,20 +295,16 @@ class P0Panel:
 
 
 def fit_p0_panel(
-    source_train: Mapping[str, EpisodeBank],
-    source_validation: Mapping[str, EpisodeBank],
-    source_repeat: Mapping[str, EpisodeBank],
+    verified_source_banks: Mapping[str, EpisodeBank],
     certificate_manifest: CertifiedPolicyManifest,
     *,
     config_digest: str,
     probe_protocol_digest: str,
     normalization_digest: str,
-    source_train_membership_digest: str,
-    source_validation_membership_digest: str,
-    source_repeat_membership_digest: str,
+    source_parent_asset_sha256: Mapping[str, str],
+    source_parent_membership_digest: Mapping[str, str],
     bandwidth: float,
     expected_source_count: int = 30,
-    expected_episode_counts: tuple[int, int, int] = (19, 6, 7),
     reducer_config: ReducerConfig = ReducerConfig(),
     rff_frequency_count: int = 512,
     rff_seed: int = 50_501,
@@ -276,41 +314,24 @@ def fit_p0_panel(
     logreg_l2_grid: Sequence[float] = (1.0e-4, 1.0e-3, 1.0e-2, 1.0e-1, 1.0),
     krr_ridge_grid: Sequence[float] = (1.0e-6, 1.0e-4, 1.0e-2, 1.0),
 ) -> P0Panel:
-    """Fit every P0 method once on exactly the same source role mappings."""
+    """Project each verified 32-episode source bank, then fit every P0."""
 
-    if len(expected_episode_counts) != 3 or any(
-        isinstance(item, (bool, np.bool_))
-        or not isinstance(item, (int, np.integer))
-        or int(item) <= 0
-        for item in expected_episode_counts
-    ):
-        raise V05RunnerError(
-            "expected_episode_counts must have positive train/validation/repeat integers"
-        )
-    train = _banks(
-        source_train,
-        expected_episodes=int(expected_episode_counts[0]),
-        role="source_train",
-    )
-    validation = _banks(
-        source_validation,
-        expected_episodes=int(expected_episode_counts[1]),
-        role="source_validation",
-    )
-    repeat = _banks(
-        source_repeat,
-        expected_episodes=int(expected_episode_counts[2]),
-        role="source_repeat",
-    )
-    if set(train) != set(validation) or set(train) != set(repeat):
-        raise V05RunnerError("source train/validation/repeat coverage differs")
     if (
         isinstance(expected_source_count, (bool, np.bool_))
         or not isinstance(expected_source_count, (int, np.integer))
         or int(expected_source_count) <= 0
-        or len(train) != int(expected_source_count)
     ):
-        raise V05RunnerError("source panel does not match the frozen market size")
+        raise V05RunnerError("expected_source_count must be a positive integer")
+    projection = project_verified_source_banks(
+        verified_source_banks,
+        parent_asset_sha256=source_parent_asset_sha256,
+        parent_membership_digest=source_parent_membership_digest,
+        expected_source_count=int(expected_source_count),
+    )
+    train = dict(projection.source_train)
+    validation = dict(projection.source_validation)
+    repeat = dict(projection.source_repeat)
+    role_manifest = projection.manifest
     resolver = CertificateResolver(certificate_manifest)
     if set(resolver.anchor_ids) != set(train):
         raise V05RunnerError("certificate/source anchor coverage differs")
@@ -346,25 +367,36 @@ def fit_p0_panel(
             probe_protocol_digest, "probe_protocol_digest"
         ),
         "normalization_digest": normalizer,
-        "source_train_membership_digest": _digest(
-            source_train_membership_digest, "source_train_membership_digest"
-        ),
-        "source_validation_membership_digest": _digest(
-            source_validation_membership_digest,
-            "source_validation_membership_digest",
-        ),
-        "source_repeat_membership_digest": _digest(
-            source_repeat_membership_digest, "source_repeat_membership_digest"
-        ),
-        "source_train_bank_digest": _role_bank_digest(train),
-        "source_validation_bank_digest": _role_bank_digest(validation),
-        "source_repeat_bank_digest": _role_bank_digest(repeat),
-        "episode_counts_per_anchor": list(expected_episode_counts),
+        "source_full_bank_digest": role_manifest["full_bank_digest"],
+        "source_parent_asset_binding_digest": role_manifest[
+            "parent_asset_binding_digest"
+        ],
+        "source_role_manifest_digest": role_manifest["source_role_manifest_digest"],
+        "source_train_membership_digest": role_manifest["roles"]["source_train"][
+            "membership_digest"
+        ],
+        "source_validation_membership_digest": role_manifest["roles"][
+            "source_validation"
+        ]["membership_digest"],
+        "source_repeat_membership_digest": role_manifest["roles"][
+            "source_repeat_report"
+        ]["membership_digest"],
+        "source_train_bank_digest": role_manifest["roles"]["source_train"][
+            "bank_digest"
+        ],
+        "source_validation_bank_digest": role_manifest["roles"]["source_validation"][
+            "bank_digest"
+        ],
+        "source_repeat_bank_digest": role_manifest["roles"]["source_repeat_report"][
+            "bank_digest"
+        ],
+        "episode_counts_per_anchor": [19, 6, 7],
     }
     return P0Panel(
         certificate_manifest=certificate_manifest,
         config_digest=config_digest,
         source_binding=source_binding,
+        source_role_manifest=role_manifest,
         bandwidth=bandwidth,
         raw=RawDeltaRKMENN.fit(
             train,
@@ -417,54 +449,72 @@ def _posterior(scores: Mapping[str, float]) -> dict[str, float]:
 
 def score_query(
     panel: P0Panel,
-    query_bank: EpisodeBank,
+    query_views: AuthorizedQueryViews,
     *,
-    opaque_query_id: str,
-    candidate_anchor_ids: Sequence[str],
-    probe_protocol_digest: str,
-    reward_free_bank_sha256: str,
-    target_membership_digest: str,
-    normalization_digest: str,
-    budgets: Sequence[int] = BUDGET_EPISODES,
+    budgets: Sequence[int] | None = None,
     expected_task_candidate_count: int = 5,
 ) -> tuple[tuple[PredictionRanking, ...], tuple[dict[str, Any], ...]]:
-    """Compute 30-way scores, then aggregate B, apply masks, and break ties."""
+    """Score only verified public views, then apply masks and break ties."""
 
-    if not isinstance(panel, P0Panel) or not isinstance(query_bank, EpisodeBank):
+    if not isinstance(panel, P0Panel) or not isinstance(
+        query_views, AuthorizedQueryViews
+    ):
         raise V05RunnerError("panel/query types are invalid")
+    opaque_query_id = query_views.opaque_query_id
     if (
         not isinstance(opaque_query_id, str)
         or _OPAQUE_QUERY_ID.fullmatch(opaque_query_id) is None
     ):
         raise V05RunnerError("opaque_query_id must match q-[0-9a-f]{20,64}")
+    manifest = query_views.manifest
     target_binding = {
         "probe_protocol_digest": _digest(
-            probe_protocol_digest, "probe_protocol_digest"
+            manifest.get("probe_protocol_digest"), "probe_protocol_digest"
         ),
         "reward_free_bank_sha256": _digest(
-            reward_free_bank_sha256, "reward_free_bank_sha256"
+            manifest.get("reward_free_bank_sha256"), "reward_free_bank_sha256"
         ),
         "target_membership_digest": _digest(
-            target_membership_digest, "target_membership_digest"
+            manifest.get("target_membership_digest"), "target_membership_digest"
         ),
-        "normalization_digest": _digest(normalization_digest, "normalization_digest"),
+        "normalization_digest": _digest(
+            manifest.get("normalization_digest"), "normalization_digest"
+        ),
+        "authorized_query_manifest_digest": _digest(
+            manifest.get("manifest_digest"), "authorized_query_manifest_digest"
+        ),
     }
     if (
         target_binding["probe_protocol_digest"]
         != panel.source_binding["probe_protocol_digest"]
         or target_binding["normalization_digest"]
         != panel.source_binding["normalization_digest"]
+        or manifest.get("certificate_manifest_digest")
+        != panel.certificate_manifest.certificate_manifest_digest
     ):
-        raise V05RunnerError("source/target common-probe or normalization differs")
+        raise V05RunnerError(
+            "source/target common-probe, normalization, or certificate differs"
+        )
     source_ids = tuple(panel.resolver.anchor_ids)
-    candidates = tuple(candidate_anchor_ids)
+    if manifest.get("market_order_digest") != sha256_json(list(source_ids)):
+        raise V05RunnerError("authorized candidate mask uses another market order")
+    raw_mask = manifest.get("candidate_mask")
+    if (
+        not isinstance(raw_mask, list)
+        or len(raw_mask) != len(source_ids)
+        or any(type(item) is not bool for item in raw_mask)
+    ):
+        raise V05RunnerError("authorized candidate mask is malformed")
+    candidates = tuple(
+        source_id
+        for source_id, allowed in zip(source_ids, raw_mask, strict=True)
+        if allowed
+    )
     if (
         isinstance(expected_task_candidate_count, (bool, np.bool_))
         or not isinstance(expected_task_candidate_count, (int, np.integer))
         or int(expected_task_candidate_count) <= 0
         or len(candidates) != int(expected_task_candidate_count)
-        or len(candidates) != len(set(candidates))
-        or not set(candidates).issubset(source_ids)
     ):
         raise V05RunnerError("TASK candidate mask has the wrong size or coverage")
     candidate_records = [panel.resolver.record_for_anchor(item) for item in candidates]
@@ -479,6 +529,12 @@ def score_query(
     }
     if set(candidates) != complete_candidate_group:
         raise V05RunnerError("TASK candidate mask is not the complete task/ABI group")
+    if manifest.get("execution_abi_digest") != candidate_abi or manifest.get(
+        "task_scope_digest"
+    ) != sha256_json(
+        {"task_id": candidate_task, "execution_abi_digest": candidate_abi}
+    ):
+        raise V05RunnerError("authorized task/ABI binding differs")
     labels = {
         item.source_anchor_id: item.opaque_certified_policy_id
         for item in panel.certificate_manifest.bindings
@@ -488,24 +544,44 @@ def score_query(
     source_model_manifest_digest = panel.source_model_manifest[
         "source_model_manifest_digest"
     ]
-    for raw_budget in budgets:
+    selected_budgets = (
+        query_views.authorized_budgets if budgets is None else tuple(budgets)
+    )
+    if selected_budgets != query_views.authorized_budgets:
+        raise V05RunnerError("runner budgets differ from the authorized query subset")
+    for raw_budget in selected_budgets:
         if isinstance(raw_budget, (bool, np.bool_)) or not isinstance(
             raw_budget, (int, np.integer)
         ):
             raise V05RunnerError("budgets must contain only discrete integers")
         ledger = BudgetLedger.for_budget(int(raw_budget))
-        if ledger.budget_episodes > query_bank.episode_count:
-            raise V05RunnerError("query bank lacks the requested nested budget")
-        query = query_bank.prefix(ledger.budget_episodes)
-        rff_spec = panel.rff.rff_map.embed(query.points, query.episode_offsets)
-        swe_spec = panel.swe.swe_map.embed(query.points, query.episode_offsets)
+        raw_query = query_views.bank_for(RAW_DELTA_RKME, ledger.budget_episodes)
+        empirical_query = query_views.bank_for(EMPIRICAL_MMD_NN, ledger.budget_episodes)
+        krr_query = query_views.bank_for(KME_KRR, ledger.budget_episodes)
+        canonical_budget_bank_digest = query_views.canonical_bank_digest_for_budget(
+            ledger.budget_episodes
+        )
+        if {
+            raw_query.bank_digest,
+            empirical_query.bank_digest,
+            krr_query.bank_digest,
+        } != {canonical_budget_bank_digest}:
+            raise V05RunnerError(
+                "authorized method views differ from the canonical budget bank"
+            )
         full_scores = {
-            RAW_DELTA_RKME: panel.raw.score(query),
-            EMPIRICAL_MMD_NN: panel.empirical_mmd.score(query),
-            SUMMARY_LOGREG: panel.summary_logreg.score(query),
-            KME_KRR: panel.kme_krr.score(query),
-            RFF_KME_NN: panel.rff.score_specification(rff_spec),
-            SWE_NN: panel.swe.score_specification(swe_spec),
+            RAW_DELTA_RKME: panel.raw.score(raw_query),
+            EMPIRICAL_MMD_NN: panel.empirical_mmd.score(empirical_query),
+            SUMMARY_LOGREG: panel.summary_logreg.score_summaries(
+                query_views.summaries_for(ledger.budget_episodes)
+            ),
+            KME_KRR: panel.kme_krr.score(krr_query),
+            RFF_KME_NN: panel.rff.score_specification(
+                query_views.rff_specs[ledger.budget_episodes]
+            ),
+            SWE_NN: panel.swe.score_specification(
+                query_views.swe_specs[ledger.budget_episodes]
+            ),
         }
         for method_id in P0_METHOD_IDS:
             method_scores = full_scores[method_id]
@@ -551,7 +627,7 @@ def score_query(
                         reward_free_bank_sha256=target_binding[
                             "reward_free_bank_sha256"
                         ],
-                        canonical_query_bank_digest=query.bank_digest,
+                        canonical_query_bank_digest=canonical_budget_bank_digest,
                         source_train_membership_digest=panel.source_binding[
                             "source_train_membership_digest"
                         ],
@@ -567,6 +643,9 @@ def score_query(
                         normalization_digest=target_binding["normalization_digest"],
                         config_digest=panel.config_digest,
                         source_model_manifest_digest=source_model_manifest_digest,
+                        authorized_query_manifest_digest=target_binding[
+                            "authorized_query_manifest_digest"
+                        ],
                     )
                 )
                 score_rows.append(
@@ -575,11 +654,15 @@ def score_query(
                         "endpoint": endpoint,
                         "budget_episodes": ledger.budget_episodes,
                         "opaque_query_id": opaque_query_id,
-                        "scores_before_mask": dict(sorted(method_scores.items())),
+                        "scores_before_mask": [
+                            float(anchor_scores[source_id]) for source_id in source_ids
+                        ],
                         "source_binding": dict(panel.source_binding),
                         "target_binding": {
                             **target_binding,
-                            "canonical_query_bank_digest": query.bank_digest,
+                            "canonical_query_bank_digest": (
+                                canonical_budget_bank_digest
+                            ),
                         },
                         "ledger": ledger.to_dict(),
                     }
@@ -590,10 +673,12 @@ def score_query(
 def seal_prediction_rows(
     rankings: Iterable[PredictionRanking],
     *,
-    expected_budgets: Sequence[int] = BUDGET_EPISODES,
+    expected_budgets: Sequence[int] | None = None,
 ) -> tuple[dict[str, Any], RankingSeal]:
     """The only runner exit toward evaluation: canonical truth-free bytes + seal."""
 
+    if expected_budgets is None:
+        raise V05RunnerError("seal requires the explicit authorized budget subset")
     rows = require_prediction_cell_coverage(
         rankings,
         expected_method_ids=P0_METHOD_IDS,

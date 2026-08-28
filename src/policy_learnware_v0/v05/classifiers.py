@@ -558,12 +558,21 @@ class SummaryLogReg:
         query = _bank(query_bank)
         if query.input_dim != self.input_dim:
             raise V05ClassifierError("Summary query point width differs from fit")
-        summaries = _episode_summaries(query)
+        return self.logits_from_summaries(_episode_summaries(query))
+
+    def logits_from_summaries(self, summaries: Any) -> np.ndarray:
+        summaries = _readonly_numeric(summaries, ndim=2, where="episode summaries")
+        if summaries.shape[1] != self.feature_mean.size:
+            raise V05ClassifierError("Summary view width differs from fit")
         standardized = (summaries - self.feature_mean) / self.feature_scale
         return standardized @ self.weights + self.intercept
 
     def score(self, query_bank: EpisodeBank | tuple[Any, Any]) -> dict[str, float]:
         logits = np.mean(self.episode_logits(query_bank), axis=0)
+        return _finite_scores(dict(zip(self.class_ids, logits, strict=True)))
+
+    def score_summaries(self, summaries: Any) -> dict[str, float]:
+        logits = np.mean(self.logits_from_summaries(summaries), axis=0)
         return _finite_scores(dict(zip(self.class_ids, logits, strict=True)))
 
     def save_npz(self, path: str | Path, *, overwrite: bool = False) -> str:

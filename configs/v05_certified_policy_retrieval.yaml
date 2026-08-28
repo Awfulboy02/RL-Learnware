@@ -114,4 +114,10 @@ ranking:
 
 privacy:
   formal_dp: false
-  claim: specification_mediated_raw_data_non_disclosure_and_data_minimization_only
+  claim: reward_policy_label_channel_exclusion_and_role_separation
+  method_scope:
+    RFF_KME_NN: fixed_vector_raw_non_disclosure_interface_only
+    SWE_NN: fixed_vector_raw_non_disclosure_interface_only
+    RAW_DELTA_RKME: source_reduced_target_full_support_or_local_scoring
+    EMPIRICAL_MMD_NN: full_support_control
+    KME_KRR: full_support_control
