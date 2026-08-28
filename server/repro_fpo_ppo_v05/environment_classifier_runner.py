@@ -2707,6 +2707,7 @@ def _validate_development_batch(
         raise V05RunnerError("global prediction panel is not exactly 30x36")
     ranking_by_cell = {item.cell_key: item for item in rows}
     source_order = tuple(panel.resolver.anchor_ids)
+    expected_source_binding_digest = sha256_json(dict(panel.source_binding))
     normalized_scores: list[dict[str, Any]] = []
     ledgers: dict[str, Any] = {}
     seen_score_cells: set[tuple[str, str, int, str]] = set()
@@ -2758,7 +2759,8 @@ def _validate_development_batch(
             ranking is None
             or len(scores) != 30
             or any(not math.isfinite(float(value)) for value in scores)
-            or row["source_binding"] != dict(panel.source_binding)
+            or not isinstance(row["source_binding"], Mapping)
+            or sha256_json(row["source_binding"]) != expected_source_binding_digest
             or row["ledger"] != ledger
             or row["score_vector_digest"] != score_digest
             or ranking.score_vector_digest != score_digest

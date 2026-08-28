@@ -4,6 +4,7 @@ from collections.abc import Mapping
 from dataclasses import replace
 import hashlib
 import inspect
+import json
 import shutil
 from types import SimpleNamespace
 from pathlib import Path
@@ -1817,3 +1818,122 @@ def test_completed_source_fit_checkpoint_closure_is_immutable_on_resume(
                 resume=True,
             )
         assert write_attempts == [], name
+
+    source_order = tuple(panel.resolver.anchor_ids)
+    policy_order = tuple(
+        panel.resolver.record_for_anchor(anchor).opaque_certified_policy_id
+        for anchor in source_order
+    )
+    query_ids = tuple(f"q-{index:064x}" for index in range(30))
+    query_manifests = {
+        query_id: _digest(f"source-binding-manifest-{query_id}")
+        for query_id in query_ids
+    }
+    index = {"queries": query_manifests}
+    predictions = []
+    score_rows = []
+    source_model_digest = panel.source_model_manifest["source_model_manifest_digest"]
+    for query_id in query_ids:
+        reward_free_digest = _digest(f"source-binding-reward-free-{query_id}")
+        target_membership_digest = _digest(
+            f"source-binding-target-membership-{query_id}"
+        )
+        for method_id in P0_METHOD_IDS:
+            for budget in (1, 2, 4):
+                scores = [float(index) for index in range(30)]
+                score_digest = sha256_json(
+                    {
+                        "method_id": method_id,
+                        "budget_episodes": budget,
+                        "opaque_query_id": query_id,
+                        "source_order": list(source_order),
+                        "scores_before_mask": scores,
+                    }
+                )
+                ledger = BudgetLedger.for_budget(budget).to_dict()
+                ledger_digest = sha256_json(ledger)
+                canonical_bank_digest = _digest(
+                    f"source-binding-canonical-{query_id}-{budget}"
+                )
+                target_binding = {
+                    "probe_protocol_digest": panel.source_binding[
+                        "probe_protocol_digest"
+                    ],
+                    "reward_free_bank_sha256": reward_free_digest,
+                    "target_membership_digest": target_membership_digest,
+                    "normalization_digest": panel.source_binding[
+                        "normalization_digest"
+                    ],
+                    "authorized_query_manifest_digest": query_manifests[query_id],
+                    "canonical_query_bank_digest": canonical_bank_digest,
+                }
+                for endpoint, ranked_anchors, ranked_policies in (
+                    (MARKET_30_CERT, source_order, policy_order),
+                    (TASK_5_CERT, source_order[:5], policy_order[:5]),
+                ):
+                    predictions.append(
+                        PredictionRanking(
+                            method_id=method_id,
+                            endpoint=endpoint,
+                            budget_episodes=budget,
+                            opaque_query_id=query_id,
+                            ranked_anchor_ids=ranked_anchors,
+                            ranked_policy_ids=ranked_policies,
+                            probe_protocol_digest=panel.source_binding[
+                                "probe_protocol_digest"
+                            ],
+                            reward_free_bank_sha256=reward_free_digest,
+                            canonical_query_bank_digest=canonical_bank_digest,
+                            source_train_membership_digest=panel.source_binding[
+                                "source_train_membership_digest"
+                            ],
+                            source_validation_membership_digest=panel.source_binding[
+                                "source_validation_membership_digest"
+                            ],
+                            target_membership_digest=target_membership_digest,
+                            normalization_digest=panel.source_binding[
+                                "normalization_digest"
+                            ],
+                            config_digest=panel.config_digest,
+                            source_model_manifest_digest=source_model_digest,
+                            authorized_query_manifest_digest=query_manifests[query_id],
+                            score_vector_digest=score_digest,
+                            budget_ledger_digest=ledger_digest,
+                        )
+                    )
+                    score_rows.append(
+                        {
+                            "method_id": method_id,
+                            "endpoint": endpoint,
+                            "budget_episodes": budget,
+                            "opaque_query_id": query_id,
+                            "scores_before_mask": scores,
+                            "source_binding": dict(panel.source_binding),
+                            "target_binding": target_binding,
+                            "ledger": ledger,
+                            "score_vector_digest": score_digest,
+                            "budget_ledger_digest": ledger_digest,
+                        }
+                    )
+
+    assert panel.source_binding["episode_counts_per_anchor"] == (19, 6)
+    serialized_rows = json.loads(canonical_json_bytes(score_rows))
+    assert serialized_rows[0]["source_binding"]["episode_counts_per_anchor"] == [
+        19,
+        6,
+    ]
+    validated = runner_module._validate_development_batch(
+        panel, index, predictions, serialized_rows
+    )
+    assert len(validated[0]) == len(validated[1]) == 1080
+
+    bad_counts = json.loads(canonical_json_bytes(serialized_rows))
+    bad_counts[0]["source_binding"]["episode_counts_per_anchor"] = [19, 7]
+    with pytest.raises(V05RunnerError):
+        runner_module._validate_development_batch(panel, index, predictions, bad_counts)
+    bad_digest = json.loads(canonical_json_bytes(serialized_rows))
+    bad_digest[0]["source_binding"]["source_train_bank_digest"] = _digest(
+        "tampered-source-train-bank"
+    )
+    with pytest.raises(V05RunnerError):
+        runner_module._validate_development_batch(panel, index, predictions, bad_digest)
