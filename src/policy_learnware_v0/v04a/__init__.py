@@ -1,0 +1,63 @@
+"""v0.4a Bayesian policy-reuse fixed-probe primitives."""
+
+from .bpr import (
+    BPRGaussianModel,
+    BPRModelError,
+    episode_summaries,
+    episode_summary,
+    summarize_episode,
+    summarize_probe,
+)
+from .ebpr import (
+    EBPRError,
+    EBPRFixedProbe,
+    EBPRSelection,
+    EBPR_HYBRID_METHOD_ID,
+    EBPR_METHOD_ID,
+    TransitionEpisode,
+)
+from .protocol import (
+    BUDGET_EPISODES,
+    BudgetLedger,
+    ProbeMembership,
+    RankingSeal,
+    RewardFreeProbe,
+    TransitionIndex,
+    V04AProtocolError,
+    break_tie,
+    canonical_tie_token,
+    derive_probe_membership,
+    seal_rankings,
+    stable_argmax,
+    tie_break_key,
+    verify_ranking_seal,
+)
+
+__all__ = [
+    "BPRGaussianModel",
+    "BPRModelError",
+    "BUDGET_EPISODES",
+    "BudgetLedger",
+    "EBPRError",
+    "EBPRFixedProbe",
+    "EBPRSelection",
+    "EBPR_HYBRID_METHOD_ID",
+    "EBPR_METHOD_ID",
+    "ProbeMembership",
+    "RankingSeal",
+    "RewardFreeProbe",
+    "TransitionIndex",
+    "TransitionEpisode",
+    "V04AProtocolError",
+    "break_tie",
+    "canonical_tie_token",
+    "derive_probe_membership",
+    "episode_summaries",
+    "episode_summary",
+    "seal_rankings",
+    "stable_argmax",
+    "summarize_episode",
+    "summarize_probe",
+    "tie_break_key",
+    "verify_ranking_seal",
+]

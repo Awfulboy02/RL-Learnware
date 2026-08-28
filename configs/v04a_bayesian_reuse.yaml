@@ -1,0 +1,46 @@
+schema: policy-learnware.v04a-config.v0
+version: 0.4a.0
+plan_sha256: d1860c1418fe807bf640e9cfb8a816b7f58e8797db76345af212796fa6d487c0
+scope: development
+
+candidate_scope: TASK_5
+budgets: [1, 2, 4, 8, 16, 24, 32]
+split_seed: 40401
+transitions_per_episode: 64
+interaction_steps_per_episode: 1000
+
+source_split:
+  train_episodes: 19
+  validation_episodes: 6
+  repeat_report_episodes: 7
+
+source_utility_split:
+  train_episodes: 30
+  validation_episodes: 10
+  repeat_report_episodes: 10
+
+bpr:
+  shrinkage_grid: [0.0, 0.25, 0.5, 0.75, 1.0]
+  variance_floor_grid: [0.0001, 0.001, 0.01]
+  temperature_grid: [0.1, 0.25, 0.5, 1.0]
+
+ebpr:
+  hidden_dim: 64
+  ridge: 0.001
+  feature_seed: 40402
+  variance_floor_grid: [0.0001, 0.001, 0.01]
+  temperature_grid: [0.01, 0.03, 0.1, 0.3, 1.0]
+
+controls:
+  enable_hybrid: true
+  epsilon_optimal: 0.01
+  posterior_confidence_threshold: 0.8
+  hierarchical_bootstrap_replicates: 2000
+  hierarchical_bootstrap_seed: 40403
+
+deferred:
+  - P4_CONTROLS
+  - P4_FULL_TRANSITION_SENSITIVITY
+  - BPR_SEQ
+  - EBPR_SEQ
+  - confirmatory
