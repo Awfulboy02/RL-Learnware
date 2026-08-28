@@ -40,8 +40,8 @@ from policy_learnware_v0.io import (
     read_json,
 )
 from policy_learnware_v0.policy.bundle import BundleValidationError, validate_bundle
+from policy_learnware_v0.policy.evaluate import verify_compiled_policy_parity
 from policy_learnware_v0.policy.loader import load_policy
-from policy_learnware_v0.policy.parity import verify_golden_parity
 from policy_learnware_v0.rkme.reducer import ReducedRKME
 from policy_learnware_v0.v03.source_market import (
     SourceMarketError,
@@ -91,6 +91,10 @@ from server.repro_fpo_ppo_v03.signal_bank_runner import (
     _source_partition as _v031_source_partition,
     _subset as _signal_subset,
 )
+from server.repro_fpo_ppo_v02.provenance import (
+    ContractError as V02ContractError,
+    validate_success_record,
+)
 
 
 SCHEMA = "policy-learnware.v04a-fixed-probe-run.v1"
@@ -121,6 +125,31 @@ LOGGER_FIELDS = (
     "episode_count",
     "steps_per_episode",
 )
+
+# The v02 exporter hard-gated its same-runtime golden replay at 1e-6.  The
+# frozen v03 source-market later showed that those float32 action bytes are not
+# portable across otherwise valid JAX/XLA backends: its 70 recorded replays
+# (aggregate SHA below) reached 2.27e-2 before tanh and 5.39e-3 after tanh,
+# while every scalar/compiled deployment comparison remained below 7.75e-7.
+# Keep the origin receipt and current compiled path strict; use this versioned
+# envelope only for the explicitly cross-backend diagnostic.
+ORIGIN_PARITY_ATOL = 1.0e-6
+ORIGIN_PARITY_RTOL = 1.0e-6
+COMPILED_PARITY_SAMPLE_COUNT = 2
+CROSS_BACKEND_PARITY = {
+    "version": "v03-selected-market-f32-v1",
+    "dtype": "float32",
+    "raw_atol": 2.5e-2,
+    "environment_atol": 6.0e-3,
+    "rtol": 1.0e-5,
+    "evidence_file_count": 70,
+    "evidence_aggregate_sha256": (
+        "7892455fae56637dbc44c0bdd969cfc7c7182ec67af5a4db3b71b1d961911089"
+    ),
+    "observed_raw_max_abs_error": 2.269744873046875e-2,
+    "observed_environment_max_abs_error": 5.387336015701294e-3,
+    "observed_compiled_max_abs_error": 7.748603820800781e-7,
+}
 
 
 class V04ARunnerError(RuntimeError):
@@ -592,6 +621,269 @@ def _raw_root(root: Path) -> Path:
     )
 
 
+def _origin_parity_receipt(metadata: Any) -> dict[str, Any]:
+    """Verify the immutable v02 same-runtime parity receipt for one bundle."""
+
+    attempt_root = metadata.bundle_dir.parents[1]
+    record_path = attempt_root / "training_record.json"
+    status_path = attempt_root / "status.json"
+    if any(
+        path.is_symlink() or not path.is_file() for path in (record_path, status_path)
+    ):
+        raise GateFailure(
+            "NO_GO_MARKET_OR_TASK5_ABI",
+            f"origin parity receipt is absent for {metadata.bundle_dir}",
+        )
+    try:
+        record = validate_success_record(
+            record_path,
+            expected_job_digest=str(metadata.provenance["job_digest"]),
+            expected_attempt_digest=str(metadata.provenance["attempt_digest"]),
+            expected_anchor_manifest_digest=str(
+                metadata.provenance["anchor_manifest_digest"]
+            ),
+            expected_environment_instance_digest=str(
+                metadata.provenance["environment_instance_digest"]
+            ),
+            expected_config_digest=str(metadata.provenance["config_digest"]),
+            expected_execution_purpose=str(metadata.provenance["execution_purpose"]),
+        )
+    except (KeyError, V02ContractError) as error:
+        raise GateFailure(
+            "NO_GO_MARKET_OR_TASK5_ABI",
+            f"origin training receipt is invalid for {metadata.bundle_dir}: {error}",
+        ) from error
+    record_digest = record["record_digest"]
+    status = _json(status_path)
+    if (
+        status.get("state") != "completed"
+        or status.get("training_record_digest") != record_digest
+        or status.get("promoted_outer_iteration") != metadata.outer_iteration
+        or status.get("promoted_environment_steps") != metadata.environment_steps
+    ):
+        raise GateFailure(
+            "NO_GO_MARKET_OR_TASK5_ABI",
+            f"origin training status differs for {metadata.bundle_dir}",
+        )
+    checkpoints = record.get("checkpoint_bundles")
+    bundle_root = metadata.bundle_dir.resolve()
+    matching = [
+        row
+        for row in checkpoints
+        if isinstance(row, Mapping)
+        and Path(str(row.get("path", ""))).resolve() == bundle_root
+    ]
+    if len(matching) != 1 or matching[0].get("bundle_digest") != metadata.bundle_digest:
+        raise GateFailure(
+            "NO_GO_MARKET_OR_TASK5_ABI",
+            f"origin checkpoint identity differs for {metadata.bundle_dir}",
+        )
+    checkpoint = matching[0]
+    golden = checkpoint.get("golden_parity")
+    compiled = checkpoint.get("compiled_parity")
+    assert isinstance(golden, Mapping) and isinstance(compiled, Mapping)
+    if (
+        golden.get("passed") is not True
+        or golden.get("raw_checked") is not True
+        or golden.get("sample_count") != 8
+        or float(golden.get("atol", float("nan"))) != ORIGIN_PARITY_ATOL
+        or float(golden.get("rtol", float("nan"))) != ORIGIN_PARITY_RTOL
+        or compiled.get("passed") is not True
+        or compiled.get("next_keys_equal") is not True
+        or float(compiled.get("atol", float("nan"))) != ORIGIN_PARITY_ATOL
+        or float(compiled.get("rtol", float("nan"))) != ORIGIN_PARITY_RTOL
+    ):
+        raise GateFailure(
+            "NO_GO_MARKET_OR_TASK5_ABI",
+            f"origin parity did not pass the frozen 1e-6 gate for {metadata.bundle_dir}",
+        )
+    return {
+        "status": "PASS",
+        "training_record_sha256": sha256_file(record_path),
+        "training_record_digest": record_digest,
+        "golden_report_digest": golden["report_digest"],
+        "compiled_report_digest": compiled["report_digest"],
+        "atol": ORIGIN_PARITY_ATOL,
+        "rtol": ORIGIN_PARITY_RTOL,
+    }
+
+
+def _restore_policy_key(key_data: np.ndarray) -> Any:
+    import jax
+
+    wrap = getattr(jax.random, "wrap_key_data", None)
+    return wrap(key_data) if wrap is not None else key_data
+
+
+def _policy_key_data(key: Any) -> np.ndarray:
+    import jax
+
+    return np.asarray(jax.device_get(jax.random.key_data(key)))
+
+
+def _symmetric_relative_error(actual: np.ndarray, expected: np.ndarray) -> float:
+    delta = np.abs(actual.astype(np.float64) - expected.astype(np.float64))
+    scale = np.maximum(
+        np.maximum(
+            np.abs(actual.astype(np.float64)), np.abs(expected.astype(np.float64))
+        ),
+        np.finfo(np.float32).eps,
+    )
+    return float(np.max(delta / scale, initial=0.0))
+
+
+def _deployment_action_audit(policy: Any, metadata: Any) -> dict[str, Any]:
+    """Audit current deterministic deployment semantics without bitwise host affinity."""
+
+    with np.load(metadata.bundle_dir / "golden_io.npz", allow_pickle=False) as archive:
+        observation = np.asarray(archive["observation"])
+        key_data = np.asarray(archive["prng_key_data"])
+        expected_raw = np.asarray(archive["raw_action"])
+        expected_environment = np.asarray(archive["environment_action"])
+    if any(
+        array.dtype != np.dtype(np.float32)
+        for array in (observation, expected_raw, expected_environment)
+    ):
+        raise GateFailure(
+            "NO_GO_MARKET_OR_TASK5_ABI",
+            f"golden deployment arrays are not float32 for {metadata.bundle_dir}",
+        )
+    key = _restore_policy_key(key_data)
+    raw_first, raw_next_first = policy.act_raw(observation, key, deterministic=True)
+    raw_second, raw_next_second = policy.act_raw(observation, key, deterministic=True)
+    environment, environment_next = policy.act(observation, key, deterministic=True)
+    actual_raw = np.asarray(raw_first)
+    repeated_raw = np.asarray(raw_second)
+    actual_environment = np.asarray(environment)
+    if (
+        actual_raw.shape != expected_raw.shape
+        or actual_environment.shape != expected_environment.shape
+        or actual_raw.dtype != np.dtype(np.float32)
+        or actual_environment.dtype != np.dtype(np.float32)
+        or not np.all(np.isfinite(actual_raw))
+        or not np.all(np.isfinite(actual_environment))
+        or not np.array_equal(actual_raw, repeated_raw)
+        or not np.array_equal(
+            _policy_key_data(raw_next_first), _policy_key_data(raw_next_second)
+        )
+        or not np.array_equal(
+            _policy_key_data(raw_next_first), _policy_key_data(environment_next)
+        )
+        or np.any(actual_environment < -1.0)
+        or np.any(actual_environment > 1.0)
+        or not np.allclose(
+            actual_environment,
+            np.tanh(actual_raw),
+            atol=ORIGIN_PARITY_ATOL,
+            rtol=ORIGIN_PARITY_RTOL,
+        )
+    ):
+        raise GateFailure(
+            "NO_GO_MARKET_OR_TASK5_ABI",
+            f"current deterministic deployment action invariants failed for {metadata.bundle_dir}",
+        )
+    compiled = verify_compiled_policy_parity(
+        policy,
+        observation,
+        key_data,
+        atol=ORIGIN_PARITY_ATOL,
+        rtol=ORIGIN_PARITY_RTOL,
+        sample_count=COMPILED_PARITY_SAMPLE_COUNT,
+    )
+    if not compiled.passed or not compiled.next_keys_equal:
+        raise GateFailure(
+            "NO_GO_MARKET_OR_TASK5_ABI",
+            f"current scalar/compiled deployment parity failed for {metadata.bundle_dir}",
+            details={
+                "max_abs_error": compiled.max_abs_error,
+                "sample_count": compiled.sample_count,
+            },
+        )
+    raw_delta = np.abs(actual_raw.astype(np.float64) - expected_raw.astype(np.float64))
+    environment_delta = np.abs(
+        actual_environment.astype(np.float64) - expected_environment.astype(np.float64)
+    )
+    raw_max_abs = float(np.max(raw_delta, initial=0.0))
+    environment_max_abs = float(np.max(environment_delta, initial=0.0))
+    cross_backend_compatible = bool(
+        np.allclose(
+            actual_raw,
+            expected_raw,
+            atol=float(CROSS_BACKEND_PARITY["raw_atol"]),
+            rtol=float(CROSS_BACKEND_PARITY["rtol"]),
+        )
+        and np.allclose(
+            actual_environment,
+            expected_environment,
+            atol=float(CROSS_BACKEND_PARITY["environment_atol"]),
+            rtol=float(CROSS_BACKEND_PARITY["rtol"]),
+        )
+    )
+    if not cross_backend_compatible:
+        raise GateFailure(
+            "NO_GO_MARKET_OR_TASK5_ABI",
+            f"cross-backend action drift exceeds the frozen compatibility envelope for {metadata.bundle_dir}",
+            details={
+                "raw_max_abs_error": raw_max_abs,
+                "environment_max_abs_error": environment_max_abs,
+                "compatibility": CROSS_BACKEND_PARITY,
+            },
+        )
+    exact_golden = bool(
+        np.allclose(
+            actual_raw,
+            expected_raw,
+            atol=ORIGIN_PARITY_ATOL,
+            rtol=ORIGIN_PARITY_RTOL,
+        )
+        and np.allclose(
+            actual_environment,
+            expected_environment,
+            atol=ORIGIN_PARITY_ATOL,
+            rtol=ORIGIN_PARITY_RTOL,
+        )
+    )
+    try:
+        import jax
+
+        runtime = {
+            "backend": jax.default_backend(),
+            "device_kind": str(jax.devices()[0].device_kind),
+            "x64_enabled": bool(jax.config.jax_enable_x64),
+            "default_matmul_precision": str(jax.config.jax_default_matmul_precision),
+            "default_prng_impl": str(jax.config.jax_default_prng_impl),
+        }
+    except (AttributeError, ImportError, RuntimeError):
+        runtime = {"backend": "unavailable"}
+    return {
+        "status": "PASS" if exact_golden else "WARNING_CROSS_BACKEND_COMPATIBLE",
+        "current_backend_deterministic_repeat": True,
+        "deployment_transform_matches": True,
+        "compiled_parity": {
+            "status": "PASS",
+            "max_abs_error": compiled.max_abs_error,
+            "next_keys_equal": compiled.next_keys_equal,
+            "sample_count": compiled.sample_count,
+            "atol": compiled.atol,
+            "rtol": compiled.rtol,
+        },
+        "cross_backend_golden_diagnostic": {
+            "exact_origin_tolerance_passed": exact_golden,
+            "compatibility_envelope_passed": True,
+            "raw_max_abs_error": raw_max_abs,
+            "raw_max_relative_error": _symmetric_relative_error(
+                actual_raw, expected_raw
+            ),
+            "environment_max_abs_error": environment_max_abs,
+            "environment_max_relative_error": _symmetric_relative_error(
+                actual_environment, expected_environment
+            ),
+            "compatibility": CROSS_BACKEND_PARITY,
+        },
+        "runtime": runtime,
+    }
+
+
 def inspect_assets(
     *,
     context_index: Path,
@@ -705,12 +997,15 @@ def inspect_assets(
                     expected_environment_steps=private.environment_steps,
                     runtime_only=True,
                 )
+                origin_parity = _origin_parity_receipt(metadata)
                 policy = load_policy(
                     metadata,
                     fpo_root=fpo_root,
                     runtime_only=True,
                 )
-                parity = verify_golden_parity(policy, metadata)
+                deployment_audit = _deployment_action_audit(policy, metadata)
+            except GateFailure:
+                raise
             except (
                 BundleValidationError,
                 ImportError,
@@ -722,24 +1017,6 @@ def inspect_assets(
                     "NO_GO_MARKET_OR_TASK5_ABI",
                     f"policy bundle validation/parity failed for {opaque}: {error}",
                 ) from error
-            if (
-                not parity.passed
-                or not parity.raw_checked
-                or parity.sample_count != 8
-                or parity.raw_max_abs_error is None
-                or not math.isfinite(parity.raw_max_abs_error)
-                or not math.isfinite(parity.environment_max_abs_error)
-            ):
-                raise GateFailure(
-                    "NO_GO_MARKET_OR_TASK5_ABI",
-                    f"deterministic golden action parity failed for {opaque}",
-                    details={
-                        "raw_checked": parity.raw_checked,
-                        "raw_max_abs_error": parity.raw_max_abs_error,
-                        "environment_max_abs_error": (parity.environment_max_abs_error),
-                        "sample_count": parity.sample_count,
-                    },
-                )
             if metadata.bundle_digest != private.bundle_digest:
                 raise GateFailure(
                     "NO_GO_MARKET_OR_TASK5_ABI",
@@ -761,15 +1038,8 @@ def inspect_assets(
                 "action_dim": metadata.action_dim,
                 "execution_abi_digest": private.execution_abi.digest,
                 "bundle_structure_and_normalizer_payload_verified": True,
-                "deterministic_golden_action_parity": {
-                    "status": "PASS",
-                    "raw_checked": parity.raw_checked,
-                    "raw_max_abs_error": parity.raw_max_abs_error,
-                    "environment_max_abs_error": parity.environment_max_abs_error,
-                    "atol": parity.atol,
-                    "rtol": parity.rtol,
-                    "sample_count": parity.sample_count,
-                },
+                "origin_same_runtime_parity": origin_parity,
+                "current_deployment_action_audit": deployment_audit,
                 "attestation_receipt_digest": private.attestation_receipt_digest,
             }
         if len(abi_by_task[task_id]) != 1:
@@ -900,7 +1170,12 @@ def inspect_assets(
         "policy_bundle_and_abi": {
             "status": "PASS",
             "runtime_only_bundle_validation": True,
-            "deterministic_golden_action_replay": True,
+            "origin_same_runtime_golden_parity": "digest-bound PASS at 1e-6",
+            "current_backend_deployment_determinism": "hard-gated",
+            "cross_backend_float32_golden_replay": (
+                "versioned compatibility diagnostic; never an asset identity gate"
+            ),
+            "cross_backend_parity_version": CROSS_BACKEND_PARITY,
             "candidate_count": len(bundle_audit),
             "task_abi_digests": {
                 task: next(iter(values)) for task, values in sorted(abi_by_task.items())

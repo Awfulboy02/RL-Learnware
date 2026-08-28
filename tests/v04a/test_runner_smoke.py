@@ -29,11 +29,14 @@ from policy_learnware_v0.v04a.protocol import (
 from server.repro_fpo_ppo_v03.development_baseline_runner import _distance, _empirical
 from server.repro_fpo_ppo_v04a.bpr_runner import (
     ALL_FP_METHODS,
+    CROSS_BACKEND_PARITY,
     GateFailure,
     SCHEMA,
     V04ARunnerError,
     _load_config,
+    _deployment_action_audit,
     _method_cards,
+    _origin_parity_receipt,
     _parser,
     _publish,
     _publish_jsonl,
@@ -286,6 +289,142 @@ def test_no_go_prepare_returns_nonzero_process_status(tmp_path: Path) -> None:
         ]
     )
     assert result == 2
+
+
+def test_origin_parity_receipt_remains_digest_bound_at_one_e_minus_six(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bundle = tmp_path / "attempt_001" / "checkpoints" / "outer_000001"
+    bundle.mkdir(parents=True)
+    golden = {
+        "passed": True,
+        "raw_checked": True,
+        "sample_count": 8,
+        "atol": 1.0e-6,
+        "rtol": 1.0e-6,
+    }
+    golden["report_digest"] = sha256_json(golden)
+    compiled = {
+        "passed": True,
+        "next_keys_equal": True,
+        "sample_count": 2,
+        "atol": 1.0e-6,
+        "rtol": 1.0e-6,
+    }
+    compiled["report_digest"] = sha256_json(compiled)
+    record = {
+        "schema": "policy-learnware.v02-training-record.v1",
+        "state": "succeeded",
+        "promoted_outer_iteration": 1,
+        "promoted_environment_steps": 100,
+        "checkpoint_bundles": [
+            {
+                "path": str(bundle),
+                "bundle_digest": "a" * 64,
+                "golden_parity": golden,
+                "compiled_parity": compiled,
+            }
+        ],
+    }
+    record["record_digest"] = sha256_json(record)
+    _publish(tmp_path / "attempt_001" / "training_record.json", record)
+    _publish(
+        tmp_path / "attempt_001" / "status.json",
+        {
+            "state": "completed",
+            "training_record_digest": record["record_digest"],
+            "promoted_outer_iteration": 1,
+            "promoted_environment_steps": 100,
+        },
+    )
+    metadata = SimpleNamespace(
+        bundle_dir=bundle,
+        bundle_digest="a" * 64,
+        outer_iteration=1,
+        environment_steps=100,
+        provenance={
+            "job_digest": "b" * 64,
+            "attempt_digest": "c" * 64,
+            "anchor_manifest_digest": "d" * 64,
+            "environment_instance_digest": "e" * 64,
+            "config_digest": "f" * 64,
+            "execution_purpose": "test",
+        },
+    )
+    monkeypatch.setattr(
+        runner_module, "validate_success_record", lambda *a, **k: record
+    )
+    assert _origin_parity_receipt(metadata)["status"] == "PASS"
+
+    tampered = dict(record)
+    tampered["checkpoint_bundles"] = [
+        {
+            **record["checkpoint_bundles"][0],
+            "golden_parity": {**golden, "passed": False},
+        }
+    ]
+    (tmp_path / "attempt_001" / "training_record.json").unlink()
+    _publish(tmp_path / "attempt_001" / "training_record.json", tampered)
+    monkeypatch.setattr(
+        runner_module, "validate_success_record", lambda *a, **k: tampered
+    )
+    with pytest.raises(GateFailure, match="origin parity"):
+        _origin_parity_receipt(metadata)
+
+
+def test_deployment_audit_separates_determinism_from_cross_backend_float(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    observation = np.asarray([[0.1], [0.2]], dtype=np.float32)
+    actual_raw = np.asarray([[0.25], [-0.5]], dtype=np.float32)
+    expected_raw = actual_raw + np.float32(1.0e-3)
+    expected_environment = np.tanh(expected_raw).astype(np.float32)
+    np.savez_compressed(
+        bundle / "golden_io.npz",
+        observation=observation,
+        prng_key_data=np.asarray([1, 2], dtype=np.uint32),
+        raw_action=expected_raw,
+        environment_action=expected_environment,
+    )
+
+    class FakePolicy:
+        def act_raw(self, observation, key, *, deterministic=True):
+            assert deterministic
+            return actual_raw.copy(), np.asarray(key) + 1
+
+        def act(self, observation, key, *, deterministic=True):
+            assert deterministic
+            return np.tanh(actual_raw).astype(np.float32), np.asarray(key) + 1
+
+    compiled = SimpleNamespace(
+        passed=True,
+        next_keys_equal=True,
+        max_abs_error=1.0e-7,
+        sample_count=2,
+        atol=1.0e-6,
+        rtol=1.0e-6,
+    )
+    monkeypatch.setattr(runner_module, "_restore_policy_key", lambda key: key)
+    monkeypatch.setattr(runner_module, "_policy_key_data", np.asarray)
+    monkeypatch.setattr(
+        runner_module, "verify_compiled_policy_parity", lambda *args, **kwargs: compiled
+    )
+    result = _deployment_action_audit(FakePolicy(), SimpleNamespace(bundle_dir=bundle))
+    assert result["status"] == "WARNING_CROSS_BACKEND_COMPATIBLE"
+    assert result["compiled_parity"]["status"] == "PASS"
+    assert result["cross_backend_golden_diagnostic"]["compatibility_envelope_passed"]
+    assert CROSS_BACKEND_PARITY["raw_atol"] < 0.03
+
+    class WrongTransformPolicy(FakePolicy):
+        def act(self, observation, key, *, deterministic=True):
+            return np.zeros_like(actual_raw), np.asarray(key) + 1
+
+    with pytest.raises(GateFailure, match="deployment action invariants"):
+        _deployment_action_audit(
+            WrongTransformPolicy(), SimpleNamespace(bundle_dir=bundle)
+        )
 
 
 def test_score_parser_has_no_oracle_capability() -> None:
