@@ -2914,17 +2914,252 @@ def _entropy(posterior: Mapping[str, float]) -> float:
     return float(-np.sum(values * np.log(np.maximum(values, np.finfo(float).tiny))))
 
 
+def _score_cell_binding(
+    *,
+    run: Mapping[str, Any],
+    config_digest: str,
+    manifest: Mapping[str, Any],
+    manifest_sha256: str,
+    raw_adapter_sha256: str,
+    layout: Mapping[str, Mapping[str, Any]],
+    row: Mapping[str, Any],
+    budget: int,
+    methods: Sequence[str],
+    block_size: int,
+) -> dict[str, Any]:
+    """Bind one resumable full-score cell to every frozen numeric input."""
+
+    task_id = str(row["task_id"])
+    raw = run.get("raw_delta")
+    if not isinstance(raw, Mapping):
+        raise V04ARunnerError("score cell lacks a Raw-Delta binding")
+    raw_digests = raw.get("source_rkme_sha256")
+    candidates = tuple(str(value) for value in layout[task_id]["candidate_ids"])
+    if not isinstance(raw_digests, Mapping) or not set(candidates).issubset(
+        raw_digests
+    ):
+        raise V04ARunnerError("score cell Raw-Delta binding is incomplete")
+    return {
+        "config_digest": config_digest,
+        "runner_source_sha256": sha256_file(Path(__file__)),
+        "fixed_probe_protocol_id": run["fixed_probe_protocol_id"],
+        "scoring_manifest_payload_digest": run["scoring_manifest_payload_digest"],
+        "source_model_manifest_sha256": manifest_sha256,
+        "source_task_model_digest": sha256_json(manifest["models"][task_id]),
+        "raw_adapter_sha256": raw_adapter_sha256,
+        "raw_config_sha256": raw["config_sha256"],
+        "raw_task_source_digests": {
+            candidate: raw_digests[candidate] for candidate in candidates
+        },
+        "context_id": str(row["context_id"]),
+        "task_id": task_id,
+        "budget_episodes": int(budget),
+        "probe_membership_digest": str(row["probe_membership_digest"]),
+        "target_reward_free_npz_sha256": str(row["reward_free_npz_sha256"]),
+        "block_size": int(block_size),
+        "methods": list(methods),
+    }
+
+
+def _validate_score_cell_payload(
+    payload: Mapping[str, Any],
+    *,
+    binding: Mapping[str, Any],
+    layout: Mapping[str, Mapping[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Validate a completed cell before its runtime and rows are reused."""
+
+    expected_fields = {"schema", "stage", "status", "binding", "rankings", "traces"}
+    if set(payload) != expected_fields:
+        raise V04ARunnerError("score cell has unexpected fields")
+    if (
+        payload.get("schema") != SCHEMA
+        or payload.get("stage") != "score-fp-cell"
+        or payload.get("status") != "COMPLETE"
+        or payload.get("binding") != dict(binding)
+    ):
+        raise V04ARunnerError("score cell binding or status differs")
+    rankings = payload.get("rankings")
+    traces = payload.get("traces")
+    if not isinstance(rankings, list) or not isinstance(traces, list):
+        raise V04ARunnerError("score cell rows are malformed")
+    methods = tuple(str(value) for value in binding["methods"])
+    posterior_methods = tuple(value for value in methods if value != RAW_METHOD)
+    if (
+        len(rankings) != len(methods)
+        or {row.get("method_id") for row in rankings} != set(methods)
+        or len(traces) != len(posterior_methods)
+        or {row.get("method_id") for row in traces} != set(posterior_methods)
+    ):
+        raise V04ARunnerError("score cell method coverage differs")
+    task = layout[str(binding["task_id"])]
+    candidates = set(str(value) for value in task["candidate_ids"])
+    source_types = set(str(value) for value in task["source_type_ids"])
+    ledger = BudgetLedger.for_budget(int(binding["budget_episodes"])).to_dict()
+    for row in rankings:
+        ranking = row.get("ranking")
+        method_id = str(row.get("method_id"))
+        expected_ties = (
+            dict(task["raw_tie_break_tokens"])
+            if method_id == RAW_METHOD
+            else {
+                candidate: tie_break_key(str(binding["config_digest"]), candidate)
+                for candidate in candidates
+            }
+        )
+        if (
+            row.get("schema") != SCHEMA
+            or row.get("stage") != "PUBLIC_RANKING_PRE_ORACLE"
+            or row.get("status") != "OK"
+            or row.get("context_role") != "development"
+            or row.get("context_id") != binding["context_id"]
+            or row.get("task_id") != binding["task_id"]
+            or method_id not in methods
+            or row.get("method_version") != "0.4a.0"
+            or row.get("access_track") != "BI0-FP-RF"
+            or row.get("candidate_scope") != "TASK_5"
+            or not isinstance(row.get("faithfulness"), str)
+            or not row.get("faithfulness")
+            or not isinstance(row.get("source_evidence_privileges"), str)
+            or not row.get("source_evidence_privileges")
+            or row.get("budget_episodes") != binding["budget_episodes"]
+            or row.get("probe_membership_digest") != binding["probe_membership_digest"]
+            or row.get("budget_ledger") != ledger
+            or any(
+                row.get(name) != value
+                for name, value in ledger.items()
+                if name != "schema"
+            )
+            or not isinstance(ranking, list)
+            or len(ranking) != 5
+            or {item.get("opaque_candidate_id") for item in ranking} != candidates
+            or [item.get("rank") for item in ranking] != list(range(1, 6))
+            or {
+                str(item.get("opaque_candidate_id")): item.get("tie_break_token")
+                for item in ranking
+            }
+            != expected_ties
+            or row.get("selected_opaque_candidate_id")
+            != ranking[0].get("opaque_candidate_id")
+            or row.get("score_semantics")
+            != (
+                "negative_mmd"
+                if method_id == RAW_METHOD
+                else "posterior_expected_source_utility"
+                if method_id in {BPR_METHOD, HYBRID_METHOD}
+                else "paired_source_type_posterior"
+            )
+            or not isinstance(row.get("runtime_accounting"), str)
+            or not row.get("runtime_accounting")
+            or isinstance(row.get("peak_memory_ru_maxrss"), bool)
+            or not isinstance(row.get("peak_memory_ru_maxrss"), int)
+            or row.get("peak_memory_ru_maxrss") < 0
+        ):
+            raise V04ARunnerError("score cell ranking payload differs")
+        scores = [item.get("score") for item in ranking]
+        if any(
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            for value in scores
+        ) or any(float(scores[index]) < float(scores[index + 1]) for index in range(4)):
+            raise V04ARunnerError("score cell ranking scores are malformed")
+        score_by_candidate = {
+            str(item["opaque_candidate_id"]): float(item["score"]) for item in ranking
+        }
+        expected_order = sorted(
+            candidates,
+            key=lambda candidate: (
+                -score_by_candidate[candidate],
+                expected_ties[candidate],
+            ),
+        )
+        if [str(item["opaque_candidate_id"]) for item in ranking] != expected_order:
+            raise V04ARunnerError("score cell ranking tie order differs")
+        for name in ("runtime_seconds", "shared_probe_load_seconds"):
+            value = row.get(name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or float(value) < 0.0
+            ):
+                raise V04ARunnerError("score cell runtime is malformed")
+    for row in traces:
+        posterior = row.get("posterior")
+        if (
+            row.get("schema") != SCHEMA
+            or row.get("context_id") != binding["context_id"]
+            or row.get("task_id") != binding["task_id"]
+            or row.get("method_id") not in posterior_methods
+            or row.get("budget_episodes") != binding["budget_episodes"]
+            or row.get("probe_membership_digest") != binding["probe_membership_digest"]
+            or row.get("fit_on_target") is not False
+            or not isinstance(posterior, Mapping)
+            or set(posterior) != source_types
+        ):
+            raise V04ARunnerError("score cell posterior trace differs")
+        probabilities = np.asarray(list(posterior.values()), dtype=np.float64)
+        entropy = float(row.get("posterior_entropy", float("nan")))
+        predictive_nll = float(row.get("target_predictive_nll", float("nan")))
+        if (
+            not np.all(np.isfinite(probabilities))
+            or np.any(probabilities < 0.0)
+            or not np.isclose(np.sum(probabilities), 1.0, rtol=0.0, atol=1.0e-10)
+            or not math.isfinite(entropy)
+            or not np.isclose(entropy, _entropy(posterior), rtol=0.0, atol=1.0e-12)
+            or not math.isfinite(predictive_nll)
+        ):
+            raise V04ARunnerError("score cell posterior values are malformed")
+    return [dict(row) for row in rankings], [dict(row) for row in traces]
+
+
+def _attempt_id(value: Any) -> str:
+    attempt = str(value or "").strip()
+    if (
+        not attempt
+        or len(attempt) > 80
+        or any(
+            character
+            not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
+            for character in attempt
+        )
+    ):
+        raise V04ARunnerError("attempt ID must use 1-80 safe filename characters")
+    return attempt
+
+
 def _score_fp_impl(args: argparse.Namespace) -> Mapping[str, Any]:
-    if any(
-        (args.run_dir / name).exists()
-        for name in (
+    smoke_context_id = getattr(args, "smoke_context_id", None)
+    smoke = smoke_context_id is not None
+    if smoke:
+        _attempt_id(getattr(args, "attempt_id", None))
+    forbidden = (
+        (
+            "rankings.jsonl",
+            "posterior_traces.jsonl",
+            "score_fp_status.json",
+            "score_cells",
             "rankings.seal.json",
             "oracle_binding.json",
             "metrics.jsonl",
             "summary.json",
         )
-    ):
-        raise V04ARunnerError("score-fp cannot run after ranking seal or oracle access")
+        if smoke
+        else (
+            "rankings.seal.json",
+            "oracle_binding.json",
+            "metrics.jsonl",
+            "summary.json",
+        )
+    )
+    if any((args.run_dir / name).exists() for name in forbidden):
+        message = (
+            "smoke-fp must run before full target scoring"
+            if smoke
+            else "score-fp cannot run after ranking seal or oracle access"
+        )
+        raise V04ARunnerError(message)
     run, config, config_digest = _prepared(args.run_dir)
     rows, layout = _sanitized_layout(args.run_dir, run)
     manifest = _json(args.run_dir / "source_observation_model_manifest.json")
@@ -2973,19 +3208,37 @@ def _score_fp_impl(args: argparse.Namespace) -> Mapping[str, Any]:
     }
     _verify_raw_binding(run, raw_view, all_candidates)
     development = [row for row in rows if row["role"] == "development"]
+    if smoke:
+        development = [
+            row for row in development if row["context_id"] == smoke_context_id
+        ]
+        if len(development) != 1:
+            raise V04ARunnerError(
+                "smoke context must identify exactly one development context"
+            )
+    budgets = (32,) if smoke else BUDGET_EPISODES
+    ranking_stage = (
+        "DEVELOPMENT_SMOKE_PRE_ORACLE" if smoke else "PUBLIC_RANKING_PRE_ORACLE"
+    )
     methods = list(PRIMARY_METHODS)
     if bool(config["controls"].get("enable_hybrid", False)):
         methods.append(HYBRID_METHOD)
     output_rankings: list[dict[str, Any]] = []
     traces: list[dict[str, Any]] = []
     cache: dict[str, tuple[BPRGaussianModel, EBPRFixedProbe]] = {}
+    active_tasks = {str(row["task_id"]) for row in development}
     raw_source_cache: dict[str, dict[str, ReducedRKME]] = {
         task_id: {
             candidate: ReducedRKME.load_npz(raw_view / "source" / f"{candidate}.npz")
             for candidate in task["candidate_ids"]
         }
         for task_id, task in layout.items()
+        if task_id in active_tasks
     }
+    manifest_sha256 = sha256_file(
+        args.run_dir / "source_observation_model_manifest.json"
+    )
+    raw_adapter_sha256 = sha256_file(args.run_dir / "raw_delta_adapter.json")
     try:
         for row in development:
             task_id = str(row["task_id"])
@@ -3001,7 +3254,47 @@ def _score_fp_impl(args: argparse.Namespace) -> Mapping[str, Any]:
                 )
             bpr, ebpr = cache[task_id]
             candidates = tuple(task["candidate_ids"])
-            for budget in BUDGET_EPISODES:
+            target_path = args.run_dir / str(row["reward_free_npz"])
+            if (
+                target_path.is_symlink()
+                or not target_path.is_file()
+                or sha256_file(target_path) != row["reward_free_npz_sha256"]
+            ):
+                raise V04ARunnerError(
+                    f"target scoring projection moved or changed: {row['context_id']}"
+                )
+            for budget in budgets:
+                cell_binding = _score_cell_binding(
+                    run=run,
+                    config_digest=config_digest,
+                    manifest=manifest,
+                    manifest_sha256=manifest_sha256,
+                    raw_adapter_sha256=raw_adapter_sha256,
+                    layout=layout,
+                    row=row,
+                    budget=budget,
+                    methods=methods,
+                    block_size=args.block_size,
+                )
+                cell_path = (
+                    args.run_dir
+                    / "score_cells"
+                    / str(row["context_id"])
+                    / f"budget_{int(budget):03d}.json"
+                )
+                if not smoke and cell_path.exists():
+                    if not args.resume:
+                        raise V04ARunnerError(
+                            f"immutable score cell already exists: {cell_path}"
+                        )
+                    cell_rankings, cell_traces = _validate_score_cell_payload(
+                        _json(cell_path), binding=cell_binding, layout=layout
+                    )
+                    output_rankings.extend(cell_rankings)
+                    traces.extend(cell_traces)
+                    continue
+                ranking_start = len(output_rankings)
+                trace_start = len(traces)
                 probe_started = time.perf_counter()
                 probe = _projected_probe(args.run_dir, row, budget)
                 shared_probe_load_seconds = time.perf_counter() - probe_started
@@ -3081,7 +3374,7 @@ def _score_fp_impl(args: argparse.Namespace) -> Mapping[str, Any]:
                     output_rankings.append(
                         {
                             "schema": SCHEMA,
-                            "stage": "PUBLIC_RANKING_PRE_ORACLE",
+                            "stage": ranking_stage,
                             "context_id": row["context_id"],
                             "context_role": "development",
                             "task_id": task_id,
@@ -3144,22 +3437,54 @@ def _score_fp_impl(args: argparse.Namespace) -> Mapping[str, Any]:
                                 "fit_on_target": False,
                             }
                         )
+                if not smoke:
+                    cell_rankings = output_rankings[ranking_start:]
+                    cell_traces = traces[trace_start:]
+                    payload = {
+                        "schema": SCHEMA,
+                        "stage": "score-fp-cell",
+                        "status": "COMPLETE",
+                        "binding": cell_binding,
+                        "rankings": cell_rankings,
+                        "traces": cell_traces,
+                    }
+                    _validate_score_cell_payload(
+                        payload, binding=cell_binding, layout=layout
+                    )
+                    _publish(cell_path, payload)
     except GateFailure as error:
-        result = {
-            "schema": SCHEMA,
-            "stage": "score-fp",
-            "status": error.status,
-            "message": str(error),
-            "oracle_access": False,
-        }
-        _publish(args.run_dir / "score_fp_status.json", result, resume=args.resume)
-        return result
+        raise error
     output_rankings.sort(
         key=lambda row: (row["context_id"], row["budget_episodes"], row["method_id"])
     )
     traces.sort(
         key=lambda row: (row["context_id"], row["budget_episodes"], row["method_id"])
     )
+    if smoke:
+        attempt = _attempt_id(getattr(args, "attempt_id", None))
+        output_dir = (
+            args.run_dir / "smoke_fp" / str(development[0]["context_id"]) / attempt
+        )
+        rankings_sha256 = _publish_jsonl(output_dir / "rankings.jsonl", output_rankings)
+        traces_sha256 = _publish_jsonl(output_dir / "posterior_traces.jsonl", traces)
+        result = {
+            "schema": SCHEMA,
+            "stage": "smoke-fp",
+            "status": "COMPLETE_SMOKE",
+            "smoke_only": True,
+            "seal_eligible": False,
+            "oracle_access": False,
+            "context_id": development[0]["context_id"],
+            "task_id": development[0]["task_id"],
+            "budget_episodes": 32,
+            "method_count": len(methods),
+            "ranking_record_count": len(output_rankings),
+            "posterior_trace_count": len(traces),
+            "rankings_sha256": rankings_sha256,
+            "posterior_traces_sha256": traces_sha256,
+        }
+        _publish(output_dir / "status.json", result)
+        return result
     rankings_sha256 = _publish_jsonl(
         args.run_dir / "rankings.jsonl", output_rankings, resume=args.resume
     )
@@ -3174,6 +3499,7 @@ def _score_fp_impl(args: argparse.Namespace) -> Mapping[str, Any]:
         "development_context_count": len(development),
         "method_count": len(methods),
         "budget_count": len(BUDGET_EPISODES),
+        "immutable_cell_count": len(development) * len(BUDGET_EPISODES),
         "ranking_record_count": len(output_rankings),
         "posterior_trace_count": len(traces),
         "rankings_sha256": rankings_sha256,
@@ -3186,7 +3512,7 @@ def _score_fp_impl(args: argparse.Namespace) -> Mapping[str, Any]:
 
 
 def score_fp(args: argparse.Namespace) -> Mapping[str, Any]:
-    """Run target scoring and persist every fail-closed terminal status."""
+    """Run resumable target scoring; failures live in per-attempt records."""
 
     if any(
         (args.run_dir / name).exists()
@@ -3198,6 +3524,7 @@ def score_fp(args: argparse.Namespace) -> Mapping[str, Any]:
         )
     ):
         raise V04ARunnerError("score-fp cannot run after ranking seal or oracle access")
+    attempt = _attempt_id(getattr(args, "attempt_id", None))
     try:
         return _score_fp_impl(args)
     except GateFailure as error:
@@ -3214,10 +3541,12 @@ def score_fp(args: argparse.Namespace) -> Mapping[str, Any]:
         BPRModelError,
         EBPRError,
         V04ARunnerError,
+        DevelopmentBaselineError,
         OSError,
         KeyError,
         TypeError,
         ValueError,
+        FloatingPointError,
     ) as error:
         result = {
             "schema": SCHEMA,
@@ -3227,7 +3556,76 @@ def score_fp(args: argparse.Namespace) -> Mapping[str, Any]:
             "error_type": type(error).__name__,
             "oracle_access": False,
         }
-    _publish(args.run_dir / "score_fp_status.json", result, resume=args.resume)
+    result = {
+        **result,
+        "attempt_id": attempt,
+        "completed_cell_count": len(
+            tuple((args.run_dir / "score_cells").glob("*/*.json"))
+        ),
+    }
+    _publish(
+        args.run_dir / "score_attempts" / f"{attempt}.json",
+        result,
+        resume=args.resume,
+    )
+    return result
+
+
+def smoke_fp(args: argparse.Namespace) -> Mapping[str, Any]:
+    """Run one isolated B=32 development cell that can never be sealed."""
+
+    args.smoke_context_id = args.context_id
+    try:
+        return _score_fp_impl(args)
+    except GateFailure as error:
+        result = {
+            "schema": SCHEMA,
+            "stage": "smoke-fp",
+            "status": error.status,
+            "message": str(error),
+            "details": error.details,
+            "error_type": type(error).__name__,
+            "smoke_only": True,
+            "seal_eligible": False,
+            "oracle_access": False,
+        }
+    except (
+        BPRModelError,
+        EBPRError,
+        V04ARunnerError,
+        DevelopmentBaselineError,
+        OSError,
+        KeyError,
+        TypeError,
+        ValueError,
+        FloatingPointError,
+    ) as error:
+        result = {
+            "schema": SCHEMA,
+            "stage": "smoke-fp",
+            "status": "NO_GO_FP_SMOKE",
+            "message": str(error),
+            "error_type": type(error).__name__,
+            "smoke_only": True,
+            "seal_eligible": False,
+            "oracle_access": False,
+        }
+    context_component = str(args.context_id)
+    if not context_component or "/" in context_component or ".." in context_component:
+        context_component = "invalid-context"
+    result = {
+        **result,
+        "attempt_id": _attempt_id(args.attempt_id),
+        "context_id": str(args.context_id),
+    }
+    _publish(
+        args.run_dir
+        / "smoke_fp"
+        / context_component
+        / _attempt_id(args.attempt_id)
+        / "status.json",
+        result,
+    )
     return result
 
 
@@ -3943,8 +4341,16 @@ def _parser() -> argparse.ArgumentParser:
     score = subparsers.add_parser("score-fp")
     score.add_argument("--run-dir", type=_path, required=True)
     score.add_argument("--block-size", type=int, default=2048)
+    score.add_argument("--attempt-id", required=True)
     score.add_argument("--resume", action="store_true")
     score.set_defaults(handler=score_fp)
+
+    smoke = subparsers.add_parser("smoke-fp")
+    smoke.add_argument("--run-dir", type=_path, required=True)
+    smoke.add_argument("--context-id", required=True)
+    smoke.add_argument("--attempt-id", required=True)
+    smoke.add_argument("--block-size", type=int, default=2048)
+    smoke.set_defaults(handler=smoke_fp)
 
     seal = subparsers.add_parser("seal-rankings")
     seal.add_argument("--run-dir", type=_path, required=True)
@@ -3988,6 +4394,7 @@ __all__ = [
     "prepare",
     "raw_delta_task5_scores",
     "score_fp",
+    "smoke_fp",
     "seal_stage",
     "summarize",
 ]

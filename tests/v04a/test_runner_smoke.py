@@ -50,6 +50,7 @@ from server.repro_fpo_ppo_v04a.bpr_runner import (
     raw_delta_task5_scores,
     score_fp,
     seal_stage,
+    smoke_fp,
 )
 from server.repro_fpo_ppo_v04a import bpr_runner as runner_module
 
@@ -583,7 +584,17 @@ def test_deployment_audit_separates_determinism_from_cross_backend_float(
 
 def test_score_parser_has_no_oracle_capability() -> None:
     parser = _parser()
-    parsed = parser.parse_args(["score-fp", "--run-dir", "/tmp/v04a-run"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(["score-fp", "--run-dir", "/tmp/v04a-run"])
+    parsed = parser.parse_args(
+        [
+            "score-fp",
+            "--run-dir",
+            "/tmp/v04a-run",
+            "--attempt-id",
+            "attempt-1",
+        ]
+    )
     assert parsed.stage == "score-fp"
     assert not hasattr(parsed, "oracle_root")
     with pytest.raises(SystemExit):
@@ -592,6 +603,37 @@ def test_score_parser_has_no_oracle_capability() -> None:
                 "score-fp",
                 "--run-dir",
                 "/tmp/v04a-run",
+                "--attempt-id",
+                "attempt-1",
+                "--oracle-root",
+                "/tmp/private-oracle",
+            ]
+        )
+
+    smoke = parser.parse_args(
+        [
+            "smoke-fp",
+            "--run-dir",
+            "/tmp/v04a-run",
+            "--context-id",
+            "development-context",
+            "--attempt-id",
+            "attempt-1",
+        ]
+    )
+    assert smoke.stage == "smoke-fp"
+    assert smoke.context_id == "development-context"
+    assert not hasattr(smoke, "oracle_root")
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            [
+                "smoke-fp",
+                "--run-dir",
+                "/tmp/v04a-run",
+                "--context-id",
+                "development-context",
+                "--attempt-id",
+                "attempt-1",
                 "--oracle-root",
                 "/tmp/private-oracle",
             ]
@@ -992,9 +1034,14 @@ def test_score_fp_uses_only_sanitized_reward_free_closure(
         return FakeBPR(task), FakeEBPR(task)
 
     raw_calls: list[tuple[str, int, str]] = []
+    fail_after: list[int | None] = [None]
 
     def fake_raw_scores(*, probe, task_id, candidate_ids, **kwargs):
         raw_calls.append((task_id, probe.episode_count, probe.probe_membership_digest))
+        if fail_after[0] is not None:
+            if fail_after[0] == 0:
+                raise V04ARunnerError("injected resumable score interruption")
+            fail_after[0] -= 1
         return {
             candidate: float(5 - index) for index, candidate in enumerate(candidate_ids)
         }
@@ -1009,11 +1056,64 @@ def test_score_fp_uses_only_sanitized_reward_free_closure(
     monkeypatch.setattr(runner_module, "_market", forbidden_private_access)
     monkeypatch.setattr(runner_module, "_evidence_root", forbidden_private_access)
 
-    result = score_fp(argparse.Namespace(run_dir=run_dir, block_size=16, resume=False))
+    smoke_context = next(
+        row["context_id"]
+        for row in scoring_manifest["contexts"]
+        if row["role"] == "development"
+    )
+    smoke = smoke_fp(
+        argparse.Namespace(
+            run_dir=run_dir,
+            block_size=16,
+            context_id=smoke_context,
+            attempt_id="smoke-1",
+        )
+    )
+    assert smoke["status"] == "COMPLETE_SMOKE"
+    assert smoke["budget_episodes"] == 32
+    assert smoke["ranking_record_count"] == 4
+    assert smoke["posterior_trace_count"] == 3
+    assert smoke["seal_eligible"] is False
+    assert len(raw_calls) == 1
+    smoke_root = run_dir / "smoke_fp" / smoke_context / "smoke-1"
+    assert len(_read_jsonl(smoke_root / "rankings.jsonl")) == 4
+    assert all(
+        row["stage"] == "DEVELOPMENT_SMOKE_PRE_ORACLE"
+        for row in _read_jsonl(smoke_root / "rankings.jsonl")
+    )
+    assert not (run_dir / "rankings.jsonl").exists()
+    assert not (run_dir / "score_fp_status.json").exists()
+
+    fail_after[0] = 3
+    interrupted = score_fp(
+        argparse.Namespace(
+            run_dir=run_dir,
+            block_size=16,
+            resume=False,
+            attempt_id="full-failed-1",
+        )
+    )
+    assert interrupted["status"] == "NO_GO_FP_SCORING"
+    assert len(tuple((run_dir / "score_cells").glob("*/*.json"))) == 3
+    assert (run_dir / "score_attempts" / "full-failed-1.json").is_file()
+    assert not (run_dir / "rankings.jsonl").exists()
+    assert not (run_dir / "score_fp_status.json").exists()
+
+    fail_after[0] = None
+    calls_before_resume = len(raw_calls)
+    result = score_fp(
+        argparse.Namespace(
+            run_dir=run_dir,
+            block_size=16,
+            resume=True,
+            attempt_id="full-resume-1",
+        )
+    )
     assert result["status"] == "COMPLETE"
+    assert result["immutable_cell_count"] == 24 * 7
     assert result["ranking_record_count"] == 24 * 7 * 4 == 672
     assert result["posterior_trace_count"] == 24 * 7 * 3 == 504
-    assert len(raw_calls) == 24 * 7
+    assert len(raw_calls) - calls_before_resume == 24 * 7 - 3
     assert {budget for _, budget, _ in raw_calls} == set(BUDGET_EPISODES)
 
     rankings = _read_jsonl(run_dir / "rankings.jsonl")
@@ -1031,6 +1131,78 @@ def test_score_fp_uses_only_sanitized_reward_free_closure(
     assert b"context_index" not in run_bytes
     assert b"private_registry" not in run_bytes
     assert b"oracle" not in run_bytes
+
+    first_cell_path = sorted((run_dir / "score_cells").glob("*/*.json"))[0]
+    first_cell = runner_module._json(first_cell_path)
+    assert first_cell["binding"]["block_size"] == 16
+    assert first_cell["binding"]["target_reward_free_npz_sha256"]
+    assert first_cell["binding"]["scoring_manifest_payload_digest"]
+    assert first_cell["binding"]["runner_source_sha256"] == sha256_file(
+        runner_module.__file__
+    )
+    wrong_block = score_fp(
+        argparse.Namespace(
+            run_dir=run_dir,
+            block_size=32,
+            resume=True,
+            attempt_id="wrong-block",
+        )
+    )
+    assert wrong_block["status"] == "NO_GO_FP_SCORING"
+    assert "binding" in wrong_block["message"]
+
+    target_row = next(
+        row
+        for row in scoring_manifest["contexts"]
+        if row["context_id"] == first_cell["binding"]["context_id"]
+    )
+    target_path = run_dir / target_row["reward_free_npz"]
+    target_bytes = target_path.read_bytes()
+    target_path.write_bytes(target_bytes + b"changed")
+    changed_target = score_fp(
+        argparse.Namespace(
+            run_dir=run_dir,
+            block_size=16,
+            resume=True,
+            attempt_id="changed-target",
+        )
+    )
+    assert changed_target["status"] == "NO_GO_FP_SCORING"
+    assert "projection moved or changed" in changed_target["message"]
+    target_path.write_bytes(target_bytes)
+
+    cell_bytes = first_cell_path.read_bytes()
+    corrupted_cell = dict(first_cell)
+    corrupted_cell["binding"] = {
+        **corrupted_cell["binding"],
+        "runner_source_sha256": "corrupted-runner-binding",
+    }
+    first_cell_path.write_bytes(canonical_json_bytes(corrupted_cell) + b"\n")
+    rejected_cell = score_fp(
+        argparse.Namespace(
+            run_dir=run_dir,
+            block_size=16,
+            resume=True,
+            attempt_id="corrupted-cell",
+        )
+    )
+    assert rejected_cell["status"] == "NO_GO_FP_SCORING"
+    assert "binding" in rejected_cell["message"]
+    first_cell_path.write_bytes(cell_bytes)
+
+    completed_rankings = (run_dir / "rankings.jsonl").read_bytes()
+    calls_before_complete_resume = len(raw_calls)
+    resumed = score_fp(
+        argparse.Namespace(
+            run_dir=run_dir,
+            block_size=16,
+            resume=True,
+            attempt_id="full-resume-2",
+        )
+    )
+    assert resumed["status"] == "COMPLETE"
+    assert len(raw_calls) == calls_before_complete_resume
+    assert (run_dir / "rankings.jsonl").read_bytes() == completed_rankings
 
     seal_stage(argparse.Namespace(run_dir=run_dir, resume=False))
     with pytest.raises(V04ARunnerError, match="after ranking seal or oracle"):
