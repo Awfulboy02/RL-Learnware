@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+import io
+import json
 import math
 import os
 from pathlib import Path
@@ -26,6 +28,7 @@ import yaml
 
 from policy_learnware_v0.hashing import (
     canonical_json_bytes,
+    sha256_bytes,
     sha256_file,
     sha256_json,
     sha256_ndarrays,
@@ -207,6 +210,21 @@ class FrozenR4Assets:
     provenance: Mapping[str, Any]
 
 
+def _frozen_bytes(path: Path, expected_sha: str, where: str) -> bytes:
+    """Read, authenticate, and return one immutable frozen-file buffer."""
+
+    expected = _digest(expected_sha, f"{where} SHA")
+    if path.is_symlink() or not path.is_file():
+        raise V05RunnerError(f"{where} frozen file is absent or unsafe")
+    try:
+        payload = path.read_bytes()
+    except OSError as error:
+        raise V05RunnerError(f"{where} frozen file cannot be read") from error
+    if sha256_bytes(payload) != expected:
+        raise V05RunnerError(f"{where} frozen file digest changed")
+    return payload
+
+
 def _frozen_json(
     root: Path, row: Mapping[str, Any], *, expected_sha256: str, where: str
 ) -> tuple[Path, dict[str, Any]]:
@@ -214,9 +232,33 @@ def _frozen_json(
     if relative.is_absolute() or ".." in relative.parts or not relative.parts:
         raise V05RunnerError(f"{where} relative path is unsafe")
     path = root / relative
-    if path.is_symlink() or not path.is_file() or sha256_file(path) != expected_sha256:
-        raise V05RunnerError(f"{where} frozen file is absent or changed")
-    return path, load_strict_json(path)
+    payload = _frozen_bytes(path, expected_sha256, where)
+
+    def unique_object(pairs: Sequence[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise V05RunnerError(f"{where} contains duplicate JSON key {key!r}")
+            result[key] = value
+        return result
+
+    def reject_constant(value: str) -> None:
+        raise V05RunnerError(f"{where} contains non-finite JSON constant {value}")
+
+    try:
+        value = json.loads(
+            payload.decode("utf-8"),
+            object_pairs_hook=unique_object,
+            parse_constant=reject_constant,
+        )
+        canonical_json_bytes(value)
+    except V05RunnerError:
+        raise
+    except (TypeError, ValueError, UnicodeError, json.JSONDecodeError) as error:
+        raise V05RunnerError(f"{where} is not strict finite JSON") from error
+    if not isinstance(value, dict):
+        raise V05RunnerError(f"{where} JSON must be a top-level object")
+    return path, value
 
 
 def _load_frozen_r4_assets(
@@ -485,14 +527,18 @@ def _load_frozen_r4_assets(
             raise V05RunnerError("probe membership does not replay from split seed")
         path = root / relative
         expected_sha = _digest(row["reward_free_npz_sha256"], "source bank SHA")
-        if path.is_symlink() or not path.is_file() or sha256_file(path) != expected_sha:
-            raise V05RunnerError("source bank file digest changed")
-        with np.load(path, allow_pickle=False) as archive:
-            if set(archive.files) != set(expected_npz_keys):
-                raise V05RunnerError("source bank NPZ fields differ")
-            arrays = {
-                name: np.array(archive[name], copy=True) for name in archive.files
-            }
+        bank_bytes = _frozen_bytes(path, expected_sha, "source bank")
+        try:
+            with np.load(io.BytesIO(bank_bytes), allow_pickle=False) as archive:
+                if set(archive.files) != set(expected_npz_keys):
+                    raise V05RunnerError("source bank NPZ fields differ")
+                arrays = {
+                    name: np.array(archive[name], copy=True) for name in archive.files
+                }
+        except V05RunnerError:
+            raise
+        except (OSError, ValueError, EOFError) as error:
+            raise V05RunnerError("source bank NPZ cannot be parsed") from error
         membership_scalar = np.asarray(arrays.pop("probe_membership_digest"))
         observation = arrays["observation"]
         action = arrays["action"]

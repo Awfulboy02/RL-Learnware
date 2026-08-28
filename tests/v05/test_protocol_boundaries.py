@@ -1526,6 +1526,43 @@ def test_query_prepare_rejects_public_or_private_ancestor_symlink_before_writes(
         assert outside_state(outside) == before[outside]
 
 
+def test_frozen_json_parses_the_same_verified_bytes_when_path_swaps(
+    tmp_path, monkeypatch
+) -> None:
+    frozen_path = tmp_path / "frozen.json"
+    value_a = {"identity": "A", "rows": [1, 2, 3]}
+    value_b = {"identity": "B", "rows": [4, 5, 6]}
+    bytes_a = canonical_json_bytes(value_a) + b"\n"
+    bytes_b = canonical_json_bytes(value_b) + b"\n"
+    frozen_path.write_bytes(bytes_a)
+    expected_sha256 = hashlib.sha256(bytes_a).hexdigest()
+    real_read_bytes = Path.read_bytes
+    swapped = False
+
+    def swap_after_read(path):
+        nonlocal swapped
+        payload = real_read_bytes(path)
+        if path == frozen_path and not swapped:
+            assert path.is_relative_to(tmp_path)
+            replacement = tmp_path / "replacement.json"
+            replacement.write_bytes(bytes_b)
+            replacement.replace(path)
+            swapped = True
+        return payload
+
+    monkeypatch.setattr(Path, "read_bytes", swap_after_read)
+    observed_path, observed = runner_module._frozen_json(
+        tmp_path,
+        {"relative_path": frozen_path.name},
+        expected_sha256=expected_sha256,
+        where="swap-hook fixture",
+    )
+    assert observed_path == frozen_path
+    assert observed == value_a
+    assert swapped is True
+    assert real_read_bytes(frozen_path) == bytes_b
+
+
 def test_completed_source_fit_checkpoint_closure_is_immutable_on_resume(
     tmp_path, monkeypatch
 ) -> None:
