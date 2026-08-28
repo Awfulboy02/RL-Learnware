@@ -236,6 +236,13 @@ def _load_config(path: Path) -> tuple[dict[str, Any], str]:
         raise V04ARunnerError(
             "source utility split must be the frozen 30/10/10 seed partition"
         )
+    utility_seeds = config.get("source_utility_seed_namespace")
+    if not isinstance(utility_seeds, Mapping) or dict(utility_seeds) != {
+        "reset_seed_start": 730000,
+        "episode_count": 50,
+        "policy_seed_offset": 1_000_003,
+    }:
+        raise V04ARunnerError("source utility seed namespace differs from v03 freeze")
     controls = config.get("controls")
     if (
         not isinstance(controls, Mapping)
@@ -1803,6 +1810,8 @@ def _utility_matrix(
     layout: Mapping[str, Any],
     *,
     train_episode_count: int = 30,
+    expected_reset_seeds: Sequence[int] = tuple(range(730000, 730050)),
+    policy_seed_offset: int = 1_000_003,
 ) -> tuple[dict[str, dict[str, float]], dict[str, str]]:
     evidence = _evidence_root(root)
     rows = layout["source_rows"]
@@ -1820,6 +1829,19 @@ def _utility_matrix(
         or not 0 < train_episode_count < 50
     ):
         raise V04ARunnerError("source utility train split must be within 1..49")
+    expected_resets = tuple(int(seed) for seed in expected_reset_seeds)
+    if (
+        len(expected_resets) != 50
+        or len(set(expected_resets)) != 50
+        or any(
+            isinstance(seed, bool) or not isinstance(seed, (int, np.integer))
+            for seed in expected_reset_seeds
+        )
+        or isinstance(policy_seed_offset, bool)
+        or not isinstance(policy_seed_offset, int)
+    ):
+        raise V04ARunnerError("source utility seed binding must be an exact 50-vector")
+    expected_policies = tuple(seed + policy_seed_offset for seed in expected_resets)
     utility: dict[str, dict[str, float]] = {}
     digests: dict[str, str] = {}
     for source in rows:
@@ -1842,6 +1864,11 @@ def _utility_matrix(
                 failure_status="NO_GO_SOURCE_UTILITY_GAP",
             )
             seed_bank = (reset_seeds, policy_seeds)
+            if reset_seeds != expected_resets or policy_seeds != expected_policies:
+                raise GateFailure(
+                    "NO_GO_SOURCE_UTILITY_GAP",
+                    f"source utility seed identity/order differs from freeze: {type_id}/{candidate}",
+                )
             if common_seed_bank is None:
                 common_seed_bank = seed_bank
             elif seed_bank != common_seed_bank:
@@ -2002,6 +2029,14 @@ def fit_source(args: argparse.Namespace) -> Mapping[str, Any]:
     bpr_cfg = config["bpr"]
     ebpr_cfg = config["ebpr"]
     utility_split = config["source_utility_split"]
+    utility_seed_namespace = config["source_utility_seed_namespace"]
+    expected_utility_reset_seeds = tuple(
+        range(
+            int(utility_seed_namespace["reset_seed_start"]),
+            int(utility_seed_namespace["reset_seed_start"])
+            + int(utility_seed_namespace["episode_count"]),
+        )
+    )
     models: dict[str, Any] = {}
     utility_artifact: dict[str, Any] = {
         "schema": SCHEMA,
@@ -2021,6 +2056,8 @@ def fit_source(args: argparse.Namespace) -> Mapping[str, Any]:
                 "usage": "reserved sealed repeat evidence; not used by BI0 utility fit",
             },
             "seed_order": "the immutable per-cell common reset-seed vector order",
+            "reset_seed_vector_sha256": sha256_json(list(expected_utility_reset_seeds)),
+            "policy_seed_offset": int(utility_seed_namespace["policy_seed_offset"]),
         },
         "tasks": {},
     }
@@ -2063,6 +2100,8 @@ def fit_source(args: argparse.Namespace) -> Mapping[str, Any]:
                 evidence_root,
                 task,
                 train_episode_count=int(utility_split["train_episodes"]),
+                expected_reset_seeds=expected_utility_reset_seeds,
+                policy_seed_offset=int(utility_seed_namespace["policy_seed_offset"]),
             )
             source_evidence_digests.update(digests)
             utility_artifact["tasks"][task_id] = utility

@@ -217,8 +217,8 @@ def _write_utility_evidence(
             "episode_returns": episode_returns,
             "mean_return": float(np.mean(episode_returns)),
             "normalized_mean_return": float(np.mean(episode_returns)) / 1000.0,
-            "reset_seeds": list(range(50)),
-            "policy_seeds": list(range(1_000_003, 1_000_053)),
+            "reset_seeds": list(range(730000, 730050)),
+            "policy_seeds": list(range(1_730_003, 1_730_053)),
         }
         if candidate == omit_episode_returns_for:
             record.pop("episode_returns")
@@ -900,6 +900,42 @@ def test_utility_builder_uses_only_frozen_source_train_seed_prefix(
     assert utility[context_id][candidates[0]] != record["normalized_mean_return"]
 
 
+def test_utility_builder_rejects_synchronous_seed_reordering(tmp_path: Path) -> None:
+    evidence = tmp_path / "utility"
+    task_id = "Task"
+    context_id = "source-context"
+    candidates = tuple(f"policy-{index}" for index in range(5))
+    bundle_digests = {
+        candidate: sha256_json({"bundle": candidate}) for candidate in candidates
+    }
+    _write_utility_evidence(
+        evidence,
+        task_id=task_id,
+        context_id=context_id,
+        candidates=candidates,
+        bundle_digests=bundle_digests,
+    )
+    for candidate in candidates:
+        path = evidence / context_id / f"{candidate}.json"
+        record = dict(runner_module._json(path))
+        path.unlink()
+        record["episode_returns"] = list(reversed(record["episode_returns"]))
+        record["reset_seeds"] = list(reversed(record["reset_seeds"]))
+        record["policy_seeds"] = list(reversed(record["policy_seeds"]))
+        _publish(path, record)
+
+    with pytest.raises(GateFailure, match="seed identity/order"):
+        _utility_matrix(
+            evidence,
+            {
+                "task_id": task_id,
+                "source_rows": [{"context_id": context_id, "role": "source"}],
+                "candidate_ids": candidates,
+                "candidate_bundle_digests": bundle_digests,
+            },
+        )
+
+
 @pytest.mark.parametrize("tamper", ["schema", "seed_bank", "mean"])
 def test_utility_builder_requires_v03_provenance_and_common_seeds(
     tmp_path: Path, tamper: str
@@ -924,8 +960,8 @@ def test_utility_builder_requires_v03_provenance_and_common_seeds(
     if tamper == "schema":
         record.pop("schema")
     elif tamper == "seed_bank":
-        record["reset_seeds"] = list(range(100, 150))
-        record["policy_seeds"] = list(range(1_000_103, 1_000_153))
+        record["reset_seeds"] = list(range(730100, 730150))
+        record["policy_seeds"] = list(range(1_730_103, 1_730_153))
     else:
         record["mean_return"] = "not-a-number"
     _publish(path, record)
