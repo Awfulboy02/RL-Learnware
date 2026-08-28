@@ -101,6 +101,7 @@ from server.repro_fpo_ppo_v02.pool_acceptance import accept_policy_pool
 
 
 SCHEMA = "policy-learnware.v04a-fixed-probe-run.v1"
+SOURCE_UTILITY_PROJECTION_SCHEMA = "policy-learnware.v04a-source-utility-projection.v1"
 PLAN_SHA256 = "d1860c1418fe807bf640e9cfb8a816b7f58e8797db76345af212796fa6d487c0"
 RAW_METHOD = "RAW_DELTA_TASK5"
 BPR_METHOD = "BPR_FP"
@@ -1431,6 +1432,7 @@ def _available_input_metadata(
     deployment_private_registry: Path,
     origin_pool_acceptance: Path,
     raw_delta_root: Path,
+    source_utility_root: Path,
 ) -> dict[str, Any]:
     """Describe only verifiably present inputs for a failed local census."""
 
@@ -1454,6 +1456,11 @@ def _available_input_metadata(
         "path": str(raw_delta_root.resolve()),
         "present_directory": raw_delta_root.is_dir()
         and not raw_delta_root.is_symlink(),
+    }
+    result["source_utility_root"] = {
+        "path": str(source_utility_root.resolve()),
+        "present_directory": source_utility_root.is_dir()
+        and not source_utility_root.is_symlink(),
     }
     try:
         view = _raw_root(raw_delta_root)
@@ -1495,6 +1502,7 @@ def _record_prepare_failure(
             "NO_GO_REQUIRED_ASSETS_ABSENT"
             if any(not path.is_file() for path in required_files)
             or not args.raw_delta_root.is_dir()
+            or not args.source_utility_root.is_dir()
             else "NO_GO_ASSET_INVALID"
         )
     failed = {
@@ -1512,6 +1520,7 @@ def _record_prepare_failure(
             deployment_private_registry=args.deployment_private_registry,
             origin_pool_acceptance=args.origin_pool_acceptance,
             raw_delta_root=args.raw_delta_root,
+            source_utility_root=args.source_utility_root,
         ),
     }
     _publish(args.run_dir / "asset_census.json", failed)
@@ -1591,6 +1600,139 @@ def _materialize_sanitized_assets(
     return raw_adapter, sanitized_contexts, scoring_raw_binding
 
 
+def _materialize_source_utility_projection(
+    *,
+    run_dir: Path,
+    source_utility_root: Path,
+    layout: Mapping[str, Mapping[str, Any]],
+    config: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate the mixed authority once, then copy only 150 source cells."""
+
+    evidence_root = _evidence_root(source_utility_root)
+    if evidence_root.name != "oracle":
+        raise GateFailure(
+            "NO_GO_SOURCE_UTILITY_GAP",
+            "source utility evidence must come from an oracle-cell namespace",
+        )
+    utility_split = config["source_utility_split"]
+    seed_namespace = config["source_utility_seed_namespace"]
+    expected_resets = tuple(
+        range(
+            int(seed_namespace["reset_seed_start"]),
+            int(seed_namespace["reset_seed_start"])
+            + int(seed_namespace["episode_count"]),
+        )
+    )
+    digests: dict[str, str] = {}
+    for task in layout.values():
+        _, task_cells = _utility_matrix(
+            evidence_root,
+            task,
+            train_episode_count=int(utility_split["train_episodes"]),
+            expected_reset_seeds=expected_resets,
+            policy_seed_offset=int(seed_namespace["policy_seed_offset"]),
+        )
+        for cell_id, digest in task_cells.items():
+            if f"{cell_id}.json" in digests:
+                raise GateFailure("NO_GO_SOURCE_UTILITY_GAP", "duplicate source cell")
+            digests[f"{cell_id}.json"] = digest
+    if len(digests) != 150:
+        raise GateFailure(
+            "NO_GO_SOURCE_UTILITY_GAP",
+            "source utility projection must contain 150 unique cells",
+        )
+
+    projection_root = run_dir / "source_utility_projection"
+    for relative, expected_digest in sorted(digests.items()):
+        source = evidence_root / relative
+        if source.is_symlink() or sha256_file(source) != expected_digest:
+            raise GateFailure(
+                "NO_GO_SOURCE_UTILITY_GAP",
+                f"source utility cell changed during projection: {relative}",
+            )
+        if (
+            atomic_write_bytes(projection_root / relative, source.read_bytes())
+            != expected_digest
+        ):
+            raise GateFailure(
+                "NO_GO_SOURCE_UTILITY_GAP",
+                f"source utility projection bytes differ: {relative}",
+            )
+    return {
+        "schema": SOURCE_UTILITY_PROJECTION_SCHEMA,
+        "source_only": True,
+        "contains_target_contexts": False,
+        "root": "source_utility_projection",
+        "cell_count": 150,
+        "cells": digests,
+        "aggregate_digest": sha256_json(digests),
+    }
+
+
+def _validated_source_utility_projection(
+    run_dir: Path,
+    run: Mapping[str, Any],
+) -> tuple[Path, dict[str, str]]:
+    """Open only the prepared source projection and verify its exact tree."""
+
+    manifest_path = run_dir / "source_utility_projection_manifest.json"
+    if manifest_path.is_symlink() or not manifest_path.is_file():
+        raise GateFailure(
+            "NO_GO_SOURCE_UTILITY_GAP",
+            "source utility projection manifest is absent or unsafe",
+        )
+    manifest = _json(manifest_path)
+    if (
+        manifest.get("schema") != SOURCE_UTILITY_PROJECTION_SCHEMA
+        or manifest.get("source_only") is not True
+        or manifest.get("contains_target_contexts") is not False
+        or manifest.get("root") != "source_utility_projection"
+        or manifest.get("cell_count") != 150
+        or sha256_json(manifest)
+        != run.get("source_utility_projection_manifest_payload_digest")
+    ):
+        raise GateFailure(
+            "NO_GO_SOURCE_UTILITY_GAP",
+            "source utility projection manifest differs from prepare binding",
+        )
+    raw_cells = manifest.get("cells")
+    cells = (
+        {str(key): str(value) for key, value in raw_cells.items()}
+        if isinstance(raw_cells, Mapping)
+        else {}
+    )
+    if (
+        len(cells) != 150
+        or manifest.get("aggregate_digest") != sha256_json(cells)
+    ):
+        raise GateFailure(
+            "NO_GO_SOURCE_UTILITY_GAP",
+            "source utility projection count or aggregate differs",
+        )
+
+    projection_root = run_dir / "source_utility_projection"
+    if projection_root.is_symlink() or not projection_root.is_dir():
+        raise GateFailure(
+            "NO_GO_SOURCE_UTILITY_GAP",
+            "source utility projection root is absent or unsafe",
+        )
+    entries = tuple(projection_root.rglob("*"))
+    if any(path.is_symlink() for path in entries):
+        raise GateFailure("NO_GO_SOURCE_UTILITY_GAP", "unsafe projection symlink")
+    observed = {
+        path.relative_to(projection_root).as_posix(): sha256_file(path)
+        for path in entries
+        if path.is_file()
+    }
+    if observed != cells:
+        raise GateFailure(
+            "NO_GO_SOURCE_UTILITY_GAP",
+            "source utility projection files or digests differ",
+        )
+    return projection_root, cells
+
+
 def prepare(args: argparse.Namespace) -> Mapping[str, Any]:
     config, config_digest = _load_config(args.config)
     inputs = (
@@ -1600,6 +1742,7 @@ def prepare(args: argparse.Namespace) -> Mapping[str, Any]:
         args.origin_pool_acceptance,
         args.raw_delta_root,
         args.fpo_root,
+        args.source_utility_root,
     )
     _assert_new_output_root(args.run_dir, inputs)
     try:
@@ -1699,6 +1842,31 @@ def prepare(args: argparse.Namespace) -> Mapping[str, Any]:
             for task_id, task in sorted(layout.items())
         },
     }
+    source_utility_layout = {
+        task_id: {**task, "source_rows": layout[task_id]["source_rows"]}
+        for task_id, task in source_fit_manifest["tasks"].items()
+    }
+    try:
+        source_utility_projection_manifest = (
+            _materialize_source_utility_projection(
+                run_dir=args.run_dir,
+                source_utility_root=args.source_utility_root,
+                layout=source_utility_layout,
+                config=config,
+            )
+        )
+    except GateFailure as error:
+        return _record_prepare_failure(args, config_digest, error, status=error.status)
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        return _record_prepare_failure(args, config_digest, error)
+    census["source_utility"] = {
+        "status": "PASS_SOURCE_ONLY_PROJECTION",
+        "cell_count": source_utility_projection_manifest["cell_count"],
+        "aggregate_digest": source_utility_projection_manifest[
+            "aggregate_digest"
+        ],
+        "fit_cli_external_namespace_bound": False,
+    }
     scoring_manifest = {
         "schema": "policy-learnware.v04a-sanitized-scoring-manifest.v1",
         "access_track": "BI0-FP-RF",
@@ -1742,6 +1910,9 @@ def prepare(args: argparse.Namespace) -> Mapping[str, Any]:
         "method_cards_payload_digest": sha256_json(method_cards),
         "source_task_layout_payload_digest": sha256_json(layout_payload),
         "source_fit_manifest_payload_digest": sha256_json(source_fit_manifest),
+        "source_utility_projection_manifest_payload_digest": sha256_json(
+            source_utility_projection_manifest
+        ),
         "scoring_manifest_payload_digest": sha256_json(scoring_manifest),
         "raw_delta_adapter_payload_digest": sha256_json(raw_adapter),
         "target_oracle_bound": False,
@@ -1752,6 +1923,10 @@ def prepare(args: argparse.Namespace) -> Mapping[str, Any]:
     _publish(args.run_dir / "probe_membership.json", membership_payload)
     _publish(args.run_dir / "source_task_layout.json", layout_payload)
     _publish(args.run_dir / "source_fit_manifest.json", source_fit_manifest)
+    _publish(
+        args.run_dir / "source_utility_projection_manifest.json",
+        source_utility_projection_manifest,
+    )
     _publish(args.run_dir / "scoring_manifest.json", scoring_manifest)
     _publish(args.run_dir / "raw_delta_adapter.json", raw_adapter)
     return run
@@ -2454,10 +2629,6 @@ def fit_source(args: argparse.Namespace) -> Mapping[str, Any]:
             source_by_id[type_id] for type_id in task["source_type_ids"]
         ]
         layout[str(task_id)] = task
-    utility_root = args.source_utility_root.resolve()
-    raw_operator_root = (args.run_dir / str(run["raw_delta"]["root"])).resolve()
-    if utility_root == raw_operator_root:
-        raise V04ARunnerError("source utility and Raw artifact roots cannot alias")
 
     bpr_cfg = config["bpr"]
     ebpr_cfg = config["ebpr"]
@@ -2506,23 +2677,24 @@ def fit_source(args: argparse.Namespace) -> Mapping[str, Any]:
         ],
     ] = {}
     try:
-        # Do not read the mixed 54-context v03 build/summary manifests here:
-        # they contain target construction metadata and oracle-derived
-        # aggregates.  Source admission is instead an exact allowlist of the
-        # 150 source-role cells, each schema/stage/bundle/seed/episode checked
-        # below and then frozen by digest in the source-only projection.
-        evidence_root = _evidence_root(utility_root)
-        if evidence_root.name != "oracle":
-            raise GateFailure(
-                "NO_GO_SOURCE_UTILITY_GAP",
-                "source utility evidence must come from an oracle-cell namespace",
-            )
+        # The broad prepare process has already admitted and copied exactly
+        # 150 cells.  This fit process has no external oracle-root argument and
+        # opens only the run-relative source-only projection.
+        evidence_root, projected_evidence_digests = (
+            _validated_source_utility_projection(args.run_dir, run)
+        )
         utility_artifact["input_namespace_provenance"] = {
-            "source_projection": "exact allowlisted source-role cells only",
+            "source_projection": "run-relative exact 150-cell source-only copy",
+            "projection_manifest_payload_digest": run[
+                "source_utility_projection_manifest_payload_digest"
+            ],
             "expected_cell_schema": V03_BASELINE_SCHEMA,
             "expected_cell_stage": "PRIVATE_ORACLE",
             "expected_source_context_count": 30,
             "expected_cell_count": 150,
+            "projection_aggregate_digest": sha256_json(
+                projected_evidence_digests
+            ),
             "mixed_manifest_or_target_records_read": False,
             "input_path_withheld_from_scorer": True,
         }
@@ -2542,6 +2714,14 @@ def fit_source(args: argparse.Namespace) -> Mapping[str, Any]:
             raise GateFailure(
                 "NO_GO_SOURCE_UTILITY_GAP",
                 "source utility projection must contain exactly 150 unique cells",
+            )
+        if {
+            f"{cell_id}.json": digest
+            for cell_id, digest in source_evidence_digests.items()
+        } != projected_evidence_digests:
+            raise GateFailure(
+                "NO_GO_SOURCE_UTILITY_GAP",
+                "source utility identities changed after projection validation",
             )
         for task_id, task in layout.items():
             utility = utility_artifact["tasks"][task_id]
@@ -4330,11 +4510,11 @@ def _parser() -> argparse.ArgumentParser:
     prepare_parser.add_argument("--origin-pool-acceptance", type=_path, required=True)
     prepare_parser.add_argument("--raw-delta-root", type=_path, required=True)
     prepare_parser.add_argument("--fpo-root", type=_path, required=True)
+    prepare_parser.add_argument("--source-utility-root", type=_path, required=True)
     prepare_parser.set_defaults(handler=prepare)
 
     fit = subparsers.add_parser("fit-source")
     fit.add_argument("--run-dir", type=_path, required=True)
-    fit.add_argument("--source-utility-root", type=_path, required=True)
     fit.add_argument("--resume", action="store_true")
     fit.set_defaults(handler=fit_source)
 

@@ -252,6 +252,7 @@ def test_prepare_missing_real_assets_fails_closed_with_metadata(tmp_path: Path) 
             origin_pool_acceptance=tmp_path / "missing-pool-acceptance.json",
             raw_delta_root=raw_root,
             fpo_root=tmp_path / "missing-fpo-runtime",
+            source_utility_root=tmp_path / "missing-source-utility",
         )
     )
 
@@ -291,6 +292,8 @@ def test_no_go_prepare_returns_nonzero_process_status(tmp_path: Path) -> None:
             str(tmp_path / "missing-raw"),
             "--fpo-root",
             str(tmp_path / "missing-fpo-runtime"),
+            "--source-utility-root",
+            str(tmp_path / "missing-source-utility"),
         ]
     )
     assert result == 2
@@ -584,6 +587,8 @@ def test_deployment_audit_separates_determinism_from_cross_backend_float(
 
 def test_score_parser_has_no_oracle_capability() -> None:
     parser = _parser()
+    fit = parser.parse_args(["fit-source", "--run-dir", "/tmp/v04a-run"])
+    assert not hasattr(fit, "source_utility_root")
     with pytest.raises(SystemExit):
         parser.parse_args(["score-fp", "--run-dir", "/tmp/v04a-run"])
     parsed = parser.parse_args(
@@ -1212,60 +1217,144 @@ def test_score_fp_uses_only_sanitized_reward_free_closure(
         score_fp(argparse.Namespace(run_dir=run_dir, block_size=16, resume=True))
 
 
-def test_fit_source_never_opens_target_scoring_manifest(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    run_dir = tmp_path / "source-only-fit-run"
+def _source_projection_fixture(
+    tmp_path: Path,
+) -> tuple[Path, Path, dict, dict, dict]:
+    run_dir = tmp_path / "run"
+    mixed_root = tmp_path / "mixed-authority"
+    oracle_root = mixed_root / "oracle"
     scoring_manifest, _ = _seal_fixture()
-    source_fit_manifest = {
+    contexts = [
+        {
+            **row,
+            "reward_free_npz": f"source_fit_banks/{row['context_id']}.npz",
+        }
+        for row in scoring_manifest["contexts"]
+        if row["role"] == "source"
+    ]
+    tasks = {
+        task_id: {
+            key: value
+            for key, value in task.items()
+            if key != "raw_tie_break_tokens"
+        }
+        for task_id, task in scoring_manifest["tasks"].items()
+    }
+    layout = {
+        task_id: {
+            **task,
+            "source_rows": [
+                row for row in contexts if row["task_id"] == task_id
+            ],
+        }
+        for task_id, task in tasks.items()
+    }
+    for task_id, task in layout.items():
+        for row in task["source_rows"]:
+            _write_utility_evidence(
+                oracle_root,
+                task_id=task_id,
+                context_id=row["context_id"],
+                candidates=tuple(task["candidate_ids"]),
+                bundle_digests=dict(task["candidate_bundle_digests"]),
+            )
+    _publish(
+        oracle_root / "private-target" / "secret.json",
+        {"private": "must-not-be-projected"},
+    )
+    config, _ = _load_config(CONFIG)
+    projection = runner_module._materialize_source_utility_projection(
+        run_dir=run_dir,
+        source_utility_root=mixed_root,
+        layout=layout,
+        config=config,
+    )
+    source_manifest = {
         "schema": "policy-learnware.v04a-source-fit-manifest.v1",
         "contains_reward_or_done": False,
         "contains_target_contexts": False,
-        "contexts": [
-            {
-                **row,
-                "reward_free_npz": f"source_fit_banks/{row['context_id']}.npz",
-            }
-            for row in scoring_manifest["contexts"]
-            if row["role"] == "source"
-        ],
-        "tasks": {
-            task_id: {
-                key: value
-                for key, value in task.items()
-                if key != "raw_tie_break_tokens"
-            }
-            for task_id, task in scoring_manifest["tasks"].items()
-        },
+        "contexts": contexts,
+        "tasks": tasks,
     }
-    _publish(run_dir / "source_fit_manifest.json", source_fit_manifest)
+    _publish(run_dir / "source_fit_manifest.json", source_manifest)
+    _publish(run_dir / "source_utility_projection_manifest.json", projection)
     _prepared_run(
         run_dir,
         run_fields={
             "fixed_probe_protocol_id": sha256_json({"source-only": True}),
-            "source_fit_manifest_payload_digest": sha256_json(source_fit_manifest),
-            "raw_delta": {"root": "raw_source_operator"},
+            "source_fit_manifest_payload_digest": sha256_json(source_manifest),
+            "source_utility_projection_manifest_payload_digest": sha256_json(
+                projection
+            ),
         },
     )
-    empty_utility_root = tmp_path / "empty-source-utility"
-    empty_utility_root.mkdir()
-
-    def forbidden_target_manifest(*args, **kwargs):
-        raise AssertionError("fit_source opened the target scoring closure")
-
-    monkeypatch.setattr(runner_module, "_scoring_manifest", forbidden_target_manifest)
-    monkeypatch.setattr(runner_module, "_sanitized_layout", forbidden_target_manifest)
-    result = fit_source(
-        argparse.Namespace(
-            run_dir=run_dir,
-            source_utility_root=empty_utility_root,
-            resume=False,
-        )
+    return run_dir, mixed_root, layout, projection, runner_module._json(
+        run_dir / "run.json"
     )
 
-    assert result["status"] == "NO_GO_MISSING_ASSET"
-    assert result["source_only"] is True
-    assert not (run_dir / "scoring_manifest.json").exists()
+
+def test_source_utility_projection_exact_and_no_clobber(tmp_path: Path) -> None:
+    run_dir, mixed_root, layout, projection, run = _source_projection_fixture(
+        tmp_path
+    )
+    root = run_dir / projection["root"]
+    assert projection["cell_count"] == len(projection["cells"]) == 150
+    assert projection["contains_target_contexts"] is False
+    assert projection["aggregate_digest"] == sha256_json(projection["cells"])
+    assert len(tuple(root.glob("*/*.json"))) == 150
+    assert not (root / "private-target").exists()
+    assert runner_module._validated_source_utility_projection(run_dir, run) == (
+        root,
+        projection["cells"],
+    )
+    config, _ = _load_config(CONFIG)
+    with pytest.raises(FileExistsError):
+        runner_module._materialize_source_utility_projection(
+            run_dir=run_dir,
+            source_utility_root=mixed_root,
+            layout=layout,
+            config=config,
+        )
+
+
+def test_source_utility_projection_rejects_tamper_and_extra(tmp_path: Path) -> None:
+    run_dir, _, _, projection, run = _source_projection_fixture(tmp_path)
+    root = run_dir / projection["root"]
+    cell = root / sorted(projection["cells"])[0]
+    original = cell.read_bytes()
+    cell.write_bytes(original + b"tampered")
+    with pytest.raises(GateFailure, match="files or digests differ"):
+        runner_module._validated_source_utility_projection(run_dir, run)
+    cell.write_bytes(original)
+    _publish(root / "unexpected.json", {"unexpected": True})
+    with pytest.raises(GateFailure, match="files or digests differ"):
+        runner_module._validated_source_utility_projection(run_dir, run)
+
+
+def test_fit_source_can_only_open_source_utility_projection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_dir, mixed_root, _, projection, _ = _source_projection_fixture(tmp_path)
+    projection_root = (run_dir / projection["root"]).resolve()
+    original_evidence_root = runner_module._evidence_root
+    opened: list[Path] = []
+
+    def projection_only(root: Path) -> Path:
+        resolved = Path(root).resolve()
+        assert resolved == projection_root
+        opened.append(resolved)
+        return original_evidence_root(root)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("fit-source opened the target scoring closure")
+
+    monkeypatch.setattr(runner_module, "_evidence_root", projection_only)
+    monkeypatch.setattr(runner_module, "_scoring_manifest", forbidden)
+    monkeypatch.setattr(runner_module, "_sanitized_layout", forbidden)
+    result = fit_source(argparse.Namespace(run_dir=run_dir, resume=False))
+    assert result["status"] == "NO_GO_SOURCE_MODEL_FIT"
+    assert opened == [projection_root] * 6
+    assert (mixed_root / "oracle" / "private-target" / "secret.json").is_file()
     assert not (run_dir / "checkpoints").exists()
 
 
