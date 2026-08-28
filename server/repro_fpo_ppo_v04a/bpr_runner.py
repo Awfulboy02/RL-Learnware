@@ -131,7 +131,7 @@ LOGGER_FIELDS = (
 
 # The v02 exporter hard-gated its same-runtime golden replay at 1e-6.  The
 # frozen v03 source-market later showed that those float32 action bytes are not
-# portable across otherwise valid JAX/XLA backends.  The v03 g0544 evidence
+# portable across otherwise valid JAX/XLA backends.  The frozen v03 evidence
 # reached 2.27e-2 before tanh and 5.39e-3 after tanh.  A later read-only replay
 # of all 30 selected policies on the original m2 host's CPU reached 6.43e-2
 # and 2.86e-2 respectively, while every deterministic/transform/key invariant
@@ -144,7 +144,7 @@ COMPILED_PARITY_SAMPLE_COUNT = 2
 CROSS_BACKEND_PARITY = {
     "version": "v04a-selected-market-f32-m2cpu-v2",
     "dtype": "float32",
-    "scope": "stored-golden-diagnostic-only; never ranking or asset identity",
+    "scope": "stored-golden compatibility guard; values never enter ranking or identity",
     "raw_atol": 7.0e-2,
     "environment_atol": 3.0e-2,
     "rtol": 1.0e-5,
