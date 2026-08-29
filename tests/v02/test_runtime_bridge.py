@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import importlib.machinery
+import importlib.util
 from pathlib import Path
+import py_compile
 import subprocess
 import sys
 from types import ModuleType
@@ -560,6 +562,95 @@ def test_loader_requires_bytecode_suppression(
     monkeypatch.setattr(sys, "dont_write_bytecode", False)
     with pytest.raises(runtime.RuntimeVerificationError, match="dont_write_bytecode"):
         runtime.load_verified_fpo_upstream(root, allow_reconstructed=True)
+
+
+def test_loader_rejects_external_bytecode_cache_before_attestation_or_import(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, _ = _make_checkout(tmp_path)
+    trusted_source = root / "playground" / "src" / "flow_policy" / "fpo.py"
+    malicious_source = tmp_path / "malicious_fpo.py"
+    malicious_source.write_text("NAME = 'external-cache'\n", encoding="utf-8")
+    external_cache = tmp_path / "external-pycache"
+    monkeypatch.setattr(sys, "pycache_prefix", str(external_cache))
+    cache_path = Path(importlib.util.cache_from_source(str(trusted_source)))
+    cache_path.parent.mkdir(parents=True)
+    py_compile.compile(
+        str(malicious_source),
+        cfile=str(cache_path),
+        dfile=str(trusted_source),
+        doraise=True,
+        invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH,
+    )
+    assert cache_path.is_file()
+
+    verifications: list[Path] = []
+    imports: list[str] = []
+    before = {
+        name: module
+        for name, module in sys.modules.items()
+        if name == "flow_policy" or name.startswith("flow_policy.")
+    }
+    monkeypatch.setattr(
+        runtime,
+        "verify_fpo_checkout",
+        lambda path: verifications.append(Path(path)),
+    )
+    monkeypatch.setattr(
+        runtime.importlib,
+        "import_module",
+        lambda name: imports.append(name),
+    )
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+
+    with pytest.raises(runtime.RuntimeVerificationError, match="pycache_prefix=None"):
+        runtime.load_verified_fpo_upstream(root, allow_reconstructed=True)
+
+    after = {
+        name: module
+        for name, module in sys.modules.items()
+        if name == "flow_policy" or name.startswith("flow_policy.")
+    }
+    assert verifications == []
+    assert imports == []
+    assert after == before
+
+
+def test_loader_rejects_empty_pycache_prefix_before_attestation_or_import(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, _ = _make_checkout(tmp_path)
+    verifications: list[Path] = []
+    imports: list[str] = []
+    before = {
+        name: module
+        for name, module in sys.modules.items()
+        if name == "flow_policy" or name.startswith("flow_policy.")
+    }
+    monkeypatch.setattr(sys, "pycache_prefix", "")
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    monkeypatch.setattr(
+        runtime,
+        "verify_fpo_checkout",
+        lambda path: verifications.append(Path(path)),
+    )
+    monkeypatch.setattr(
+        runtime.importlib,
+        "import_module",
+        lambda name: imports.append(name),
+    )
+
+    with pytest.raises(runtime.RuntimeVerificationError, match="pycache_prefix=None"):
+        runtime.load_verified_fpo_upstream(root, allow_reconstructed=True)
+
+    assert verifications == []
+    assert imports == []
+    after = {
+        name: module
+        for name, module in sys.modules.items()
+        if name == "flow_policy" or name.startswith("flow_policy.")
+    }
+    assert after == before
 
 
 def test_original_vendor_is_permanently_missing_and_fail_closed() -> None:
