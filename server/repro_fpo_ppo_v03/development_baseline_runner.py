@@ -1040,7 +1040,7 @@ def _resolve_artifact_inputs(args: argparse.Namespace) -> None:
     if args.relocation_manifest is not None:
         args.relocation_manifest = args.relocation_manifest.expanduser().resolve()
     else:
-        default_manifest = layout.root / "v02" / "relocation_manifest.json"
+        default_manifest = layout.relocation_manifest
         args.relocation_manifest = default_manifest if default_manifest.is_file() else None
 
 

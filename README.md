@@ -52,13 +52,15 @@ Canonical roots are `/share/songyf/RL_Learnware/artifacts` on the server and
 `/Users/jamesmac/Desktop/RL Learnware/artifacts` locally. The v0.3 closure is:
 
 ```text
-artifacts/v03/
-  runs/
-    v03-main-20260827-r0/                 # source market + legacy evidence
-    v03-signal-ranking-20260827-r1/       # banks, Signal Atlas, oracle, metrics
-    v031-raw-transition-controls-20260828-r1/  # eight fixed-Raw views
-  restricted/authorities/                 # centrally managed nonces
-  relocation_manifest.json                # old -> new, never rewrites receipts
+artifacts/
+  relocation_manifest.json                # old -> new; receipts stay immutable
+  shared/runtime/fpo-418c2554/             # recovered, attested FPO checkout
+  v03/
+    runs/
+      v03-main-20260827-r0/                # source market + legacy evidence
+      v03-signal-ranking-20260827-r1/      # banks, Atlas, oracle, metrics
+      v031-raw-transition-controls-20260828-r1/  # eight fixed-Raw views
+    restricted/authorities/                # centrally managed nonces
 ```
 
 The private deployment registry and development oracle are restricted assets.
@@ -66,6 +68,12 @@ Historical manifests, receipts, configs, and digests remain byte-identical;
 portable code applies a separate relocation manifest when a recorded path has
 moved. The exact-90 policies are shared v0.2 assets and are not duplicated
 under `artifacts/v03/`.
+
+Relocation rows keep the immutable historical `source` as an absolute path and
+store `target` relative to the common artifacts root, so the same manifest is
+byte-identical across local and server mirrors. Only verified rows whose
+`sha256sum-relative-v1` inventory, file count, and regular-file bytes match are
+usable.
 
 ## Install and focused checks
 
@@ -132,15 +140,18 @@ through that external mapping; it never edits the frozen private registry.
 ## Recovery and provenance boundary
 
 The stored banks, source market, Raw-RKME specifications, rankings, oracle, and
-metrics are complete and digest-verifiable. Two inputs required for a *fresh*
-end-to-end replay are not currently preserved in their original locations:
+metrics are complete and digest-verifiable. The FPO checkout recovered at
+`artifacts/shared/runtime/fpo-418c2554` passes both frozen attestation digests.
+Two inputs required for an original-provenance *fresh* end-to-end replay are
+still unavailable:
 
 - the persisted v0.3 intake/binding triplet must be regenerated from the v0.2
   exact-90 handoff;
-- the original top-level FPO checkout and `_vendor` runtime are missing.
+- the original `_vendor` dependency tree is missing.
 
-The archived FPO commit is only a recovery candidate and `_vendor` has not been
-found. Any regenerated intake or replacement runtime must be labelled
+The recovered FPO checkout is verified source/runtime evidence, not a
+candidate; this does not reconstruct its missing `_vendor` bytes. Any
+regenerated intake or replacement vendor runtime must be labelled
 `RECONSTRUCTED`; a successful reconstructed policy rollout is not the original
 provenance replay. Until that recovery is independently verified, the
 supported reproduction boundary is stored banks through Raw-RKME ranking and

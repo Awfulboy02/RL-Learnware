@@ -1,8 +1,8 @@
 """Strict, digest-bound foundation records for the v0.3 sidecar.
 
 The records in this module deliberately contain only protocol identities and
-opaque public identifiers.  Private task/axis/factor material is kept in the
-LOTO audit record and is never accepted by the anonymous selector projection.
+opaque public identifiers. Private task/axis/factor material remains outside
+selector-visible records and is never accepted by the anonymous projection.
 """
 
 from __future__ import annotations
