@@ -95,7 +95,6 @@ artifacts/
     │   ├── v05-ablation-fewshot-20260829-r0/
     │   ├── v05-compute-scale-20260829-r0/
     │   └── v05-ablation-summary-20260829-r0/
-    └── evidence/final-manifest-chain/
 ```
 
 The loader resolves v0.3 and v0.4a independently from this root and verifies
@@ -111,7 +110,13 @@ evidence, but this branch does not claim exact source-level regeneration of
 those derived files. The raw development, few-shot, and OFAT JSON producers are
 versioned and reproducible.
 
-Narrative reports live outside Git under `reports/v05/`.
+The five former workspace-root JSON aliases are byte-identical duplicates and
+are removed after hash verification. Their authoritative copies are
+`runs/.../results/development_report.json` and the release files
+`initial_launch_receipt.json`, `execution_events.json`, `final_manifest.json`,
+and `tables_abc.json`; no duplicate evidence chain is created.
+
+Canonical narrative reports live outside Git under `reports/v05/`.
 
 ## Install and test
 

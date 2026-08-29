@@ -16,6 +16,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from policy_learnware_v0.hashing import canonical_json_bytes, sha256_file, sha256_json
+from policy_learnware_v0 import cli as top_level_cli
 from policy_learnware_v0.io import atomic_write_json, read_json
 from policy_learnware_v0.rkme.reducer import ReducerConfig
 from policy_learnware_v0.v04a.protocol import (
@@ -1421,10 +1422,123 @@ def test_frozen_root_resolver_uses_canonical_layout_from_any_location(
         other_v03.resolve(),
     )
     monkeypatch.delenv("RL_LEARNWARE_ARTIFACTS_ROOT")
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    (repository / ".git").mkdir()
+    (repository / "pyproject.toml").write_text(
+        '[project]\nname = "policy-learnware-v0"\n', encoding="utf-8"
+    )
     assert (
-        runner_module.resolve_artifacts_root(repository_root=tmp_path / "repository")
+        runner_module.resolve_artifacts_root(repository_root=repository)
         == (tmp_path / "artifacts").resolve()
     )
+
+
+def test_artifact_root_rejects_empty_explicit_value() -> None:
+    with pytest.raises(ValueError, match="cannot be empty"):
+        runner_module.resolve_artifacts_root("")
+
+
+def test_artifact_root_rejects_existing_symlink_ancestor(tmp_path) -> None:
+    real = tmp_path / "real"
+    (real / "artifacts").mkdir(parents=True)
+    alias = tmp_path / "alias"
+    alias.symlink_to(real, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="symlink ancestor"):
+        runner_module.resolve_artifacts_root(alias / "artifacts")
+
+
+def test_artifact_root_fallback_rejects_noncheckout_and_worktree(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.delenv("RL_LEARNWARE_ARTIFACTS_ROOT", raising=False)
+    wheel_like = tmp_path / "site-packages" / "policy_learnware_v0"
+    wheel_like.mkdir(parents=True)
+    with pytest.raises(ValueError, match="outside a checkout"):
+        runner_module.resolve_artifacts_root(repository_root=wheel_like)
+
+    worktree = tmp_path / "audit-worktree"
+    worktree.mkdir()
+    (worktree / ".git").write_text("gitdir: /tmp/shared/.git/worktrees/audit\n")
+    (worktree / "pyproject.toml").write_text(
+        '[project]\nname = "policy-learnware-v0"\n', encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="worktrees require explicit"):
+        runner_module.resolve_artifacts_root(repository_root=worktree)
+
+
+def test_top_level_cli_rejects_empty_artifacts_root(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    monkeypatch.setenv("RL_LEARNWARE_ARTIFACTS_ROOT", str(tmp_path / "configured"))
+    config = Path(__file__).resolve().parents[2] / "configs" / "smoke.yaml"
+    assert (
+        top_level_cli.main(
+            [
+                "validate-config",
+                "--config",
+                str(config),
+                "--artifacts-root",
+                "",
+                "--dry-run",
+            ]
+        )
+        == 1
+    )
+    error = json.loads(capsys.readouterr().err)
+    assert error["error_type"] == "ArtifactLayoutError"
+    assert "cannot be empty" in error["message"]
+
+
+def test_top_level_cli_rejects_artifact_symlink_ancestor(tmp_path, capsys) -> None:
+    real = tmp_path / "real"
+    (real / "artifacts").mkdir(parents=True)
+    alias = tmp_path / "alias"
+    alias.symlink_to(real, target_is_directory=True)
+    config = Path(__file__).resolve().parents[2] / "configs" / "smoke.yaml"
+    assert (
+        top_level_cli.main(
+            [
+                "validate-config",
+                "--config",
+                str(config),
+                "--artifacts-root",
+                str(alias / "artifacts"),
+                "--dry-run",
+            ]
+        )
+        == 1
+    )
+    error = json.loads(capsys.readouterr().err)
+    assert error["error_type"] == "ArtifactLayoutError"
+    assert "symlink ancestor" in error["message"]
+
+
+def test_frozen_json_rejects_nested_symlink_escape_before_read(
+    tmp_path, monkeypatch
+) -> None:
+    owner = tmp_path / "owner"
+    external = tmp_path / "external"
+    owner.mkdir()
+    external.mkdir()
+    (external / "document.json").write_text("{}", encoding="utf-8")
+    (owner / "nested").symlink_to(external, target_is_directory=True)
+    frozen_reads = []
+    monkeypatch.setattr(
+        runner_module,
+        "_frozen_bytes",
+        lambda *args, **kwargs: frozen_reads.append((args, kwargs)),
+    )
+
+    with pytest.raises(V05RunnerError, match="contains a symlink"):
+        runner_module._frozen_json(
+            owner,
+            {"relative_path": "nested/document.json"},
+            expected_sha256=_digest("document"),
+            where="nested fixture",
+        )
+    assert frozen_reads == []
 
 
 def test_frozen_root_resolver_fails_before_frozen_input_io(
