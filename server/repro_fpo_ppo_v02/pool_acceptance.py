@@ -19,10 +19,14 @@ from collections import Counter
 import json
 import math
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 from .anchor_binding import AnchorManifest
-from .package_bridge import _validate_checkpoint_bytes, derive_iterations_per_env
+from .handoff_contracts import (
+    _validate_checkpoint_bytes,
+    derive_iterations_per_env,
+    validate_completed_attempt,
+)
 from .provenance import (
     ContractError,
     FORMAL_EXECUTION_PURPOSE,
@@ -44,7 +48,6 @@ from .provenance import (
     validate_vendor_provenance,
     with_self_digest,
 )
-from .queue_master import validate_completed_attempt
 
 
 PROMOTION_SCHEMA = "policy-learnware.v02-compiled-parity-promotion-set.v0"
@@ -57,6 +60,8 @@ EXPECTED_JOB_COUNT = 90
 EXPECTED_ANCHOR_COUNT = 30
 EXPECTED_SEEDS = (0, 1, 2)
 EXPECTED_TERMINAL_RECORD_COUNTS = {"recovered": 57, "succeeded": 27}
+
+RecordedPathResolver = Callable[[str | Path], Path]
 
 _CHECKPOINT_EVENT_KEYS = {
     "event",
@@ -96,6 +101,12 @@ _PROMOTION_ENTRY_KEYS = {
     "events_sha256",
     "entry_digest",
 }
+
+
+def _physical_path(
+    value: str | Path, resolver: RecordedPathResolver | None
+) -> Path:
+    return Path(value).resolve() if resolver is None else Path(resolver(value)).resolve()
 
 
 def _strict_json_line(line: str, *, where: str) -> dict[str, Any]:
@@ -176,7 +187,9 @@ def _failed_payload(message: str) -> dict[str, Any]:
 
 
 def _canonical_job_roots(
-    plan: Mapping[str, Any], runs_root: Path
+    plan: Mapping[str, Any],
+    runs_root: Path,
+    path_resolver: RecordedPathResolver | None = None,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
     validated = validate_training_plan(plan)
     jobs = {job["job_id"]: validate_training_job(job) for job in validated["jobs"]}
@@ -187,7 +200,9 @@ def _canonical_job_roots(
             f"v0.2 policy-pool acceptance requires exactly {EXPECTED_JOB_COUNT} jobs"
         )
     for job in jobs.values():
-        anchor = AnchorManifest.from_path(job["anchor_manifest_path"])
+        anchor = AnchorManifest.from_path(
+            _physical_path(job["anchor_manifest_path"], path_resolver)
+        )
         if anchor.manifest_digest != job["anchor_manifest_digest"]:
             raise ContractError(
                 "live anchor manifest differs from the frozen server job"
@@ -276,12 +291,16 @@ def _queue_authority(
 
 
 def _attempt_from_entry(
-    *, entry: Mapping[str, Any], job: Mapping[str, Any], runs_root: Path
+    *,
+    entry: Mapping[str, Any],
+    job: Mapping[str, Any],
+    runs_root: Path,
+    path_resolver: RecordedPathResolver | None = None,
 ) -> tuple[Path, dict[str, Any]]:
     expected_dir = (
         runs_root / "jobs" / job["job_id"] / f"attempt_{entry['attempt_number']:03d}"
     ).resolve()
-    supplied = Path(entry["attempt_dir"]).resolve()
+    supplied = _physical_path(entry["attempt_dir"], path_resolver)
     if (
         supplied != expected_dir
         or supplied.name != f"attempt_{entry['attempt_number']:03d}"
@@ -299,14 +318,18 @@ def _attempt_from_entry(
 
 
 def _final_attempt_dir(
-    *, state: Mapping[str, Any], job_id: str, runs_root: Path
+    *,
+    state: Mapping[str, Any],
+    job_id: str,
+    runs_root: Path,
+    path_resolver: RecordedPathResolver | None = None,
 ) -> Path:
     attempts = state.get("attempts")
     if isinstance(attempts, bool) or not isinstance(attempts, int) or attempts <= 0:
         raise ContractError("final queue state has no positive attempt count")
     expected = (runs_root / "jobs" / job_id / f"attempt_{attempts:03d}").resolve()
     supplied = state.get("attempt_dir")
-    if supplied is not None and Path(supplied).resolve() != expected:
+    if supplied is not None and _physical_path(supplied, path_resolver) != expected:
         raise ContractError("final queue attempt_dir differs from its attempt count")
     if not expected.is_dir():
         raise ContractError("final canonical attempt directory is missing")
@@ -447,6 +470,7 @@ def _validate_promotion(
     expected_vendor: Mapping[str, Any],
     expected_implementation: Mapping[str, Any],
     expected_plan_digest: str,
+    path_resolver: RecordedPathResolver | None = None,
 ) -> dict[str, Any]:
     require_exact_keys(entry, _PROMOTION_ENTRY_KEYS, "compiled-parity promotion entry")
     validate_self_digest(
@@ -459,19 +483,29 @@ def _validate_promotion(
         or entry["failure_type"] != "ContractError"
         or state.get("state") != "failed"
         or entry["attempt_number"] != state.get("attempts")
-        or _final_attempt_dir(state=state, job_id=job["job_id"], runs_root=runs_root)
-        != Path(entry["attempt_dir"]).resolve()
+        or _final_attempt_dir(
+            state=state,
+            job_id=job["job_id"],
+            runs_root=runs_root,
+            path_resolver=path_resolver,
+        )
+        != _physical_path(entry["attempt_dir"], path_resolver)
     ):
         raise ContractError("promotion entry differs from the final failed queue cell")
     attempt_dir, attempt = _attempt_from_entry(
-        entry=entry, job=job, runs_root=runs_root
+        entry=entry,
+        job=job,
+        runs_root=runs_root,
+        path_resolver=path_resolver,
     )
     if attempt["plan_digest"] != expected_plan_digest:
         raise ContractError("promotion attempt differs from the frozen server plan")
     validate_implementation_provenance(
         attempt["implementation"], expected=expected_implementation
     )
-    anchor = AnchorManifest.from_path(job["anchor_manifest_path"])
+    anchor = AnchorManifest.from_path(
+        _physical_path(job["anchor_manifest_path"], path_resolver)
+    )
     run = validate_run_manifest_server_binding(
         load_strict_json(attempt_dir / "run_manifest.json"),
         job=job,
@@ -495,9 +529,11 @@ def _validate_promotion(
         expected_hardware_digest=runtime["hardware_digest"],
         expected_config_digest=job["config_digest"],
         expected_execution_purpose=job["execution_purpose"],
-        expected_attempt_root=attempt_dir,
+        expected_attempt_root=Path(runtime["execution_evidence"]["attempt_root"]),
         require_formal=True,
     )
+    if _physical_path(execution["attempt_root"], path_resolver) != attempt_dir.resolve():
+        raise ContractError("promotion execution root does not resolve to this attempt")
     if (
         execution["execution_mode"] != FORMAL_GPU_EXECUTION_MODE
         or execution["formal_eligible"] is not True
@@ -536,15 +572,21 @@ def _validate_promotion(
     exact = {
         "failure_message": evidence["failure_message"],
         "failed_compiled_parity": evidence["failed_compiled_parity"],
-        "traceback_path": str(evidence["traceback_path"]),
         "traceback_sha256": evidence["traceback_sha256"],
-        "events_path": str(evidence["events_path"]),
         "events_sha256": evidence["events_sha256"],
     }
     if any(entry[key] != value for key, value in exact.items()):
         raise ContractError(
             "promotion entry failure evidence differs from immutable bytes"
         )
+    for key, observed_key in (
+        ("traceback_path", "traceback_path"),
+        ("events_path", "events_path"),
+    ):
+        if _physical_path(entry[key], path_resolver) != evidence[observed_key]:
+            raise ContractError(
+                "promotion entry failure path does not resolve to immutable bytes"
+            )
     parity = job["training_protocol"]["parity"]
     failed_payload = evidence["failed_compiled_parity"]
     if (
@@ -638,6 +680,7 @@ def _validate_promotion(
             execution=execution,
             source_attestation=source_attestation,
             attempt_root=attempt_dir,
+            path_resolver=path_resolver,
         )
     return {
         "resolution": "compiled_parity_fallback_promotion",
@@ -665,10 +708,13 @@ def accept_policy_pool(
     server_plan: Mapping[str, Any],
     runs_root: Path,
     promotion_manifest: Mapping[str, Any],
+    path_resolver: RecordedPathResolver | None = None,
 ) -> dict[str, Any]:
     """Revalidate and accept the exact reviewed 84-direct + 6-promotion pool."""
 
-    jobs, plan = _canonical_job_roots(server_plan, runs_root)
+    jobs, plan = _canonical_job_roots(
+        server_plan, runs_root, path_resolver=path_resolver
+    )
     status, vendor, implementation = _queue_authority(runs_root, plan, jobs)
     require_exact_keys(
         promotion_manifest,
@@ -720,7 +766,10 @@ def accept_policy_pool(
         if state.get("state") != "succeeded":
             raise ContractError("non-promoted cell is not a successful queue terminal")
         attempt_dir = _final_attempt_dir(
-            state=state, job_id=job_id, runs_root=runs_root.resolve()
+            state=state,
+            job_id=job_id,
+            runs_root=runs_root.resolve(),
+            path_resolver=path_resolver,
         )
         attempt = validate_attempt(
             load_strict_json(attempt_dir / "attempt_manifest.json")
@@ -751,6 +800,7 @@ def accept_policy_pool(
             attempt,
             expected_vendor=vendor,
             expected_implementation=implementation,
+            path_resolver=path_resolver,
         )
         promoted = record["checkpoint_bundles"][-1]
         direct_keys = {"attempt_dir", "attempts", "state", "terminal_record_state"}
@@ -774,7 +824,7 @@ def accept_policy_pool(
             "job_id": job_id,
             "job_digest": job["job_digest"],
             "source_anchor_id": AnchorManifest.from_path(
-                job["anchor_manifest_path"]
+                _physical_path(job["anchor_manifest_path"], path_resolver)
             ).anchor_id,
             "seed": job["seed"],
             "attempt_number": attempt["attempt_number"],
@@ -798,6 +848,7 @@ def accept_policy_pool(
             expected_vendor=vendor,
             expected_implementation=implementation,
             expected_plan_digest=plan["plan_digest"],
+            path_resolver=path_resolver,
         )
 
     resolutions = Counter(cell["resolution"] for cell in cells.values())
