@@ -135,21 +135,30 @@ PYTHONPATH=src:. "$PY" -m server.repro_fpo_ppo_v04a.bpr_runner summarize \
   --artifacts-root "$RL_LEARNWARE_ARTIFACTS_ROOT" --run-dir "$RUN"
 ```
 
-## Verify a central R4 relocation
+## Verify an R4 relocation before source retirement
 
-The central audit copies the complete immutable R4 tree to
-`v04a/runs/v04a-primary-dev-20260828-r4/`. After copying, this read-only verifier
-requires exact source/target tree equality, validates the source-only and
-seal-before-oracle status, and writes `v04a/relocation_manifest.json`:
+The relocation verifier is a pre-retirement operation. It requires three
+distinct source directories: the complete R4 run, a directory containing
+exactly the seven R4 log files, and a directory containing exactly the three
+m2cpu diagnostic files. After copying, it requires exact source/target equality,
+validates the source-only and seal-before-oracle status, and writes
+`v04a/relocation_manifest.json`:
 
 ```bash
 PYTHONPATH=src:. "$PY" -m server.repro_fpo_ppo_v04a.bpr_runner relocation-manifest \
   --artifacts-root "$RL_LEARNWARE_ARTIFACTS_ROOT" \
   --source-run /historical/read-only/v04a-primary-dev-20260828-r4 \
-  --source-log-root /historical/read-only/v04a_runs \
-  --source-diagnostic-root /historical/read-only/v04a_runs
+  --source-log-root /historical/read-only/r4-logs-only \
+  --source-diagnostic-root /historical/read-only/m2cpu-diagnostics-only
 ```
 
-The command never copies, edits, or re-labels the R4 evidence. A reconstructed
-runtime must be disclosed as reconstructed and cannot replace original
-provenance.
+The command never copies, edits, or re-labels the R4 evidence. It must not be
+run against a reconstructed copy after the historical source has been retired.
+For the current server freeze, the old `v04a_runs` source has already been
+retired. Authority is therefore the central
+`$RL_LEARNWARE_ARTIFACTS_ROOT/relocation_manifest.json` (SHA-256
+`81e726c297c78ebc110df017e06e6fb56de73face39371198635299f931bfed9`)
+plus `_audit/verification_receipts/server-v04a-source-retirement-precheck.json`
+and `server-v04a-source-retirement-complete.json`. No owner manifest is
+retroactively fabricated. A reconstructed runtime must be disclosed as
+reconstructed and cannot replace original provenance.
