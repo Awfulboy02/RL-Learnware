@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "policy-learnware-v0"
-version = "0.5.0"
+version = "0.5.0+ablation"
 description = "Reward-free certified-policy retrieval with RKME and matched baselines"
 readme = "README.md"
 requires-python = ">=3.11"

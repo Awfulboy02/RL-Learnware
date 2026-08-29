@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import inspect
 from types import SimpleNamespace
 
 import numpy as np
@@ -26,9 +27,12 @@ from server.repro_fpo_ppo_v05.ablation_analysis import (
     _query_grid,
     _score_rows,
     _source_nodes,
+    _validate_analysis_output_layout,
     _validate_node_score_closure,
+    run_analysis,
 )
 from server.repro_fpo_ppo_v05.compute_scale_benchmark import (
+    ComputeScaleError,
     _benchmark_output_layout,
     _fit_methods,
     _load_plan,
@@ -36,6 +40,7 @@ from server.repro_fpo_ppo_v05.compute_scale_benchmark import (
     _score_digest,
     _slice_bank,
     _validate_completed_cell,
+    run_benchmark,
 )
 
 
@@ -50,6 +55,15 @@ def _bank(episodes: list[list[list[float]]]) -> EpisodeBank:
             )
         ),
     )
+
+
+def test_ablation_entrypoints_use_the_shared_artifact_root() -> None:
+    analysis_parameters = inspect.signature(run_analysis).parameters
+    benchmark_parameters = inspect.signature(run_benchmark).parameters
+    assert "artifacts_root" in analysis_parameters
+    assert "artifacts_root" in benchmark_parameters
+    assert "r4_root" not in analysis_parameters
+    assert "r4_root" not in benchmark_parameters
 
 
 def test_v03_moment_baseline_uses_one_episode_balanced_mixture() -> None:
@@ -405,3 +419,31 @@ def test_compute_output_layout_rejects_resume_cells_symlink(tmp_path) -> None:
     with pytest.raises(ValueError, match="contains a symlink"):
         _benchmark_output_layout(output, ({"cell_id": "BASE"},))
     assert list(outside.iterdir()) == []
+
+
+def test_analysis_output_layout_rejects_unexpected_artifact(tmp_path) -> None:
+    config, _, _, _, _ = _load_analysis_config("configs/v05_ablation.yaml")
+    output = tmp_path / "analysis"
+    output.mkdir()
+    stale = output / "stale.json"
+    stale.write_bytes(b"stale")
+
+    with pytest.raises(ValueError, match="unexpected artifacts"):
+        _validate_analysis_output_layout(
+            output, _source_nodes(config), _query_grid(config)
+        )
+    assert tuple(output.iterdir()) == (stale,)
+    assert stale.read_bytes() == b"stale"
+
+
+def test_compute_output_layout_rejects_unexpected_artifact(tmp_path) -> None:
+    plan, _, _, _ = _load_plan("configs/v05_ablation.yaml")
+    output = tmp_path / "analysis"
+    output.mkdir()
+    stale = output / "stale.json"
+    stale.write_bytes(b"stale")
+
+    with pytest.raises(ComputeScaleError, match="unexpected artifacts"):
+        _benchmark_output_layout(output, _ofat_nodes(plan["compute_scale"]))
+    assert tuple(output.iterdir()) == (stale,)
+    assert stale.read_bytes() == b"stale"

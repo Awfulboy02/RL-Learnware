@@ -723,49 +723,6 @@ class SWE1024NN(SWENN):
             raise V05ClassifierError("SWE_1024_NN requires the frozen 32x32 map")
 
 
-def ablation_method_cards() -> tuple[dict[str, Any], ...]:
-    """Describe the six additions without changing the frozen P0 registry."""
-
-    return (
-        {
-            "method_id": B0_RANDOM,
-            "role": "chance_lower_bound",
-            "source_fit": "none",
-            "score": "v03-style frozen SHA256 random key",
-        },
-        {
-            "method_id": B3A_RAW_MOMENT_NN,
-            "role": "v03_trivial_baseline",
-            "source_fit": "per-anchor episode-balanced mean/std/second moment",
-            "score": "negative Euclidean distance",
-        },
-        {
-            "method_id": SUMMARY_NN,
-            "role": "decision_rule_and_preprocessing_ablation",
-            "source_fit": "mean of per-episode mean/std prototypes",
-            "score": "negative Euclidean distance",
-        },
-        {
-            "method_id": RFF_LOGREG,
-            "role": "decision_rule_and_preprocessing_ablation",
-            "source_fit": "multinomial LogReg on frozen RFF episode means",
-            "score": "mean episode logit",
-        },
-        {
-            "method_id": RFF_RIDGE,
-            "role": "decision_rule_and_preprocessing_ablation",
-            "source_fit": "dual ridge on frozen RFF episode means",
-            "score": "mean episode class score",
-        },
-        {
-            "method_id": SWE_1024_NN,
-            "role": "dimension_matched_representation_ablation",
-            "source_fit": "32 directions x 32 quantiles",
-            "score": "negative Euclidean distance",
-        },
-    )
-
-
 __all__ = [
     "ABLATION_METHOD_IDS",
     "B0_RANDOM",
@@ -781,7 +738,6 @@ __all__ = [
     "RFFEpisodeFeatures",
     "SWE1024NN",
     "SummaryPrototypeNN",
-    "ablation_method_cards",
     "episode_balanced_moment_vector",
     "nested_row_order",
     "summary_episode_features",

@@ -484,6 +484,8 @@ def _benchmark_output_layout(
     resolved = output.resolve()
     if any(not path.resolve(strict=False).is_relative_to(resolved) for path in known):
         raise ComputeScaleError("benchmark output layout escapes its root")
+    if set(output.rglob("*")) - set(known):
+        raise ComputeScaleError("benchmark output contains unexpected artifacts")
     return manifest, bootstrap, cell_root, cells, summary
 
 
@@ -1022,16 +1024,22 @@ def _run_cell(
 def run_benchmark(
     *,
     plan_path: str | Path,
-    r4_root: str | Path,
     completed_run_dir: str | Path,
     new_output_dir: str | Path,
+    artifacts_root: str | Path | None = None,
     resume: bool,
 ) -> dict[str, Any]:
     plan, plan_digest, config, config_digest = _load_plan(plan_path)
     completed = Path(completed_run_dir).expanduser().resolve()
-    r4 = Path(r4_root).expanduser().resolve()
     actual_commit = _clean_git_commit(Path(plan_path).resolve().parent.parent)
-    output = _ensure_output(new_output_dir, resume=resume, protected=(completed, r4))
+    (assets, asset_timing) = _timed(
+        lambda: _load_frozen_r4_assets(config, config_digest, artifacts_root)
+    )
+    output = _ensure_output(
+        new_output_dir,
+        resume=resume,
+        protected=(completed, assets.r4_root, assets.v03_root),
+    )
     nodes = _ofat_nodes(plan["compute_scale"])
     (
         manifest_path,
@@ -1062,9 +1070,6 @@ def run_benchmark(
             raise ComputeScaleError("resume manifest is absent")
         atomic_write_json(manifest_path, manifest)
 
-    (assets, asset_timing) = _timed(
-        lambda: _load_frozen_r4_assets(config, config_digest, r4)
-    )
     ((full_banks, canonical_receipt), canonical_timing) = _timed(
         lambda: _canonical_source_stage(assets, completed, resume=True)
     )
@@ -1248,8 +1253,11 @@ def run_benchmark(
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--version", action="version", version="%(prog)s 0.5.0+ablation"
+    )
     parser.add_argument("--plan", required=True)
-    parser.add_argument("--r4-root", required=True)
+    parser.add_argument("--artifacts-root")
     parser.add_argument("--completed-run-dir", required=True)
     parser.add_argument("--new-output-dir", required=True)
     parser.add_argument("--resume", action="store_true")
@@ -1257,9 +1265,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         run_benchmark(
             plan_path=arguments.plan,
-            r4_root=arguments.r4_root,
             completed_run_dir=arguments.completed_run_dir,
             new_output_dir=arguments.new_output_dir,
+            artifacts_root=arguments.artifacts_root,
             resume=arguments.resume,
         )
     except (ComputeScaleError, V05RunnerError, OSError, ValueError) as error:

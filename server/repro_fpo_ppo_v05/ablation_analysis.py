@@ -1602,11 +1602,46 @@ def _long_tables(
     return source_table, query_table
 
 
+def _validate_analysis_output_layout(
+    output: Path,
+    source_nodes: Sequence[SourceNode],
+    query_grid: Sequence[tuple[int, int]],
+) -> None:
+    """Reject unregistered output entries before any analysis write."""
+
+    known = {
+        output / "nodes",
+        output / "nodes" / "source",
+        output / "nodes" / "query",
+        output / "scores",
+        output / "results",
+        output / "run_manifest.json",
+        output / "scores" / "score_manifest.json",
+        output / "results" / "per_query.json",
+        output / "results" / "analysis_report.json",
+        *(
+            output / "nodes" / "source" / f"{node.node_id}.json"
+            for node in source_nodes
+        ),
+        *(
+            output / "nodes" / "query" / f"Q-B{budget:02d}-R{rows:02d}.json"
+            for budget, rows in query_grid
+        ),
+    }
+    resolved = output.resolve()
+    if any(path.is_symlink() for path in known) or any(
+        not path.resolve(strict=False).is_relative_to(resolved) for path in known
+    ):
+        raise V05RunnerError("analysis output layout is unsafe")
+    if set(output.rglob("*")) - known:
+        raise V05RunnerError("analysis output contains unexpected artifacts")
+
+
 def run_analysis(
     config_path: str | Path,
-    r4_root: str | Path,
     new_analysis_dir: str | Path,
     *,
+    artifacts_root: str | Path | None = None,
     resume: bool = False,
 ) -> dict[str, Any]:
     (
@@ -1617,7 +1652,9 @@ def run_analysis(
         repo,
     ) = _load_analysis_config(config_path)
     actual_commit = _git_commit(repo)
-    assets = _load_frozen_r4_assets(development_config, development_digest, r4_root)
+    assets = _load_frozen_r4_assets(
+        development_config, development_digest, artifacts_root
+    )
     raw_output = Path(new_analysis_dir).expanduser()
     if any(
         parent.exists() and parent.is_symlink()
@@ -1641,6 +1678,7 @@ def run_analysis(
         output.mkdir(parents=True, mode=0o755)
     source_nodes = _source_nodes(analysis_config)
     query_grid = _query_grid(analysis_config)
+    _validate_analysis_output_layout(output, source_nodes, query_grid)
     row_seed = int(analysis_config["row_prefix"]["public_seed"])
     manifest_unsigned = {
         "schema": "policy-learnware.v05-ablation-run.v1",
@@ -2009,15 +2047,18 @@ def run_analysis(
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--version", action="version", version="%(prog)s 0.5.0+ablation"
+    )
     parser.add_argument("--config", required=True)
-    parser.add_argument("--r4-root", required=True)
+    parser.add_argument("--artifacts-root")
     parser.add_argument("--new-analysis-dir", required=True)
     parser.add_argument("--resume", action="store_true")
     arguments = parser.parse_args(argv)
     run_analysis(
         arguments.config,
-        arguments.r4_root,
         arguments.new_analysis_dir,
+        artifacts_root=arguments.artifacts_root,
         resume=bool(arguments.resume),
     )
     return 0
