@@ -114,7 +114,8 @@ def _validate_analysis_run_manifest(
     persisted_stable = {key: value[key] for key in stable_manifest}
     if persisted_stable != dict(stable_manifest):
         raise V05RunnerError("analysis run manifest changed")
-    if value["run_manifest_digest"] != sha256_json(persisted_stable):
+    persisted_unsigned = {**persisted_stable, "created_at": created_at}
+    if value["run_manifest_digest"] != sha256_json(persisted_unsigned):
         raise V05RunnerError("analysis run manifest digest differs")
     return dict(value)
 
@@ -1705,7 +1706,7 @@ def run_analysis(
     _validate_analysis_output_layout(output, source_nodes, query_grid)
     row_seed = int(analysis_config["row_prefix"]["public_seed"])
     manifest_unsigned = {
-        "schema": "policy-learnware.v05-ablation-run.v1",
+        "schema": "policy-learnware.v05-ablation-run.v2",
         "scope": "SECONDARY_EXPLORATORY_POST_TRUTH",
         "formal_confirmatory": False,
         "actual_git_commit": actual_commit,
@@ -1720,13 +1721,14 @@ def run_analysis(
         "method_ids": list(ALL_METHOD_IDS),
         "created_at": utc_now(),
     }
-    # created_at is intentionally excluded so resume remains bitwise stable.
+    # Stable fields are replayed from config; the persisted v2 digest also binds
+    # the original created_at instead of regenerating it during resume.
     stable_manifest = {
         key: value for key, value in manifest_unsigned.items() if key != "created_at"
     }
     run_manifest = {
         **manifest_unsigned,
-        "run_manifest_digest": sha256_json(stable_manifest),
+        "run_manifest_digest": sha256_json(manifest_unsigned),
     }
     manifest_path = output / "run_manifest.json"
     if manifest_path.exists():

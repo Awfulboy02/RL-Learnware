@@ -51,16 +51,16 @@ from server.repro_fpo_ppo_v05.compute_scale_benchmark import (
 
 def test_partial_analysis_resume_rejects_tampered_or_extra_manifest_fields() -> None:
     stable = {
-        "schema": "policy-learnware.v05-ablation-run.v1",
+        "schema": "policy-learnware.v05-ablation-run.v2",
         "scope": "SECONDARY_EXPLORATORY_POST_TRUTH",
         "formal_confirmatory": False,
         "analysis_config_digest": "a" * 64,
     }
-    value = {
+    unsigned = {
         **stable,
         "created_at": "2026-08-29T12:00:00+00:00",
-        "run_manifest_digest": sha256_json(stable),
     }
+    value = {**unsigned, "run_manifest_digest": sha256_json(unsigned)}
     assert _validate_analysis_run_manifest(value, stable) == value
 
     tampered_digest = {**value, "run_manifest_digest": "b" * 64}
@@ -70,6 +70,10 @@ def test_partial_analysis_resume_rejects_tampered_or_extra_manifest_fields() -> 
         _validate_analysis_run_manifest({**value, "extra": 1}, stable)
     with pytest.raises(ValueError, match="created_at is invalid"):
         _validate_analysis_run_manifest({**value, "created_at": 7}, stable)
+    with pytest.raises(ValueError, match="digest differs"):
+        _validate_analysis_run_manifest(
+            {**value, "created_at": "2099-08-29T12:00:00+00:00"}, stable
+        )
 
 
 def test_compute_bootstrap_binds_timings_and_exact_schema() -> None:
