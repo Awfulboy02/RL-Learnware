@@ -9,6 +9,7 @@ the CLI never accepts an arbitrary output path.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from pathlib import Path
 import re
 from typing import Any, Mapping
@@ -28,6 +29,36 @@ from .io import (
 
 class ArtifactLayoutError(ValueError):
     """An artifact path or immutable resume request violates the layout."""
+
+
+ARTIFACTS_ROOT_ENV = "RL_LEARNWARE_ARTIFACTS_ROOT"
+
+
+def resolve_artifacts_root(
+    explicit: str | Path | None = None,
+    *,
+    repository_root: str | Path | None = None,
+) -> Path:
+    """Resolve explicit root, then the shared environment, then sibling default."""
+
+    if explicit is not None:
+        root = Path(explicit).expanduser()
+    else:
+        configured = os.environ.get(ARTIFACTS_ROOT_ENV)
+        if configured is not None:
+            if not configured.strip():
+                raise ArtifactLayoutError(f"{ARTIFACTS_ROOT_ENV} cannot be empty")
+            root = Path(configured).expanduser()
+        else:
+            repository = (
+                Path(repository_root).expanduser()
+                if repository_root is not None
+                else Path(__file__).resolve().parents[2]
+            )
+            root = repository.parent / "artifacts"
+    if root.is_symlink():
+        raise ArtifactLayoutError("artifacts root cannot be a symlink")
+    return root.resolve()
 
 
 _SAFE_SEGMENT = re.compile(r"^[A-Za-z0-9_.-]+$")
@@ -241,7 +272,9 @@ class ArtifactLayout:
     def dataset_manifest(
         self, split: str, task: str, *, bank: int | None = None
     ) -> Path:
-        return self.dataset_dir(split, bank=bank) / f"{_safe_segment(task, 'task')}.json"
+        return (
+            self.dataset_dir(split, bank=bank) / f"{_safe_segment(task, 'task')}.json"
+        )
 
     def task_spec_dir(self, task: str) -> Path:
         return self.task_specs_dir / _safe_segment(task, "task")
@@ -291,7 +324,9 @@ class ArtifactLayout:
                 f"output path is outside managed pool root {self.pool_root}: {candidate}"
             ) from error
         if candidate == self.pool_root:
-            raise ArtifactLayoutError("atomic file publication cannot target the pool directory")
+            raise ArtifactLayoutError(
+                "atomic file publication cannot target the pool directory"
+            )
         return candidate
 
     def publish_json(
@@ -370,7 +405,9 @@ class ArtifactLayout:
             if not file_path.is_file():
                 raise ArtifactLayoutError(f"manifest payload is missing: {file_path}")
             if sha256_file(file_path) != digest:
-                raise ArtifactLayoutError(f"manifest payload digest mismatch: {file_path}")
+                raise ArtifactLayoutError(
+                    f"manifest payload digest mismatch: {file_path}"
+                )
         return manifest
 
     def relative(self, path: str | Path) -> str:
@@ -378,7 +415,9 @@ class ArtifactLayout:
 
 
 __all__ = [
+    "ARTIFACTS_ROOT_ENV",
     "ArtifactExistsError",
     "ArtifactLayout",
     "ArtifactLayoutError",
+    "resolve_artifacts_root",
 ]

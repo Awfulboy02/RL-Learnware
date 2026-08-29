@@ -1,9 +1,8 @@
-"""Policy Learnware v0.
+"""Policy Learnware v0.5.
 
-This package implements the closed-set, exact-recurrent TaskSpec retrieval
-protocol described by the accompanying research plan.  Importing the package
-does not import JAX or MuJoCo Playground; runtime-specific dependencies are
-loaded only by the components that need them.
+This package retains the earlier closed-set TaskSpec pipeline and the v0.5
+reward-free retrieval modules. Importing it does not import JAX or MuJoCo
+Playground; runtime-specific dependencies are loaded only when needed.
 """
 
 from .config import ProtocolDraft, load_protocol_draft
@@ -17,4 +16,4 @@ __all__ = [
     "load_protocol_draft",
 ]
 
-__version__ = "0.2.0"
+__version__ = "0.5.0"

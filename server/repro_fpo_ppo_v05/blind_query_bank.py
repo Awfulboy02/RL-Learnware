@@ -15,7 +15,7 @@ from pathlib import Path
 import shutil
 import tempfile
 from types import MappingProxyType
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 
@@ -24,7 +24,6 @@ from policy_learnware_v0.io import atomic_write_json, atomic_write_npz, read_jso
 from policy_learnware_v0.v04a.protocol import (
     BUDGET_EPISODES,
     RankingSeal,
-    RewardFreeProbe,
     V04AProtocolError,
     verify_ranking_seal,
 )
@@ -57,10 +56,6 @@ from policy_learnware_v0.v05.specifications import (
     SWEMap,
     SWESpecification,
 )
-from server.repro_fpo_ppo_v05.exact_repeat_collector import (
-    load_published_collection,
-)
-
 
 SOURCE_TRAIN = "source_train"
 SOURCE_VALIDATION = "source_validation"
@@ -467,7 +462,7 @@ def _validate_public_manifest_shape(manifest: Mapping[str, Any]) -> None:
     raw_budgets = manifest.get("budget_episodes")
     if not isinstance(raw_budgets, list):
         raise V05BlindError("authorized query budgets differ")
-    budgets = _authorized_budget_tuple(raw_budgets, episode_count=max(BUDGET_EPISODES))
+    _authorized_budget_tuple(raw_budgets, episode_count=max(BUDGET_EPISODES))
     mask = manifest.get("candidate_mask")
     if (
         not isinstance(mask, list)
@@ -830,82 +825,6 @@ def _publish_blinded_bank(
         if stage.exists():
             shutil.rmtree(stage)
     return load_authorized_query(destination, rff_map=rff_map, swe_map=swe_map)
-
-
-def prepare_blinded_query(
-    *,
-    private_collection_root: str | Path,
-    public_parent: str | Path,
-    private_binding_root: str | Path,
-    truth_source_anchor_id: str,
-    certificate_manifest: CertifiedPolicyManifest,
-    blinding_nonce: str,
-    canonicalize_probe: Callable[[RewardFreeProbe], EpisodeBank],
-    normalization_digest: str,
-    rff_map: RFFMap,
-    swe_map: SWEMap,
-    authorized_budgets: Sequence[int] = BUDGET_EPISODES,
-    expected_candidate_count: int = 5,
-) -> AuthorizedQueryViews:
-    """Prepare a future confirmatory view from one verified 32-episode bank."""
-
-    if not callable(canonicalize_probe):
-        raise V05BlindError("canonicalize_probe must be a privileged callable")
-    private_input = Path(private_collection_root).expanduser()
-    public_input = Path(public_parent).expanduser()
-    binding_input = Path(private_binding_root).expanduser()
-    if any(item.is_symlink() for item in (private_input, public_input, binding_input)):
-        raise V05BlindError("private/public roots cannot be symlinks")
-    private_root = private_input.resolve()
-    public_root = public_input.resolve()
-    binding_root = binding_input.resolve()
-    if not private_root.is_dir():
-        raise V05BlindError("private collection root is absent or unsafe")
-    _assert_disjoint(private_root, public_root)
-    _assert_disjoint(private_root, binding_root)
-    collection = load_published_collection(private_root)
-    bank = canonicalize_probe(collection.probe)
-    if not isinstance(bank, EpisodeBank):
-        raise V05BlindError("canonicalize_probe must return an EpisodeBank")
-    if (
-        bank.episode_count != 32
-        or not np.array_equal(bank.episode_offsets, collection.probe.episode_offsets)
-        or np.any(np.diff(bank.episode_offsets) != 64)
-    ):
-        raise V05BlindError("canonical query bank is not the verified 32x64 view")
-    private_index = read_json(private_root / "index.json")
-    if not isinstance(private_index, Mapping):
-        raise V05BlindError("private collection index is malformed")
-    return _publish_blinded_bank(
-        bank=bank,
-        public_parent=public_root,
-        private_binding_root=binding_root,
-        truth_source_anchor_id=truth_source_anchor_id,
-        certificate_manifest=certificate_manifest,
-        blinding_nonce=blinding_nonce,
-        probe_protocol_digest=collection.probe_protocol_digest,
-        normalization_digest=normalization_digest,
-        rff_map=rff_map,
-        swe_map=swe_map,
-        authorized_budgets=authorized_budgets,
-        private_evidence={
-            "evidence_kind": "verified_private_collection",
-            "private_collection_index_digest": _digest(
-                private_index.get("index_digest"), "private collection index digest"
-            ),
-            "private_reward_free_bank_digest": collection.reward_free_bank_digest,
-            "private_probe_membership_digest": (
-                collection.membership.membership_digest
-            ),
-            "private_context_id": collection.context_id,
-        },
-        private_values=(
-            collection.context_id,
-            private_root.name,
-            str(private_root),
-        ),
-        expected_candidate_count=expected_candidate_count,
-    )
 
 
 def prepare_blinded_episode_bank(
@@ -1329,22 +1248,6 @@ def load_private_truth_binding(
             "private_canonical_bank_digest"
         ) != evidence.get("source_repeat_bank_digest"):
             raise V05BlindError("source-repeat private evidence binding differs")
-    elif evidence_kind == "verified_private_collection":
-        if set(evidence) != {
-            "evidence_kind",
-            "private_collection_index_digest",
-            "private_reward_free_bank_digest",
-            "private_probe_membership_digest",
-            "private_context_id",
-        }:
-            raise V05BlindError("private collection evidence fields differ")
-        for field in (
-            "private_collection_index_digest",
-            "private_reward_free_bank_digest",
-            "private_probe_membership_digest",
-        ):
-            _digest(evidence.get(field), field)
-        _text(evidence.get("private_context_id"), "private_context_id")
     else:
         raise V05BlindError("private evidence kind is unsupported")
     if (
@@ -1383,6 +1286,5 @@ __all__ = [
     "load_authorized_query",
     "load_private_truth_binding",
     "prepare_blinded_episode_bank",
-    "prepare_blinded_query",
     "project_verified_source_banks",
 ]

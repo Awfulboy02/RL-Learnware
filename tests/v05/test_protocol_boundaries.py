@@ -1393,13 +1393,69 @@ def test_canonical_source_stage_persists_fit_roles_only_then_blinds_repeat(
     assert not missing_fit_bank.exists()
 
 
+def test_frozen_root_resolver_uses_canonical_layout_from_any_location(
+    tmp_path, monkeypatch
+) -> None:
+    root = tmp_path / "arbitrary-workspace" / "external-assets"
+    r4 = root / "v04a" / "runs" / "v04a-primary-dev-20260828-r4"
+    v03 = root / "v03" / "runs" / "v03-main-20260827-r0"
+    r4.mkdir(parents=True)
+    v03.mkdir(parents=True)
+    monkeypatch.setenv("RL_LEARNWARE_ARTIFACTS_ROOT", str(root))
+
+    resolved_root, resolved_r4, resolved_v03 = runner_module._resolve_v05_frozen_roots()
+    assert (resolved_root, resolved_r4, resolved_v03) == (
+        root.resolve(),
+        r4.resolve(),
+        v03.resolve(),
+    )
+
+    other = tmp_path / "explicit-assets"
+    other_r4 = other / "v04a" / "runs" / "v04a-primary-dev-20260828-r4"
+    other_v03 = other / "v03" / "runs" / "v03-main-20260827-r0"
+    other_r4.mkdir(parents=True)
+    other_v03.mkdir(parents=True)
+    assert runner_module._resolve_v05_frozen_roots(other) == (
+        other.resolve(),
+        other_r4.resolve(),
+        other_v03.resolve(),
+    )
+    monkeypatch.delenv("RL_LEARNWARE_ARTIFACTS_ROOT")
+    assert (
+        runner_module.resolve_artifacts_root(repository_root=tmp_path / "repository")
+        == (tmp_path / "artifacts").resolve()
+    )
+
+
+def test_frozen_root_resolver_fails_before_frozen_input_io(
+    tmp_path, monkeypatch
+) -> None:
+    root = tmp_path / "artifacts"
+    r4 = root / "v04a" / "runs" / "v04a-primary-dev-20260828-r4"
+    external_v03 = tmp_path / "external-v03"
+    r4.mkdir(parents=True)
+    external_v03.mkdir()
+    (root / "v03").symlink_to(external_v03, target_is_directory=True)
+    monkeypatch.setenv("RL_LEARNWARE_ARTIFACTS_ROOT", str(root))
+    frozen_reads = []
+    monkeypatch.setattr(
+        runner_module,
+        "_frozen_bytes",
+        lambda *args, **kwargs: frozen_reads.append((args, kwargs)),
+    )
+
+    with pytest.raises(V05RunnerError, match="symlink"):
+        runner_module._load_frozen_r4_assets({}, _digest("config"))
+    assert frozen_reads == []
+
+
 def test_production_entry_and_invalid_public_seal_cannot_reach_private_capability(
     tmp_path, monkeypatch
 ) -> None:
     assert tuple(inspect.signature(runner_module.run_development).parameters) == (
         "config_path",
-        "r4_root",
         "new_run_dir",
+        "artifacts_root",
         "resume",
     )
     score_signature = inspect.signature(runner_module.score_precommitted_queries)
