@@ -610,6 +610,10 @@ def load_verified_fpo_upstream(
             raise RuntimeVerificationError(
                 "reconstructed FPO import requires sys.dont_write_bytecode=True"
             )
+        if sys.pycache_prefix is not None:
+            raise RuntimeVerificationError(
+                "reconstructed FPO import requires sys.pycache_prefix=None"
+            )
 
         source_root = _absolute_path_without_symlinks(
             fpo_root, where="FPO checkout"
