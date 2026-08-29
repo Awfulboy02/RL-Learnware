@@ -82,12 +82,72 @@ from server.repro_fpo_ppo_v05.environment_classifier_runner import (
 
 PLAN_SCHEMA = "policy-learnware.v05-ablation-plan.v1"
 CELL_SCHEMA = "policy-learnware.v05-compute-scale-cell.v1"
+COMPUTE_RUN_SCHEMA = "policy-learnware.v05-compute-scale-run.v2"
+COMPUTE_BOOTSTRAP_SCHEMA = "policy-learnware.v05-compute-scale-bootstrap.v2"
+COMPUTE_SUMMARY_SCHEMA = "policy-learnware.v05-compute-scale-summary.v2"
+EXPLORATORY_SCOPE = "SECONDARY_EXPLORATORY_POST_TRUTH"
 _EXPECTED_PLAN_DIGEST = (
     "e5e231c7ea35e42568bf9f884cc03cb930b52a4cb46c7ef37c40fd12c2ace2ae"
 )
 ALL_METHOD_IDS = P0_METHOD_IDS + ABLATION_METHOD_IDS
 RFF_FAMILY = (RFF_KME_NN, RFF_LOGREG, RFF_RIDGE)
 SWE_SWEPT_FAMILY = (SWE_NN,)
+
+
+def _exploratory_identity(schema: str) -> dict[str, Any]:
+    return {
+        "schema": schema,
+        "scope": EXPLORATORY_SCOPE,
+        "formal_confirmatory": False,
+    }
+
+
+def _validate_bootstrap_timing(value: Any, where: str) -> None:
+    names = {
+        "wall_seconds",
+        "cpu_seconds",
+        "peak_rss_before_bytes",
+        "peak_rss_after_bytes",
+    }
+    timing = _exact(value, names, where)
+    for name in ("wall_seconds", "cpu_seconds"):
+        number = timing[name]
+        if (
+            isinstance(number, bool)
+            or not isinstance(number, (int, float))
+            or not math.isfinite(float(number))
+            or float(number) < 0.0
+        ):
+            raise ComputeScaleError(f"{where} {name} is invalid")
+    for name in ("peak_rss_before_bytes", "peak_rss_after_bytes"):
+        number = timing[name]
+        if isinstance(number, bool) or not isinstance(number, int) or number < 0:
+            raise ComputeScaleError(f"{where} {name} is invalid")
+
+
+def _validate_bootstrap(value: Mapping[str, Any], stable: Mapping[str, Any]) -> str:
+    expected = set(stable) | {
+        "schema",
+        "r4_asset_load",
+        "full32_canonicalize",
+        "peak_rss_bytes",
+        "bootstrap_digest",
+    }
+    bootstrap = _exact(value, expected, "resume bootstrap")
+    if bootstrap["schema"] != COMPUTE_BOOTSTRAP_SCHEMA:
+        raise ComputeScaleError("resume bootstrap schema differs")
+    if {key: bootstrap[key] for key in stable} != dict(stable):
+        raise ComputeScaleError("resume bootstrap source closure differs")
+    _validate_bootstrap_timing(bootstrap["r4_asset_load"], "r4_asset_load")
+    _validate_bootstrap_timing(bootstrap["full32_canonicalize"], "full32_canonicalize")
+    peak_rss = bootstrap["peak_rss_bytes"]
+    if isinstance(peak_rss, bool) or not isinstance(peak_rss, int) or peak_rss < 0:
+        raise ComputeScaleError("resume bootstrap peak_rss_bytes is invalid")
+    unsigned = {key: bootstrap[key] for key in bootstrap if key != "bootstrap_digest"}
+    digest = sha256_json(unsigned)
+    if bootstrap["bootstrap_digest"] != digest:
+        raise ComputeScaleError("bootstrap digest differs")
+    return digest
 
 
 class ComputeScaleError(ValueError):
@@ -1049,7 +1109,7 @@ def run_benchmark(
         summary_path,
     ) = _benchmark_output_layout(output, nodes)
     manifest = {
-        "schema": "policy-learnware.v05-compute-scale-run.v1",
+        **_exploratory_identity(COMPUTE_RUN_SCHEMA),
         "actual_git_commit": actual_commit,
         "plan_digest": plan_digest,
         "plan_file_sha256": sha256_file(plan_path),
@@ -1094,25 +1154,26 @@ def run_benchmark(
             }
         ),
     }
-    if bootstrap_path.exists():
+    publish_bootstrap = not bootstrap_path.exists()
+    if not publish_bootstrap:
         if not resume:
             raise ComputeScaleError("bootstrap artifact already exists")
         bootstrap = load_strict_json(bootstrap_path)
-        if {key: bootstrap.get(key) for key in bootstrap_stable} != bootstrap_stable:
-            raise ComputeScaleError("resume bootstrap source closure differs")
     else:
-        bootstrap = {
-            "schema": "policy-learnware.v05-compute-scale-bootstrap.v1",
+        bootstrap_unsigned = {
+            "schema": COMPUTE_BOOTSTRAP_SCHEMA,
             **bootstrap_stable,
             "r4_asset_load": asset_timing,
             "full32_canonicalize": canonical_timing,
             "peak_rss_bytes": _rss_bytes(),
         }
-        bootstrap["bootstrap_digest"] = sha256_json(bootstrap_stable)
+        bootstrap = {
+            **bootstrap_unsigned,
+            "bootstrap_digest": sha256_json(bootstrap_unsigned),
+        }
+    bootstrap_digest = _validate_bootstrap(bootstrap, bootstrap_stable)
+    if publish_bootstrap:
         atomic_write_json(bootstrap_path, bootstrap)
-    bootstrap_digest = sha256_json(bootstrap_stable)
-    if bootstrap.get("bootstrap_digest") != bootstrap_digest:
-        raise ComputeScaleError("bootstrap digest differs")
 
     cell_root.mkdir(exist_ok=True)
     cell_files: dict[str, str] = {}
@@ -1222,7 +1283,7 @@ def run_benchmark(
                 }
             )
     summary = {
-        "schema": "policy-learnware.v05-compute-scale-summary.v1",
+        **_exploratory_identity(COMPUTE_SUMMARY_SCHEMA),
         "status": "COMPLETE",
         "plan_digest": plan_digest,
         "bootstrap_digest": bootstrap_digest,

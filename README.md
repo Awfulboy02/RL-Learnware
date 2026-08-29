@@ -91,10 +91,10 @@ artifacts/
 └── v05/
     ├── runs/v05-environment-classification-dev-20260829-r0/
     ├── releases/v05-environment-classification-dev-20260829-r0/
-    ├── analysis/
-    │   ├── v05-ablation-fewshot-20260829-r0/
-    │   ├── v05-compute-scale-20260829-r0/
-    │   └── v05-ablation-summary-20260829-r0/
+    └── analysis/
+        ├── v05-ablation-fewshot-20260829-r0/
+        ├── v05-compute-scale-20260829-r0/
+        └── v05-ablation-summary-20260829-r0/
 ```
 
 The loader resolves v0.3 and v0.4a independently from this root and verifies

@@ -27,21 +27,91 @@ from server.repro_fpo_ppo_v05.ablation_analysis import (
     _query_grid,
     _score_rows,
     _source_nodes,
+    _validate_analysis_run_manifest,
     _validate_analysis_output_layout,
     _validate_node_score_closure,
     run_analysis,
 )
 from server.repro_fpo_ppo_v05.compute_scale_benchmark import (
+    COMPUTE_RUN_SCHEMA,
+    COMPUTE_SUMMARY_SCHEMA,
     ComputeScaleError,
     _benchmark_output_layout,
+    _exploratory_identity,
     _fit_methods,
     _load_plan,
     _ofat_nodes,
     _score_digest,
     _slice_bank,
+    _validate_bootstrap,
     _validate_completed_cell,
     run_benchmark,
 )
+
+
+def test_partial_analysis_resume_rejects_tampered_or_extra_manifest_fields() -> None:
+    stable = {
+        "schema": "policy-learnware.v05-ablation-run.v1",
+        "scope": "SECONDARY_EXPLORATORY_POST_TRUTH",
+        "formal_confirmatory": False,
+        "analysis_config_digest": "a" * 64,
+    }
+    value = {
+        **stable,
+        "created_at": "2026-08-29T12:00:00+00:00",
+        "run_manifest_digest": sha256_json(stable),
+    }
+    assert _validate_analysis_run_manifest(value, stable) == value
+
+    tampered_digest = {**value, "run_manifest_digest": "b" * 64}
+    with pytest.raises(ValueError, match="digest differs"):
+        _validate_analysis_run_manifest(tampered_digest, stable)
+    with pytest.raises(ValueError, match="fields differ"):
+        _validate_analysis_run_manifest({**value, "extra": 1}, stable)
+    with pytest.raises(ValueError, match="created_at is invalid"):
+        _validate_analysis_run_manifest({**value, "created_at": 7}, stable)
+
+
+def test_compute_bootstrap_binds_timings_and_exact_schema() -> None:
+    stable = {
+        "canonical_complete_digest": "a" * 64,
+        "normalizer_digest": "b" * 64,
+    }
+    timing = {
+        "wall_seconds": 1.0,
+        "cpu_seconds": 0.5,
+        "peak_rss_before_bytes": 100,
+        "peak_rss_after_bytes": 120,
+    }
+    unsigned = {
+        "schema": "policy-learnware.v05-compute-scale-bootstrap.v2",
+        **stable,
+        "r4_asset_load": timing,
+        "full32_canonicalize": timing,
+        "peak_rss_bytes": 120,
+    }
+    value = {**unsigned, "bootstrap_digest": sha256_json(unsigned)}
+    assert _validate_bootstrap(value, stable) == value["bootstrap_digest"]
+
+    tampered_timing = deepcopy(value)
+    tampered_timing["r4_asset_load"]["wall_seconds"] = 2.0
+    with pytest.raises(ComputeScaleError, match="bootstrap digest differs"):
+        _validate_bootstrap(tampered_timing, stable)
+    with pytest.raises(ComputeScaleError, match="fields differ"):
+        _validate_bootstrap({**value, "extra": 1}, stable)
+    invalid_rss = deepcopy(value)
+    invalid_rss["full32_canonicalize"]["peak_rss_after_bytes"] = -1
+    with pytest.raises(ComputeScaleError, match="peak_rss_after_bytes is invalid"):
+        _validate_bootstrap(invalid_rss, stable)
+
+
+def test_new_compute_outputs_self_describe_exploratory_scope() -> None:
+    for schema in (COMPUTE_RUN_SCHEMA, COMPUTE_SUMMARY_SCHEMA):
+        assert _exploratory_identity(schema) == {
+            "schema": schema,
+            "scope": "SECONDARY_EXPLORATORY_POST_TRUTH",
+            "formal_confirmatory": False,
+        }
 
 
 def _bank(episodes: list[list[list[float]]]) -> EpisodeBank:

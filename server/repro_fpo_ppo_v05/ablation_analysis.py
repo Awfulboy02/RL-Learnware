@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import math
 from pathlib import Path
 import subprocess
@@ -93,6 +94,29 @@ ALL_METHOD_IDS = P0_METHOD_IDS + ABLATION_METHOD_IDS
 ENDPOINTS = (MARKET_30_CERT, TASK_5_CERT)
 ROWS_PER_PARENT_EPISODE = 64
 REPEAT_START = 25
+
+
+def _validate_analysis_run_manifest(
+    value: Mapping[str, Any], stable_manifest: Mapping[str, Any]
+) -> dict[str, Any]:
+    expected = set(stable_manifest) | {"created_at", "run_manifest_digest"}
+    if not isinstance(value, Mapping) or set(value) != expected:
+        raise V05RunnerError("analysis run manifest fields differ")
+    created_at = value["created_at"]
+    try:
+        timestamp = datetime.fromisoformat(created_at)
+    except (TypeError, ValueError) as error:
+        raise V05RunnerError("analysis run manifest created_at is invalid") from error
+    if timestamp.tzinfo is None or timestamp.utcoffset() != timezone.utc.utcoffset(
+        None
+    ):
+        raise V05RunnerError("analysis run manifest created_at is not UTC")
+    persisted_stable = {key: value[key] for key in stable_manifest}
+    if persisted_stable != dict(stable_manifest):
+        raise V05RunnerError("analysis run manifest changed")
+    if value["run_manifest_digest"] != sha256_json(persisted_stable):
+        raise V05RunnerError("analysis run manifest digest differs")
+    return dict(value)
 
 
 @dataclass(frozen=True)
@@ -1706,12 +1730,11 @@ def run_analysis(
     }
     manifest_path = output / "run_manifest.json"
     if manifest_path.exists():
-        existing = load_strict_json(manifest_path)
-        if not resume or any(
-            existing.get(key) != value for key, value in stable_manifest.items()
-        ):
-            raise V05RunnerError("analysis run manifest changed")
-        run_manifest = existing
+        if not resume:
+            raise V05RunnerError("analysis run manifest already exists")
+        run_manifest = _validate_analysis_run_manifest(
+            load_strict_json(manifest_path), stable_manifest
+        )
     else:
         atomic_write_json(manifest_path, run_manifest)
     run_manifest_digest = run_manifest["run_manifest_digest"]
