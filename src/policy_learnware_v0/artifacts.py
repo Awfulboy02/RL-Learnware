@@ -67,6 +67,11 @@ def _verified_checkout(path: Path) -> Path:
         raise ArtifactLayoutError("artifacts fallback requires a verified Git checkout")
 
     def git(*arguments: str) -> str:
+        git_environment = {
+            key: value
+            for key, value in os.environ.items()
+            if not key.upper().startswith("GIT_")
+        }
         try:
             result = subprocess.run(
                 ("git", "-C", str(repository), *arguments),
@@ -74,6 +79,7 @@ def _verified_checkout(path: Path) -> Path:
                 capture_output=True,
                 text=True,
                 timeout=10,
+                env=git_environment,
             )
         except (OSError, subprocess.TimeoutExpired) as error:
             raise ArtifactLayoutError(
