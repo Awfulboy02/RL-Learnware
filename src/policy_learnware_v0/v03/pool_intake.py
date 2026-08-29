@@ -301,6 +301,16 @@ def _replay_frozen_v02_acceptance(
     record, all promoted-failure lineage, and the referenced checkpoint bytes.
     """
 
+    if not sys.dont_write_bytecode:
+        raise PoolIntakeError(
+            "frozen v0.2 acceptance replay requires "
+            "PYTHONDONTWRITEBYTECODE=1/-B"
+        )
+    if sys.pycache_prefix is not None:
+        raise PoolIntakeError(
+            "frozen v0.2 acceptance replay requires sys.pycache_prefix=None"
+        )
+
     plan_path = root / "training_private" / "plans" / "server_training_plan.json"
     runs_root = root / "training_private" / "server_runs"
     if plan_path.is_symlink() or not plan_path.is_file():
