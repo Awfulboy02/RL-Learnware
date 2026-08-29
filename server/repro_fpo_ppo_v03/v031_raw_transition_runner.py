@@ -31,6 +31,7 @@ from policy_learnware_v0.io import atomic_write_bytes, atomic_write_json
 from policy_learnware_v0.rkme.empirical import EmpiricalKME
 from policy_learnware_v0.rkme.gaussian import calibrate_bandwidth
 from policy_learnware_v0.rkme.reducer import ReducedRKME, ReducerConfig, reduce_kme
+from policy_learnware_v0.v03.artifact_paths import V03ArtifactLayout
 from policy_learnware_v0.v03.signal_controls import RewardFreeShuffledNextSpec
 from policy_learnware_v0.v03.signal_metrics import SignalDistanceRow, SignalMetricRecord
 from policy_learnware_v0.v03.transition_views import (
@@ -875,10 +876,11 @@ def _build_table(args: argparse.Namespace) -> Mapping[str, Any] | None:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Minimal v0.31 Raw-RKME transition controls")
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--context-index", type=Path, required=True)
-    parser.add_argument("--public-policy-market", type=Path, required=True)
-    parser.add_argument("--deployment-private-registry", type=Path, required=True)
-    parser.add_argument("--oracle-root", type=Path, required=True)
+    parser.add_argument("--artifacts-root", type=Path)
+    parser.add_argument("--context-index", type=Path)
+    parser.add_argument("--public-policy-market", type=Path)
+    parser.add_argument("--deployment-private-registry", type=Path)
+    parser.add_argument("--oracle-root", type=Path)
     parser.add_argument("--views", nargs="+", choices=VIEWS, default=list(VIEWS))
     parser.add_argument("--backend", choices=("numpy", "jax"), default="numpy")
     parser.add_argument("--block-size", type=int, default=2048)
@@ -897,13 +899,24 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _resolve_artifact_inputs(args: argparse.Namespace) -> None:
+    layout = V03ArtifactLayout.discover(args.artifacts_root)
+    args.artifacts_root = layout.root
+    defaults = {
+        "context_index": layout.context_index,
+        "public_policy_market": layout.public_policy_market,
+        "deployment_private_registry": layout.deployment_private_registry,
+        "oracle_root": layout.development_oracle,
+    }
+    for name, default in defaults.items():
+        supplied = getattr(args, name)
+        setattr(args, name, Path(default if supplied is None else supplied).expanduser().resolve())
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     args.output_dir = args.output_dir.expanduser().resolve()
-    args.context_index = args.context_index.expanduser().resolve()
-    args.public_policy_market = args.public_policy_market.expanduser().resolve()
-    args.deployment_private_registry = args.deployment_private_registry.expanduser().resolve()
-    args.oracle_root = args.oracle_root.expanduser().resolve()
+    _resolve_artifact_inputs(args)
     args.market = _market(args.public_policy_market, args.deployment_private_registry)
     context_rows = _context_rows(args.context_index)
     forbidden = [

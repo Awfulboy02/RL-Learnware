@@ -15,8 +15,6 @@ from typing import Any, Mapping
 from ..hashing import sha256_json
 
 
-ENCODER_PROTOCOL_RECORD_SCHEMA = "policy-learnware.v03-encoder-protocol-record.v0"
-LOTO_FOLD_RECORD_SCHEMA = "policy-learnware.v03-loto-fold-record.v0"
 ANONYMOUS_SELECTOR_VIEW_ENTRY_SCHEMA = (
     "policy-learnware.v03-anonymous-selector-view-entry.v0"
 )
@@ -99,30 +97,6 @@ def checked_safe_id(value: Any, where: str) -> str:
     return value
 
 
-def checked_ids(value: Any, where: str, *, allow_empty: bool = False) -> tuple[str, ...]:
-    if isinstance(value, (str, bytes)) or not isinstance(value, (list, tuple)):
-        raise V03SchemaError(f"{where} must be a sequence")
-    result = tuple(checked_safe_id(item, f"{where}[]") for item in value)
-    if not allow_empty and not result:
-        raise V03SchemaError(f"{where} cannot be empty")
-    if len(set(result)) != len(result):
-        raise V03SchemaError(f"{where} contains duplicates")
-    return result
-
-
-def checked_digests(
-    value: Any, where: str, *, allow_empty: bool = False
-) -> tuple[str, ...]:
-    if isinstance(value, (str, bytes)) or not isinstance(value, (list, tuple)):
-        raise V03SchemaError(f"{where} must be a sequence")
-    result = tuple(checked_digest(item, f"{where}[]") for item in value)
-    if not allow_empty and not result:
-        raise V03SchemaError(f"{where} cannot be empty")
-    if len(set(result)) != len(result):
-        raise V03SchemaError(f"{where} contains duplicates")
-    return result
-
-
 def validate_public_mapping(
     value: Mapping[str, Any],
     *,
@@ -153,170 +127,6 @@ def validate_public_mapping(
                 scan(nested, f"{path}[{index}]")
 
     scan(value, where)
-
-
-@dataclass(frozen=True)
-class EncoderProtocolRecord:
-    encoder_id: str
-    family: str
-    implementation_digest: str
-    input_view_digest: str
-    window_protocol_digest: str
-    access_card_digest: str
-    architecture_digest: str
-    objective_digest: str
-    training_protocol_digest: str
-    latent_dim: int
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "encoder_id", checked_safe_id(self.encoder_id, "encoder_id"))
-        object.__setattr__(self, "family", checked_safe_id(self.family, "family"))
-        for name in (
-            "implementation_digest",
-            "input_view_digest",
-            "window_protocol_digest",
-            "access_card_digest",
-            "architecture_digest",
-            "objective_digest",
-            "training_protocol_digest",
-        ):
-            object.__setattr__(self, name, checked_digest(getattr(self, name), name))
-        if isinstance(self.latent_dim, bool) or not isinstance(self.latent_dim, int):
-            raise V03SchemaError("latent_dim must be a positive integer")
-        if self.latent_dim <= 0:
-            raise V03SchemaError("latent_dim must be a positive integer")
-
-    def material_dict(self) -> dict[str, Any]:
-        return {
-            "schema": ENCODER_PROTOCOL_RECORD_SCHEMA,
-            "encoder_id": self.encoder_id,
-            "family": self.family,
-            "implementation_digest": self.implementation_digest,
-            "input_view_digest": self.input_view_digest,
-            "window_protocol_digest": self.window_protocol_digest,
-            "access_card_digest": self.access_card_digest,
-            "architecture_digest": self.architecture_digest,
-            "objective_digest": self.objective_digest,
-            "training_protocol_digest": self.training_protocol_digest,
-            "latent_dim": self.latent_dim,
-        }
-
-    @property
-    def protocol_record_digest(self) -> str:
-        return sha256_json(self.material_dict())
-
-    def to_dict(self) -> dict[str, Any]:
-        return {**self.material_dict(), "protocol_record_digest": self.protocol_record_digest}
-
-    @classmethod
-    def from_dict(cls, value: Mapping[str, Any]) -> "EncoderProtocolRecord":
-        fields = {
-            "schema",
-            "encoder_id",
-            "family",
-            "implementation_digest",
-            "input_view_digest",
-            "window_protocol_digest",
-            "access_card_digest",
-            "architecture_digest",
-            "objective_digest",
-            "training_protocol_digest",
-            "latent_dim",
-            "protocol_record_digest",
-        }
-        data = strict_mapping(value, fields, "encoder protocol record")
-        if data["schema"] != ENCODER_PROTOCOL_RECORD_SCHEMA:
-            raise V03SchemaError("unknown encoder protocol record schema")
-        record = cls(**{name: data[name] for name in fields - {"schema", "protocol_record_digest"}})
-        if checked_digest(data["protocol_record_digest"], "protocol_record_digest") != record.protocol_record_digest:
-            raise V03SchemaError("encoder protocol record digest does not match payload")
-        return record
-
-
-@dataclass(frozen=True)
-class LOTOFoldRecord:
-    fold_id: str
-    held_out_task_private_id: str
-    train_task_private_ids: tuple[str, ...]
-    train_dataset_digests: tuple[str, ...]
-    validation_dataset_digests: tuple[str, ...]
-    source_reference_role_digest: str
-    target_query_role_digest: str
-    split_nonce_digest: str
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "fold_id", checked_safe_id(self.fold_id, "fold_id"))
-        object.__setattr__(
-            self,
-            "held_out_task_private_id",
-            checked_safe_id(self.held_out_task_private_id, "held_out_task_private_id"),
-        )
-        tasks = checked_ids(self.train_task_private_ids, "train_task_private_ids")
-        if self.held_out_task_private_id in tasks:
-            raise V03SchemaError("held-out task appears in LOTO training tasks")
-        object.__setattr__(self, "train_task_private_ids", tasks)
-        object.__setattr__(
-            self,
-            "train_dataset_digests",
-            checked_digests(self.train_dataset_digests, "train_dataset_digests"),
-        )
-        object.__setattr__(
-            self,
-            "validation_dataset_digests",
-            checked_digests(
-                self.validation_dataset_digests, "validation_dataset_digests"
-            ),
-        )
-        if set(self.train_dataset_digests) & set(self.validation_dataset_digests):
-            raise V03SchemaError("LOTO train and validation datasets must be disjoint")
-        for name in (
-            "source_reference_role_digest",
-            "target_query_role_digest",
-            "split_nonce_digest",
-        ):
-            object.__setattr__(self, name, checked_digest(getattr(self, name), name))
-
-    def material_dict(self) -> dict[str, Any]:
-        return {
-            "schema": LOTO_FOLD_RECORD_SCHEMA,
-            "fold_id": self.fold_id,
-            "held_out_task_private_id": self.held_out_task_private_id,
-            "train_task_private_ids": list(self.train_task_private_ids),
-            "train_dataset_digests": list(self.train_dataset_digests),
-            "validation_dataset_digests": list(self.validation_dataset_digests),
-            "source_reference_role_digest": self.source_reference_role_digest,
-            "target_query_role_digest": self.target_query_role_digest,
-            "split_nonce_digest": self.split_nonce_digest,
-        }
-
-    @property
-    def fold_record_digest(self) -> str:
-        return sha256_json(self.material_dict())
-
-    def to_dict(self) -> dict[str, Any]:
-        return {**self.material_dict(), "fold_record_digest": self.fold_record_digest}
-
-    @classmethod
-    def from_dict(cls, value: Mapping[str, Any]) -> "LOTOFoldRecord":
-        fields = {
-            "schema",
-            "fold_id",
-            "held_out_task_private_id",
-            "train_task_private_ids",
-            "train_dataset_digests",
-            "validation_dataset_digests",
-            "source_reference_role_digest",
-            "target_query_role_digest",
-            "split_nonce_digest",
-            "fold_record_digest",
-        }
-        data = strict_mapping(value, fields, "LOTO fold record")
-        if data["schema"] != LOTO_FOLD_RECORD_SCHEMA:
-            raise V03SchemaError("unknown LOTO fold record schema")
-        record = cls(**{name: data[name] for name in fields - {"schema", "fold_record_digest"}})
-        if checked_digest(data["fold_record_digest"], "fold_record_digest") != record.fold_record_digest:
-            raise V03SchemaError("LOTO fold record digest does not match payload")
-        return record
 
 
 @dataclass(frozen=True)
@@ -467,17 +277,11 @@ __all__ = [
     "ANONYMOUS_SELECTOR_ENTRY_ALLOWLIST",
     "ANONYMOUS_SELECTOR_VIEW_ENTRY_SCHEMA",
     "AnonymousSelectorViewEntry",
-    "ENCODER_PROTOCOL_RECORD_SCHEMA",
-    "EncoderProtocolRecord",
-    "LOTO_FOLD_RECORD_SCHEMA",
-    "LOTOFoldRecord",
     "PUBLIC_FORBIDDEN_FIELDS",
     "SELECTION_FAILURE_RECORD_SCHEMA",
     "SelectionFailureRecord",
     "V03SchemaError",
     "checked_digest",
-    "checked_digests",
-    "checked_ids",
     "checked_safe_id",
     "strict_mapping",
     "validate_public_mapping",

@@ -42,6 +42,10 @@ from policy_learnware_v0.rkme.empirical import (
 )
 from policy_learnware_v0.rkme.gaussian import GaussianKernel, calibrate_bandwidth
 from policy_learnware_v0.rkme.reducer import ReducedRKME, ReducerConfig, reduce_kme
+from policy_learnware_v0.v03.artifact_paths import (
+    V03ArtifactLayout,
+    resolve_recorded_path,
+)
 from policy_learnware_v0.v03.corro_trainers import (
     TASK_SUPCON_OBJECTIVE_DIGEST,
     CorroOptimizationConfig,
@@ -861,8 +865,13 @@ def evaluate(args: argparse.Namespace) -> Mapping[str, Any]:
                 if environment is None:
                     raise DevelopmentBaselineError(environment_error)
                 if opaque_id not in policy_cache:
-                    policy_cache[opaque_id] = load_policy(
+                    bundle_path = resolve_recorded_path(
                         market.deployment_private[opaque_id].bundle_path,
+                        relocation_manifest=args.relocation_manifest,
+                        artifacts_root=args.artifacts_root,
+                    )
+                    policy_cache[opaque_id] = load_policy(
+                        bundle_path,
                         fpo_root=args.fpo_root,
                         runtime_only=True,
                     )
@@ -977,8 +986,10 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Minimal v0.3 development baseline runner")
     parser.add_argument("command", choices=("build-representations", "rank", "evaluate", "summarize"))
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--public-policy-market", type=Path, required=True)
-    parser.add_argument("--deployment-private-registry", type=Path, required=True)
+    parser.add_argument("--artifacts-root", type=Path)
+    parser.add_argument("--relocation-manifest", type=Path)
+    parser.add_argument("--public-policy-market", type=Path)
+    parser.add_argument("--deployment-private-registry", type=Path)
     parser.add_argument("--context-index", type=Path)
     parser.add_argument("--r5-checkpoint-root", type=Path)
     parser.add_argument("--phase", choices=("source", "queries", "all"), default="all")
@@ -1014,10 +1025,30 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _resolve_artifact_inputs(args: argparse.Namespace) -> None:
+    layout = V03ArtifactLayout.discover(args.artifacts_root)
+    args.artifacts_root = layout.root
+    defaults = {
+        "public_policy_market": layout.public_policy_market,
+        "deployment_private_registry": layout.deployment_private_registry,
+        "context_index": layout.context_index,
+        "r5_checkpoint_root": layout.signal_fit_root,
+    }
+    for name, default in defaults.items():
+        supplied = getattr(args, name)
+        setattr(args, name, Path(default if supplied is None else supplied).expanduser().resolve())
+    if args.relocation_manifest is not None:
+        args.relocation_manifest = args.relocation_manifest.expanduser().resolve()
+    else:
+        default_manifest = layout.root / "v02" / "relocation_manifest.json"
+        args.relocation_manifest = default_manifest if default_manifest.is_file() else None
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     args.output_dir = args.output_dir.expanduser().resolve()
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    _resolve_artifact_inputs(args)
     if args.shard_count <= 0 or not 0 <= args.shard_index < args.shard_count:
         raise SystemExit("invalid shard index/count")
     positive = (
@@ -1040,8 +1071,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     ):
         raise SystemExit("invalid source train/validation split")
     if args.command == "build-representations":
-        if args.context_index is None or args.r5_checkpoint_root is None:
-            raise SystemExit("build-representations requires --context-index and --r5-checkpoint-root")
         result = build_representations(args)
     elif args.command == "rank":
         result = rank(args)
