@@ -1519,6 +1519,54 @@ def test_artifact_root_fallback_rejects_noncheckout_fake_git_and_unrooted_worktr
         runner_module.resolve_artifacts_root(repository_root=worktree)
 
 
+def test_artifact_root_git_identity_ignores_polluted_git_environment(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.delenv("RL_LEARNWARE_ARTIFACTS_ROOT", raising=False)
+    repository = _verified_fallback_checkout(tmp_path, monkeypatch)
+    fake = tmp_path / "fake-repository"
+    fake.mkdir()
+    (fake / ".git").mkdir()
+    (fake / "pyproject.toml").write_text(
+        '[project]\nname = "policy-learnware-v0"\n', encoding="utf-8"
+    )
+    polluted = {
+        "GIT_DIR": str(repository / ".git"),
+        "GIT_WORK_TREE": str(fake),
+        "GIT_INDEX_FILE": str(repository / ".git" / "index"),
+        "GIT_OBJECT_DIRECTORY": str(repository / ".git" / "objects"),
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(repository / ".git" / "objects"),
+        "GIT_CEILING_DIRECTORIES": str(tmp_path.parent),
+        "git_prefix": "attacker-controlled-case-variant",
+    }
+    for key, value in polluted.items():
+        monkeypatch.setenv(key, value)
+
+    real_run = subprocess.run
+    observed_environments = []
+
+    def sanitized_run(*args, **kwargs):
+        environment = kwargs.get("env", {})
+        observed_environments.append(environment)
+        assert not any(key.upper().startswith("GIT_") for key in environment)
+        return real_run(*args, **kwargs)
+
+    monkeypatch.setattr(artifacts_module.subprocess, "run", sanitized_run)
+    with pytest.raises(ValueError, match="Git checkout identity"):
+        runner_module.resolve_artifacts_root(repository_root=fake)
+    assert (
+        runner_module.resolve_artifacts_root(repository_root=repository)
+        == (tmp_path / "artifacts").resolve()
+    )
+    assert observed_environments
+
+    explicit = tmp_path / "explicit-assets"
+    assert runner_module.resolve_artifacts_root(explicit) == explicit.resolve()
+    configured = tmp_path / "configured-assets"
+    monkeypatch.setenv("RL_LEARNWARE_ARTIFACTS_ROOT", str(configured))
+    assert runner_module.resolve_artifacts_root() == configured.resolve()
+
+
 def test_top_level_cli_rejects_empty_artifacts_root(
     tmp_path, monkeypatch, capsys
 ) -> None:
