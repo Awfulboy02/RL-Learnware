@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 import shutil
 from types import SimpleNamespace
@@ -690,6 +691,20 @@ def test_artifact_paths_use_one_root_with_explicit_precedence(
     with pytest.raises(V04ARunnerError, match="escapes"):
         runner_module._artifact_path(Path("../outside"), explicit_root.resolve())
 
+    real_parent = tmp_path / "real-parent"
+    real_parent.mkdir()
+    linked_parent = tmp_path / "linked-parent"
+    linked_parent.symlink_to(real_parent, target_is_directory=True)
+    with pytest.raises(V04ARunnerError, match="symlink"):
+        runner_module._artifacts_root(linked_parent / "artifacts")
+
+    explicit_root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (explicit_root / "alias").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(V04ARunnerError, match="symlink"):
+        runner_module._artifact_path(Path("alias/query.json"), explicit_root)
+
     monkeypatch.delenv(runner_module.ARTIFACTS_ROOT_ENV)
     expected_default = REPOSITORY.parent / "artifacts"
     assert runner_module._artifacts_root() == expected_default.resolve()
@@ -805,6 +820,37 @@ def test_r4_relocation_manifest_requires_byte_identical_trees(
         )
     )
     assert manifest_path.read_bytes() == before
+
+    source_alias = tmp_path / "historical-alias"
+    source_alias.symlink_to(source.parent, target_is_directory=True)
+    with pytest.raises(V04ARunnerError, match="symlink"):
+        runner_module.relocation_manifest(
+            argparse.Namespace(
+                source_run=source_alias / source.name,
+                source_log_root=source_logs,
+                source_diagnostic_root=source_diagnostics,
+                artifacts_root=artifacts_root,
+                manifest_output=tmp_path / "rejected-symlink.json",
+                resume=False,
+            )
+        )
+
+    fifo = source / "unexpected.fifo"
+    os.mkfifo(fifo)
+    try:
+        with pytest.raises(V04ARunnerError, match="special file"):
+            runner_module.relocation_manifest(
+                argparse.Namespace(
+                    source_run=source,
+                    source_log_root=source_logs,
+                    source_diagnostic_root=source_diagnostics,
+                    artifacts_root=artifacts_root,
+                    manifest_output=tmp_path / "rejected-special.json",
+                    resume=False,
+                )
+            )
+    finally:
+        fifo.unlink()
 
     (destination / "metrics.jsonl").write_bytes(b"tampered\n")
     with pytest.raises(V04ARunnerError, match="not byte-identical"):

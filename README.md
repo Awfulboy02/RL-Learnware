@@ -81,7 +81,7 @@ Python 3.11 or newer is required.
 
 ```bash
 python -m venv .venv
-.venv/bin/pip install -e '.[test]'
+.venv/bin/pip install -e '.[research,test]'
 PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q -p no:cacheprovider tests/v04a
 ```
 

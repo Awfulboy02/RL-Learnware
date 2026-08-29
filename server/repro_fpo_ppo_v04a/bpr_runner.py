@@ -80,7 +80,11 @@ from policy_learnware_v0.v04a.protocol import (
     tie_break_key,
     verify_ranking_seal,
 )
-from policy_learnware_v0.v02.artifacts import RelocationResolver, V02AssetError
+from policy_learnware_v0.v02.artifacts import (
+    RelocationResolver,
+    V02AssetError,
+    resolve_artifacts_root,
+)
 from server.repro_fpo_ppo_v03.development_baseline_runner import (
     SCHEMA as V03_BASELINE_SCHEMA,
     DevelopmentBaselineError,
@@ -242,19 +246,24 @@ class GateFailure(V04ARunnerError):
 def _artifacts_root(explicit: Path | None = None) -> Path:
     """Resolve the one shared external-asset root without compatibility aliases."""
 
-    if explicit is not None:
-        raw = Path(explicit).expanduser()
-    else:
-        configured = os.environ.get(ARTIFACTS_ROOT_ENV)
-        raw = (
-            Path(configured).expanduser()
-            if configured
-            else Path(__file__).resolve().parents[2].parent / "artifacts"
+    try:
+        return resolve_artifacts_root(
+            explicit,
+            repository_root=Path(__file__).resolve().parents[2],
         )
-    if raw.is_symlink():
-        raise V04ARunnerError(f"artifacts root cannot be a symlink: {raw}")
-    resolved = raw.resolve()
-    return resolved
+    except V02AssetError as error:
+        raise V04ARunnerError(f"artifacts root is unsafe: {error}") from error
+
+
+def _reject_symlink_components(path: Path, where: str) -> None:
+    """Reject a symlink before canonicalization can erase its evidence."""
+
+    absolute = path.expanduser().absolute()
+    current = Path(absolute.anchor)
+    for part in absolute.parts[1:]:
+        current /= part
+        if current.is_symlink():
+            raise V04ARunnerError(f"{where} contains a symlink: {current}")
 
 
 def _artifact_path(value: Path, root: Path) -> Path:
@@ -262,8 +271,11 @@ def _artifact_path(value: Path, root: Path) -> Path:
 
     raw = Path(value).expanduser()
     if raw.is_absolute():
+        _reject_symlink_components(raw, "artifact path")
         return raw.resolve()
-    resolved = (root / raw).resolve()
+    combined = root / raw
+    _reject_symlink_components(combined, "artifact path")
+    resolved = combined.resolve()
     if not resolved.is_relative_to(root):
         raise V04ARunnerError(f"relative artifact path escapes its root: {raw}")
     return resolved
@@ -295,11 +307,14 @@ def _resolve_cli_paths(args: argparse.Namespace) -> argparse.Namespace:
 def _tree_inventory(root: Path) -> tuple[list[dict[str, Any]], int, str]:
     """Hash a directory as sorted relative path/size/SHA records."""
 
+    _reject_symlink_components(root, "artifact tree")
     if root.is_symlink() or not root.is_dir():
         raise V04ARunnerError(f"artifact tree is absent or unsafe: {root}")
     entries = tuple(root.rglob("*"))
     if any(path.is_symlink() for path in entries):
         raise V04ARunnerError(f"artifact tree contains a symlink: {root}")
+    if any(not path.is_file() and not path.is_dir() for path in entries):
+        raise V04ARunnerError(f"artifact tree contains a special file: {root}")
     records: list[dict[str, Any]] = []
     for path in sorted(value for value in entries if value.is_file()):
         payload = path.read_bytes()
@@ -374,6 +389,8 @@ def _verify_relocated_file_group(
     destination: Path,
     expected: Mapping[str, str],
 ) -> dict[str, Any]:
+    _reject_symlink_components(source_root, "relocation source directory")
+    _reject_symlink_components(destination, "relocation destination directory")
     if (
         source_root.is_symlink()
         or not source_root.is_dir()
@@ -381,11 +398,10 @@ def _verify_relocated_file_group(
         or not destination.is_dir()
     ):
         raise V04ARunnerError("relocation support directory is absent or unsafe")
-    source = {
-        name: sha256_file(source_root / name)
-        for name in expected
-        if (source_root / name).is_file() and not (source_root / name).is_symlink()
-    }
+    source_entries = tuple(source_root.iterdir())
+    if any(path.is_symlink() or not path.is_file() for path in source_entries):
+        raise V04ARunnerError("relocation source directory has unsafe entries")
+    source = {path.name: sha256_file(path) for path in source_entries}
     target_entries = tuple(destination.iterdir())
     if any(path.is_symlink() or not path.is_file() for path in target_entries):
         raise V04ARunnerError("relocation support directory has unsafe entries")
@@ -406,11 +422,8 @@ def relocation_manifest(args: argparse.Namespace) -> Mapping[str, Any]:
     source_input = Path(args.source_run).expanduser()
     log_source_input = Path(args.source_log_root).expanduser()
     diagnostic_source_input = Path(args.source_diagnostic_root).expanduser()
-    if any(
-        path.is_symlink()
-        for path in (source_input, log_source_input, diagnostic_source_input)
-    ):
-        raise V04ARunnerError("relocation source roots cannot be symlinks")
+    for path in (source_input, log_source_input, diagnostic_source_input):
+        _reject_symlink_components(path, "relocation source root")
     source = source_input.resolve()
     destination = artifacts_root / R4_RUN_RELATIVE
     if source == destination:
