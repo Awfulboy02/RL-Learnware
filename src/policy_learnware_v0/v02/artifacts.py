@@ -13,6 +13,8 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
+import subprocess
 from typing import Any, Mapping, Sequence
 
 from ..hashing import sha256_file, sha256_json
@@ -207,13 +209,102 @@ def _reject_absolute_symlink_components(path: Path, where: str) -> None:
             raise V02AssetError(f"{where} contains a symlink: {current}")
 
 
+def _git_output(repository: Path, *arguments: str) -> str:
+    """Run one read-only Git query with repository-selection overrides removed."""
+
+    # Keep the trust decision identical to the FPO source attestor. Importing
+    # here avoids a module-level dependency while preserving one executable
+    # proof for both public paths.
+    from .runtime import _trusted_git_executable
+
+    environment = {
+        key: value for key, value in os.environ.items() if not key.startswith("GIT_")
+    }
+    environment.update(
+        {
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_NO_REPLACE_OBJECTS": "1",
+            "GIT_OPTIONAL_LOCKS": "0",
+            "LC_ALL": "C",
+        }
+    )
+    try:
+        completed = subprocess.run(
+            (
+                _trusted_git_executable(),
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                f"core.hooksPath={os.devnull}",
+                "-C",
+                str(repository),
+                *arguments,
+            ),
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="strict",
+            env=environment,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError, UnicodeError) as error:
+        raise V02AssetError(
+            f"repository fallback failed its Git checkout proof: {repository}"
+        ) from error
+    return completed.stdout.strip()
+
+
+def _validate_repository_fallback(repository: Path) -> None:
+    """Require a real policy-learnware checkout before deriving a sibling root."""
+
+    if not repository.is_dir():
+        raise V02AssetError(f"repository fallback is not a directory: {repository}")
+    top_level = _git_output(repository, "rev-parse", "--show-toplevel")
+    if not top_level:
+        raise V02AssetError("repository fallback has no Git top-level")
+    top = Path(top_level)
+    if not top.is_absolute():
+        raise V02AssetError("Git returned a non-absolute repository top-level")
+    _reject_absolute_symlink_components(top, "Git repository top-level")
+    if top.resolve() != repository:
+        raise V02AssetError(
+            "repository fallback must identify the Git checkout top-level"
+        )
+
+    head = _git_output(repository, "rev-parse", "--verify", "HEAD^{commit}")
+    if not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", head):
+        raise V02AssetError("repository fallback has no canonical Git HEAD")
+
+    pyproject = repository / "pyproject.toml"
+    try:
+        metadata = pyproject.lstat()
+    except OSError as error:
+        raise V02AssetError(
+            "repository fallback is missing tracked pyproject.toml"
+        ) from error
+    if not stat.S_ISREG(metadata.st_mode):
+        raise V02AssetError(
+            "repository fallback pyproject.toml is not a regular file"
+        )
+    tracked = _git_output(
+        repository, "ls-files", "--error-unmatch", "--", "pyproject.toml"
+    )
+    if tracked != "pyproject.toml":
+        raise V02AssetError(
+            "repository fallback pyproject.toml is not uniquely tracked"
+        )
+
+
 def resolve_artifacts_root(
     explicit: str | Path | None = None,
     *,
     repository_root: str | Path | None = None,
     environ: Mapping[str, str] | None = None,
 ) -> Path:
-    """Resolve the root: explicit path, common environment, sibling default."""
+    """Resolve explicit/env roots or a strictly proven checkout sibling."""
 
     env = os.environ if environ is None else environ
     if explicit is not None:
@@ -221,16 +312,40 @@ def resolve_artifacts_root(
         if not raw.strip():
             raise V02AssetError("explicit artifacts root cannot be empty")
         candidate = Path(raw).expanduser()
-    elif env.get(ARTIFACTS_ROOT_ENV):
-        candidate = Path(env[ARTIFACTS_ROOT_ENV]).expanduser()
+    elif ARTIFACTS_ROOT_ENV in env:
+        raw = str(env[ARTIFACTS_ROOT_ENV])
+        if not raw.strip():
+            raise V02AssetError(
+                f"{ARTIFACTS_ROOT_ENV} cannot be empty or whitespace"
+            )
+        candidate = Path(raw).expanduser()
     else:
-        repo = Path(repository_root) if repository_root is not None else _repository_root()
-        repo = repo.expanduser().resolve()
+        if repository_root is not None and not str(repository_root).strip():
+            raise V02AssetError("repository fallback root cannot be empty")
+        repo = (
+            Path(repository_root).expanduser()
+            if repository_root is not None
+            else _repository_root()
+        )
+        if not repo.is_absolute():
+            repo = repo.absolute()
+        _reject_absolute_symlink_components(repo, "repository fallback")
+        repo = repo.resolve()
+        _validate_repository_fallback(repo)
         candidate = repo.parent / "artifacts"
     if not candidate.is_absolute():
         candidate = candidate.absolute()
     _reject_absolute_symlink_components(candidate, "artifacts root")
-    return candidate.resolve()
+    resolved = candidate.resolve()
+    if explicit is None and ARTIFACTS_ROOT_ENV not in env:
+        manifest = resolved / "relocation_manifest.json"
+        try:
+            validate_relocation_manifest(manifest)
+        except V02AssetError as error:
+            raise V02AssetError(
+                "repository-derived artifacts root lacks a strict root relocation manifest"
+            ) from error
+    return resolved
 
 
 @dataclass(frozen=True)
@@ -432,25 +547,31 @@ def attest_directory(path: str | Path) -> DirectoryAttestation:
 
     Only regular files contribute. Paths are root-relative UTF-8 strings
     without ``./`` and are ordered by their UTF-8 bytes (C ordering). Symlinks
-    are rejected rather than followed.
+    and every other non-directory special file are rejected rather than
+    followed or silently omitted.
     """
 
-    root = Path(path)
-    if root.is_symlink():
-        raise V02AssetError(f"asset root is a symlink: {root}")
+    root = Path(path).expanduser()
+    if not root.is_absolute():
+        root = root.absolute()
+    _reject_absolute_symlink_components(root, "asset directory")
     root = root.resolve()
     if not root.is_dir():
         raise V02AssetError(f"asset directory is missing: {root}")
     files: list[tuple[str, Path]] = []
     for candidate in root.rglob("*"):
-        if candidate.is_symlink():
-            raise V02AssetError(f"asset tree contains a symlink: {candidate}")
         try:
-            metadata = candidate.stat()
+            metadata = candidate.lstat()
         except OSError as error:
             raise V02AssetError(f"cannot stat asset path: {candidate}") from error
-        if not candidate.is_file():
+        if stat.S_ISLNK(metadata.st_mode):
+            raise V02AssetError(f"asset tree contains a symlink: {candidate}")
+        if stat.S_ISDIR(metadata.st_mode):
             continue
+        if not stat.S_ISREG(metadata.st_mode):
+            raise V02AssetError(
+                f"asset tree contains a special file: {candidate}"
+            )
         try:
             relative = candidate.relative_to(root).as_posix()
         except ValueError as error:  # pragma: no cover - rglob is root-bound
@@ -992,10 +1113,12 @@ def capability_status(
     *,
     verify_bytes: bool = False,
 ) -> dict[str, Any]:
-    """Report handoff, inference, and training capabilities without conflation.
+    """Report asset/provenance readiness without claiming runtime execution.
 
     Root relocation bytes are always attested. ``verify_bytes`` is a retained
     compatibility argument and does not disable or strengthen that invariant.
+    JAX, MuJoCo, and other runtime dependencies are deliberately not imported
+    or probed by this read-only receipt.
     """
 
     validated = validate_relocation_manifest(manifest)
@@ -1023,15 +1146,18 @@ def capability_status(
     if fpo:
         resolver.ensure_verified_asset("fpo")
 
-    policy_io = layout.legacy_v02 / "policy_io.py"
-    legacy = (
-        has_active_mapping("legacy_v02")
-        and layout.legacy_v02.is_dir()
-        and policy_io.is_file()
-        and sha256_file(policy_io) == EXPECTED_POLICY_IO_SHA256
-    )
-    if legacy:
-        resolver.ensure_verified_asset("legacy_v02", verify_bytes=verify_bytes)
+    legacy = False
+    if has_active_mapping("legacy_v02") and layout.legacy_v02.is_dir():
+        # Attest and reject the complete tree before opening policy_io.  A
+        # status probe must never follow an untrusted policy_io symlink or read
+        # an external/oversized file before the relocation gate closes.
+        verified_legacy = resolver.ensure_verified_asset(
+            "legacy_v02", verify_bytes=verify_bytes
+        )
+        policy_io = verified_legacy / "policy_io.py"
+        if policy_io.is_file():
+            policy_io_digest, _ = _stable_file_sha256(policy_io)
+            legacy = policy_io_digest == EXPECTED_POLICY_IO_SHA256
 
     # The central contract permanently records this provenance as missing.  A
     # rebuilt dependency tree may enable inference but never training replay.
@@ -1043,21 +1169,29 @@ def capability_status(
     inference = handoff and fpo and legacy
     training = handoff and fpo and legacy and original_vendor
     return {
-        "schema": "policy-learnware.v02-capability-status.v0",
+        "schema": "policy-learnware.v02-capability-status.v1",
+        "readiness_scope": "asset_and_provenance_only",
+        "runtime_dependency_check": "not_performed",
         "handoff_verification": {
             "available": handoff,
             "provenance_class": "ORIGINAL_IMMUTABLE_EVIDENCE" if handoff else "UNAVAILABLE",
         },
         "policy_inference": {
-            "available": inference,
-            "provenance_class": (
+            "asset_provenance_ready": inference,
+            "runtime_dependency_check": "not_performed",
+            "runtime_dependency_ready": None,
+            "provenance_class_if_runtime_ready": (
                 "ORIGINAL_RUNTIME" if inference and original_vendor else
                 "RECONSTRUCTED_RUNTIME" if inference else "UNAVAILABLE"
             ),
         },
         "training_replay": {
-            "available": training,
-            "provenance_class": "ORIGINAL_RUNTIME" if training else "UNAVAILABLE",
+            "asset_provenance_ready": training,
+            "runtime_dependency_check": "not_performed",
+            "runtime_dependency_ready": None,
+            "provenance_class_if_runtime_ready": (
+                "ORIGINAL_RUNTIME" if training else "UNAVAILABLE"
+            ),
             "blocker": None if training else "MISSING_ORIGINAL_VENDOR_RUNTIME",
         },
     }

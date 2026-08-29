@@ -3,7 +3,9 @@ from __future__ import annotations
 from dataclasses import replace
 import hashlib
 import json
+import os
 from pathlib import Path
+import subprocess
 
 import pytest
 
@@ -143,26 +145,76 @@ def _manifest(*, exact_status: str = "verified") -> dict[str, object]:
     }
 
 
-def test_root_resolution_precedence_and_single_manifest_location(
-    tmp_path: Path,
-) -> None:
-    repo = tmp_path / "policy_learnware_v0"
-    repo.mkdir()
-    environment = {"RL_LEARNWARE_ARTIFACTS_ROOT": str(tmp_path / "from-env")}
-    assert (
-        resolve_artifacts_root(
-            tmp_path / "explicit", repository_root=repo, environ=environment
+def _git_checkout_with_sibling_manifest(
+    parent: Path,
+    *,
+    manifest: object | None = None,
+) -> Path:
+    repository = parent / "policy_learnware_v0"
+    repository.mkdir(parents=True)
+    (repository / "pyproject.toml").write_text(
+        "[project]\nname = 'policy-learnware-fixture'\nversion = '0'\n",
+        encoding="utf-8",
+    )
+    subprocess.run(
+        ("git", "init", "--quiet", str(repository)),
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    subprocess.run(
+        ("git", "-C", str(repository), "add", "--", "pyproject.toml"),
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    subprocess.run(
+        (
+            "git",
+            "-C",
+            str(repository),
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "--quiet",
+            "--no-gpg-sign",
+            "-m",
+            "fixture",
+        ),
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if manifest is not None:
+        artifacts = parent / "artifacts"
+        artifacts.mkdir()
+        (artifacts / "relocation_manifest.json").write_text(
+            json.dumps(manifest), encoding="utf-8"
         )
-        == (tmp_path / "explicit").resolve()
-    )
-    assert (
-        resolve_artifacts_root(repository_root=repo, environ=environment)
-        == (tmp_path / "from-env").resolve()
-    )
-    assert (
-        resolve_artifacts_root(repository_root=repo, environ={})
-        == (tmp_path / "artifacts").resolve()
-    )
+    return repository
+
+
+def test_root_resolution_precedence_and_single_manifest_location(tmp_path: Path) -> None:
+    fake_repo = tmp_path / "fake" / "policy_learnware_v0"
+    fake_repo.mkdir(parents=True)
+    (fake_repo / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
+    environment = {"RL_LEARNWARE_ARTIFACTS_ROOT": str(tmp_path / "from-env")}
+    assert resolve_artifacts_root(
+        tmp_path / "explicit", repository_root=fake_repo, environ=environment
+    ) == (tmp_path / "explicit").resolve()
+    assert resolve_artifacts_root(repository_root=fake_repo, environ=environment) == (
+        tmp_path / "from-env"
+    ).resolve()
+    with pytest.raises(V02AssetError, match="Git checkout proof"):
+        resolve_artifacts_root(repository_root=fake_repo, environ={})
+
+    real_parent = tmp_path / "real-checkout"
+    repository = _git_checkout_with_sibling_manifest(real_parent, manifest=_manifest())
+    assert resolve_artifacts_root(repository_root=repository, environ={}) == (
+        real_parent / "artifacts"
+    ).resolve()
 
     layout = V02AssetLayout.resolve(tmp_path / "artifacts", environ={})
     assert (
@@ -188,6 +240,108 @@ def test_root_resolution_precedence_and_single_manifest_location(
         resolve_artifacts_root(
             environ={"RL_LEARNWARE_ARTIFACTS_ROOT": str(linked_parent / "artifacts")}
         )
+
+
+@pytest.mark.parametrize("value", ["", " ", "\t\n"])
+def test_explicit_and_environment_empty_roots_fail_closed(
+    tmp_path: Path, value: str
+) -> None:
+    with pytest.raises(V02AssetError, match="explicit artifacts root cannot be empty"):
+        resolve_artifacts_root(value, repository_root=tmp_path, environ={})
+    with pytest.raises(V02AssetError, match="cannot be empty or whitespace"):
+        resolve_artifacts_root(
+            repository_root=tmp_path,
+            environ={"RL_LEARNWARE_ARTIFACTS_ROOT": value},
+        )
+
+
+def test_repository_fallback_requires_checkout_top_and_strict_sibling_manifest(
+    tmp_path: Path,
+) -> None:
+    no_manifest = _git_checkout_with_sibling_manifest(tmp_path / "no-manifest")
+    with pytest.raises(V02AssetError, match="strict root relocation manifest"):
+        resolve_artifacts_root(repository_root=no_manifest, environ={})
+
+    invalid = _git_checkout_with_sibling_manifest(
+        tmp_path / "invalid-manifest", manifest={"schema": RELOCATION_SCHEMA}
+    )
+    with pytest.raises(V02AssetError, match="strict root relocation manifest"):
+        resolve_artifacts_root(repository_root=invalid, environ={})
+
+    valid = _git_checkout_with_sibling_manifest(
+        tmp_path / "valid-manifest", manifest=_manifest()
+    )
+    (valid / "nested").mkdir()
+    with pytest.raises(V02AssetError, match="checkout top-level"):
+        resolve_artifacts_root(repository_root=valid / "nested", environ={})
+
+
+def test_repository_fallback_scrubs_git_environment_for_every_query(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real = _git_checkout_with_sibling_manifest(
+        tmp_path / "real", manifest=_manifest()
+    )
+    fake = tmp_path / "fake" / "policy_learnware_v0"
+    fake.mkdir(parents=True)
+    (fake / "pyproject.toml").write_text(
+        (real / "pyproject.toml").read_text(encoding="utf-8"), encoding="utf-8"
+    )
+
+    hostile = {
+        "GIT_DIR": str(real / ".git"),
+        "GIT_WORK_TREE": str(fake),
+        "GIT_COMMON_DIR": str(real / ".git"),
+        "GIT_INDEX_FILE": str(real / ".git" / "index"),
+        "GIT_OBJECT_DIRECTORY": str(real / ".git" / "objects"),
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(real / ".git" / "objects"),
+        "GIT_CEILING_DIRECTORIES": str(tmp_path),
+        "GIT_DISCOVERY_ACROSS_FILESYSTEM": "1",
+    }
+    for key, value in hostile.items():
+        monkeypatch.setenv(key, value)
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    fake_git = fake_bin / "git"
+    fake_git.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    fake_git.chmod(0o755)
+    monkeypatch.setenv("PATH", str(fake_bin))
+
+    original_run = subprocess.run
+    observed: list[tuple[tuple[str, ...], dict[str, str]]] = []
+
+    def audited_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        command = tuple(str(item) for item in args[0])  # type: ignore[index]
+        environment = dict(kwargs["env"])  # type: ignore[arg-type]
+        observed.append((command, environment))
+        return original_run(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(artifacts_module.subprocess, "run", audited_run)
+    with pytest.raises(V02AssetError, match="Git checkout proof"):
+        resolve_artifacts_root(repository_root=fake, environ={})
+    assert resolve_artifacts_root(repository_root=real, environ={}) == (
+        tmp_path / "real" / "artifacts"
+    ).resolve()
+
+    expected_queries = [
+        ("rev-parse", "--show-toplevel"),
+        ("rev-parse", "--verify", "HEAD^{commit}"),
+        ("ls-files", "--error-unmatch", "--", "pyproject.toml"),
+    ]
+    queries = []
+    for command, _ in observed[-3:]:
+        assert command[0] == "/usr/bin/git"
+        root_index = command.index("-C")
+        queries.append(command[root_index + 2 :])
+    assert queries == expected_queries
+    assert len(observed) == 4
+    for _, environment in observed:
+        assert not set(hostile).intersection(environment)
+        assert environment["GIT_CONFIG_NOSYSTEM"] == "1"
+        assert environment["GIT_CONFIG_GLOBAL"] == os.devnull
+        assert environment["GIT_NO_REPLACE_OBJECTS"] == "1"
+        assert environment["GIT_OPTIONAL_LOCKS"] == "0"
+        assert environment["LC_ALL"] == "C"
 
 
 def test_default_loader_reads_only_root_manifest(
@@ -252,9 +406,20 @@ def test_directory_attestation_exact_sha256sum_relative_v1(tmp_path: Path) -> No
     assert observed.total_bytes == 6
     assert observed.tree_digest == expected
 
+    linked_parent = tmp_path / "linked-tree-parent"
+    linked_parent.symlink_to(root.parent, target_is_directory=True)
+    with pytest.raises(V02AssetError, match="contains a symlink"):
+        attest_directory(linked_parent / root.name)
+
     (root / "alias").symlink_to(root / "a.txt")
     with pytest.raises(V02AssetError, match="symlink"):
         attest_directory(root)
+    (root / "alias").unlink()
+
+    os.mkfifo(root / "named-pipe")
+    with pytest.raises(V02AssetError, match="special file"):
+        attest_directory(root)
+    (root / "named-pipe").unlink()
 
 
 def test_manifest_has_exact_top_level_and_row_inventory() -> None:
@@ -504,16 +669,84 @@ def test_capabilities_keep_missing_original_vendor_out_of_replay(
     _bind_fixture_inventory(monkeypatch, layout, "exact90")
     _bind_fixture_inventory(monkeypatch, layout, "formal_inputs")
     status = capability_status(layout, _manifest())
+    assert status["schema"] == "policy-learnware.v02-capability-status.v1"
+    assert status["readiness_scope"] == "asset_and_provenance_only"
+    assert status["runtime_dependency_check"] == "not_performed"
     assert status["handoff_verification"] == {
         "available": True,
         "provenance_class": "ORIGINAL_IMMUTABLE_EVIDENCE",
     }
-    assert status["policy_inference"]["available"] is False
+    assert status["policy_inference"] == {
+        "asset_provenance_ready": False,
+        "runtime_dependency_check": "not_performed",
+        "runtime_dependency_ready": None,
+        "provenance_class_if_runtime_ready": "UNAVAILABLE",
+    }
     assert status["training_replay"] == {
-        "available": False,
-        "provenance_class": "UNAVAILABLE",
+        "asset_provenance_ready": False,
+        "runtime_dependency_check": "not_performed",
+        "runtime_dependency_ready": None,
+        "provenance_class_if_runtime_ready": "UNAVAILABLE",
         "blocker": "MISSING_ORIGINAL_VENDOR_RUNTIME",
     }
+
+
+def test_capability_asset_readiness_never_calls_runtime_loader(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from policy_learnware_v0.v02 import runtime
+
+    layout = V02AssetLayout.resolve(tmp_path / "artifacts", environ={})
+    for asset_id in ("exact90", "formal_inputs", "legacy_v02", "fpo"):
+        layout.asset(asset_id).mkdir(parents=True)
+    policy_io = layout.legacy_v02 / "policy_io.py"
+    policy_io.write_text("# recovered fixture\n", encoding="utf-8")
+
+    _bind_fixture_sources(monkeypatch)
+    for asset_id in ("exact90", "formal_inputs", "legacy_v02"):
+        _bind_fixture_inventory(monkeypatch, layout, asset_id)
+    monkeypatch.setattr(
+        artifacts_module,
+        "EXPECTED_POLICY_IO_SHA256",
+        hashlib.sha256(policy_io.read_bytes()).hexdigest(),
+    )
+    monkeypatch.setattr(runtime, "verify_fpo_checkout", lambda _path: {"passed": True})
+
+    def forbidden_loader(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("capability_status must not import runtime dependencies")
+
+    monkeypatch.setattr(runtime, "load_verified_fpo_upstream", forbidden_loader)
+    status = capability_status(layout, _manifest())
+    assert status["policy_inference"] == {
+        "asset_provenance_ready": True,
+        "runtime_dependency_check": "not_performed",
+        "runtime_dependency_ready": None,
+        "provenance_class_if_runtime_ready": "RECONSTRUCTED_RUNTIME",
+    }
+    assert "available" not in status["policy_inference"]
+    assert "provenance_class" not in status["policy_inference"]
+
+
+def test_capability_rejects_legacy_symlink_before_hashing_policy_io(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    layout = V02AssetLayout.resolve(tmp_path / "artifacts", environ={})
+    layout.legacy_v02.mkdir(parents=True)
+    outside = tmp_path / "outside-policy-io.py"
+    outside.write_text("# must never be read\n", encoding="utf-8")
+    (layout.legacy_v02 / "policy_io.py").symlink_to(outside)
+    _bind_fixture_sources(monkeypatch)
+
+    hashed: list[Path] = []
+
+    def forbidden_hash(path: str | Path) -> str:
+        hashed.append(Path(path))
+        raise AssertionError("untrusted policy_io was hashed before attestation")
+
+    monkeypatch.setattr(artifacts_module, "sha256_file", forbidden_hash)
+    with pytest.raises(V02AssetError, match="symlink"):
+        capability_status(layout, _manifest())
+    assert hashed == []
     resolver = RelocationResolver(layout, validate_relocation_manifest(_manifest()))
     with pytest.raises(V02AssetError, match="MISSING_ORIGINAL"):
         resolver.ensure_verified_asset("vendor_original", must_exist=False)
