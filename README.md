@@ -62,13 +62,12 @@ artifacts/
 └── v04a/
     ├── runs/v04a-primary-dev-20260828-r4/
     ├── logs/v04a-primary-dev-20260828-r4/
-    ├── diagnostics/m2cpu-r1/
-    └── relocation_manifest.json
+    └── diagnostics/m2cpu-r1/
 ```
 
 Shared v02/v03/FPO inputs are referenced, not copied into `v04a/`. Historical
-receipts retain their original paths and bytes. The separate relocation
-manifest binds old and new locations without a symlink compatibility layer.
+receipts retain their original paths and bytes. The root relocation manifest
+binds old and new locations without a symlink compatibility layer.
 Experiment plans and reports live in the sibling `reports/` tree; they are not
 tracked in this branch. In particular, the unchanged v0.4a coding plan belongs
 at `../reports/v04a/Policy_Learnware_v0.4a_Coding_Plan.md`.
@@ -141,8 +140,8 @@ The relocation verifier is a pre-retirement operation. It requires three
 distinct source directories: the complete R4 run, a directory containing
 exactly the seven R4 log files, and a directory containing exactly the three
 m2cpu diagnostic files. After copying, it requires exact source/target equality,
-validates the source-only and seal-before-oracle status, and writes
-`v04a/relocation_manifest.json`:
+validates the source-only and seal-before-oracle status, and can write an
+owner-scoped manifest for a future relocation whose source still exists:
 
 ```bash
 PYTHONPATH=src:. "$PY" -m server.repro_fpo_ppo_v04a.bpr_runner relocation-manifest \
