@@ -21,7 +21,8 @@ from typing import Any, Iterable, Mapping, Sequence
 
 import numpy as np
 
-from .artifacts import ArtifactLayout, ArtifactLayoutError
+from . import __version__ as PACKAGE_VERSION
+from .artifacts import ArtifactLayout, ArtifactLayoutError, resolve_artifacts_root
 from .config import ConfigError, ProtocolDraft, load_protocol_draft
 from .envs.factory import make_env_adapter
 from .envs.inspect import inspect_environments, save_inspections
@@ -206,8 +207,8 @@ def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--artifacts-root",
         type=Path,
-        default=Path("artifacts"),
-        help="parent of artifacts/<pool_id>; never inferred from reproduction_root",
+        default=resolve_artifacts_root(),
+        help="shared root: explicit, RL_LEARNWARE_ARTIFACTS_ROOT, or sibling artifacts/",
     )
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument(
@@ -229,7 +230,9 @@ def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="policy-learnware-v0", description=__doc__)
-    parser.add_argument("--version", action="version", version="%(prog)s 0.1.0")
+    parser.add_argument(
+        "--version", action="version", version=f"%(prog)s {PACKAGE_VERSION}"
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     for command in COMMANDS:

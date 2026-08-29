@@ -26,6 +26,11 @@ from typing import Any, Iterable, Mapping, MutableMapping, Sequence
 import numpy as np
 import yaml
 
+from policy_learnware_v0.artifacts import (
+    ARTIFACTS_ROOT_ENV as _ARTIFACTS_ROOT_ENV,
+    ArtifactLayoutError,
+    resolve_artifacts_root,
+)
 from policy_learnware_v0.hashing import (
     canonical_json_bytes,
     sha256_bytes,
@@ -60,7 +65,6 @@ from policy_learnware_v0.v03.transition_views import (
     apply_transition_view,
 )
 from policy_learnware_v0.v04a.protocol import (
-    BUDGET_EPISODES,
     BudgetLedger,
     ProbeMembership,
     RankingSeal,
@@ -119,20 +123,8 @@ _DEVELOPMENT_BUDGETS = (1, 2, 4)
 _EXPECTED_CONFIG_DIGEST = (
     "c6b808fb0ea1f8acce8406b6b21ba29908fac790c0c2bf118b31e1aa0b13b725"
 )
-_FROZEN_FILE_SHA256 = MappingProxyType(
-    {
-        "source_fit_manifest": "4f468f6b885b7680cf3d186edb1fd70baf90c2c3c95c687373359a8d713296cf",
-        "probe_membership": "dc372cbc59578f66462afac1e4bb3ee7f9d157f6aeae1dafffb4594e60e8d600",
-        "source_task_layout": "6946b80663b6e8f4b63b2c4d63e0e83f0d57c41e5dc24a441d3c0fb93cb704e1",
-        "asset_census": "ba6bed976f7fddbecede507c170c224ed512e199995f67264b3782de3cf5abe5",
-        "raw_delta_adapter": "77d9f59129b885c367f14427fdc082eb2300a22565c73997715049424153f98a",
-        "deployment_private_registry": "cfcd8f7cdd251be73cd3e2f8d9903ebc5b08e1ffa13e175092b602579a7a9108",
-        "championization": "94e822fd6912de82c0c5fc588af8568937cf951c91e5f0997bfb84bbecd70754",
-    }
-)
-_EXPECTED_CHAMPIONIZATION_DIGEST = (
-    "45515da9ab3eed4e6293c9dbc0918be76edac5dd16ebdc711cec36674c62c88f"
-)
+_R4_RELATIVE = Path("v04a/runs/v04a-primary-dev-20260828-r4")
+_V03_RELATIVE = Path("v03/runs/v03-main-20260827-r0")
 
 
 class _UniqueKeyLoader(yaml.SafeLoader):
@@ -190,6 +182,40 @@ def load_development_config(path: str | Path) -> tuple[dict[str, Any], str]:
     if digest != _EXPECTED_CONFIG_DIGEST:
         raise V05RunnerError("preregistered development config digest drifted")
     return config, digest
+
+
+def _resolve_v05_frozen_roots(
+    explicit_root: str | Path | None = None,
+) -> tuple[Path, Path, Path]:
+    """Resolve the two frozen inputs without relying on legacy path geometry."""
+
+    try:
+        raw_root = resolve_artifacts_root(explicit_root)
+    except ArtifactLayoutError as error:
+        raise V05RunnerError(str(error)) from error
+    known = (
+        raw_root,
+        raw_root / "v04a",
+        raw_root / "v04a" / "runs",
+        raw_root / _R4_RELATIVE,
+        raw_root / "v03",
+        raw_root / "v03" / "runs",
+        raw_root / _V03_RELATIVE,
+    )
+    if any(path.is_symlink() for path in known):
+        raise V05RunnerError("frozen artifact roots cannot use symlinks")
+    root = raw_root.resolve()
+    r4_root = (root / _R4_RELATIVE).resolve()
+    v03_root = (root / _V03_RELATIVE).resolve()
+    if (
+        not root.is_dir()
+        or not r4_root.is_dir()
+        or not v03_root.is_dir()
+        or not r4_root.is_relative_to(root)
+        or not v03_root.is_relative_to(root)
+    ):
+        raise V05RunnerError("canonical frozen artifact layout is absent or unsafe")
+    return root, r4_root, v03_root
 
 
 @dataclass(frozen=True)
@@ -262,18 +288,25 @@ def _frozen_json(
 
 
 def _load_frozen_r4_assets(
-    config: Mapping[str, Any], config_digest: str, r4_root: str | Path
+    config: Mapping[str, Any],
+    config_digest: str,
+    artifacts_root: str | Path | None = None,
 ) -> FrozenR4Assets:
     """Strictly admit the 30 frozen r4 source banks and v03 label authority."""
 
-    raw_root = Path(r4_root).expanduser()
-    if raw_root.is_symlink():
-        raise V05RunnerError("r4 root cannot be a symlink")
-    root = raw_root.resolve()
-    if not root.is_dir():
-        raise V05RunnerError("r4 root is absent")
+    _, root, v03_root = _resolve_v05_frozen_roots(artifacts_root)
     frozen = config["frozen_assets"]
     r4_config = frozen["r4"]
+    frozen_file_sha256 = {
+        name: _digest(r4_config[name].get("file_sha256"), f"{name} file SHA")
+        for name in (
+            "source_fit_manifest",
+            "probe_membership",
+            "source_task_layout",
+            "asset_census",
+            "raw_delta_adapter",
+        )
+    }
     documents: dict[str, dict[str, Any]] = {}
     paths: dict[str, Path] = {}
     for name in (
@@ -286,21 +319,18 @@ def _load_frozen_r4_assets(
         paths[name], documents[name] = _frozen_json(
             root,
             r4_config[name],
-            expected_sha256=_FROZEN_FILE_SHA256[name],
+            expected_sha256=frozen_file_sha256[name],
             where=name,
         )
     v03_config = frozen["v03"]
-    v03_relative = Path(str(v03_config["root_relative_to_r4"]))
-    if v03_relative.is_absolute():
-        raise V05RunnerError("v03 root must be relative to r4")
-    v03_root = (root / v03_relative).resolve()
-    if not v03_root.is_dir():
-        raise V05RunnerError("frozen v03 root is absent")
     for name in ("deployment_private_registry", "championization"):
+        frozen_file_sha256[name] = _digest(
+            v03_config[name].get("file_sha256"), f"{name} file SHA"
+        )
         paths[name], documents[name] = _frozen_json(
             v03_root,
             v03_config[name],
-            expected_sha256=_FROZEN_FILE_SHA256[name],
+            expected_sha256=frozen_file_sha256[name],
             where=name,
         )
 
@@ -340,7 +370,7 @@ def _load_frozen_r4_assets(
         {
             "v05_probe": config["probe"],
             "r4_fixed_probe_protocol_id": r4_probe_protocol_digest,
-            "probe_membership_file_sha256": _FROZEN_FILE_SHA256["probe_membership"],
+            "probe_membership_file_sha256": frozen_file_sha256["probe_membership"],
         }
     )
     layout = _exact_fields(
@@ -414,7 +444,11 @@ def _load_frozen_r4_assets(
         documents["championization"]
     )
     if (
-        championization.championization_digest != _EXPECTED_CHAMPIONIZATION_DIGEST
+        championization.championization_digest
+        != _digest(
+            v03_config["championization"].get("championization_digest"),
+            "championization_digest",
+        )
         or registry_doc["championization_digest"]
         != championization.championization_digest
         or championization.competence_mode != "OBSERVE"
@@ -631,7 +665,7 @@ def _load_frozen_r4_assets(
     )
     competence = tuple(item.competence for item in championization.champions.values())
     provenance = {
-        "frozen_file_sha256": dict(_FROZEN_FILE_SHA256),
+        "frozen_file_sha256": frozen_file_sha256,
         "policy_market_id": registry_doc["policy_market_id"],
         "r4_fixed_probe_protocol_id": r4_probe_protocol_digest,
         "championization_digest": championization.championization_digest,
@@ -3069,15 +3103,15 @@ def _evaluate_after_persisted_seal(
 
 def run_development(
     config_path: str | Path,
-    r4_root: str | Path,
     new_run_dir: str | Path,
     *,
+    artifacts_root: str | Path | None = None,
     resume: bool = False,
 ) -> dict[str, Any]:
     """Run or strictly resume the frozen r4 held-repeat development panel."""
 
     config, config_digest = load_development_config(config_path)
-    assets = _load_frozen_r4_assets(config, config_digest, r4_root)
+    assets = _load_frozen_r4_assets(config, config_digest, artifacts_root)
     requested_run_dir = Path(new_run_dir).expanduser()
     if requested_run_dir.is_symlink():
         raise V05RunnerError("new run directory cannot be a symlink")
@@ -3097,10 +3131,14 @@ def run_development(
             raise V05RunnerError("new run directory already exists")
         run_dir.mkdir(parents=True, mode=0o755)
     manifest_unsigned = {
-        "schema": "policy-learnware.v05-development-run.v1",
+        "schema": "policy-learnware.v05-development-run.v2",
         "config_digest": config_digest,
         "config_file_sha256": sha256_file(Path(config_path).expanduser()),
-        "r4_root": assets.r4_root.as_posix(),
+        "frozen_asset_layout": {
+            "root_environment_variable": _ARTIFACTS_ROOT_ENV,
+            "r4_relative_path": _R4_RELATIVE.as_posix(),
+            "v03_relative_path": _V03_RELATIVE.as_posix(),
+        },
         "frozen_provenance_digest": sha256_json(dict(assets.provenance)),
         "budgets": list(_DEVELOPMENT_BUDGETS),
         "source_count": 30,
@@ -3202,13 +3240,17 @@ def run_development(
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--version", action="version", version="%(prog)s 0.5.0")
     parser.add_argument("--config", required=True)
-    parser.add_argument("--r4-root", required=True)
+    parser.add_argument("--artifacts-root")
     parser.add_argument("--new-run-dir", required=True)
     parser.add_argument("--resume", action="store_true")
     args = parser.parse_args(argv)
     run_development(
-        args.config, args.r4_root, args.new_run_dir, resume=bool(args.resume)
+        args.config,
+        args.new_run_dir,
+        artifacts_root=args.artifacts_root,
+        resume=bool(args.resume),
     )
     return 0
 
