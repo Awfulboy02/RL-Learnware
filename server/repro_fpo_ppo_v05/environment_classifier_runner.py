@@ -3128,9 +3128,25 @@ def run_development(
     config, config_digest = load_development_config(config_path)
     assets = _load_frozen_r4_assets(config, config_digest, artifacts_root)
     requested_run_dir = Path(new_run_dir).expanduser()
-    if requested_run_dir.is_symlink():
-        raise V05RunnerError("new run directory cannot be a symlink")
-    run_dir = requested_run_dir.resolve()
+    if not requested_run_dir.is_absolute():
+        requested_run_dir = Path.cwd() / requested_run_dir
+    lexical_run_dir = Path(os.path.abspath(requested_run_dir))
+    if any(
+        path.exists() and path.is_symlink()
+        for path in (*reversed(lexical_run_dir.parents), lexical_run_dir)
+    ):
+        raise V05RunnerError("new run directory has a symlink ancestor")
+    output_root = next(
+        (parent for parent in lexical_run_dir.parents if parent.exists()), None
+    )
+    if output_root is None or not output_root.is_dir():
+        raise V05RunnerError("new run directory has no valid output root")
+    run_dir = lexical_run_dir.resolve()
+    resolved_output_root = output_root.resolve()
+    if run_dir == resolved_output_root or not run_dir.is_relative_to(
+        resolved_output_root
+    ):
+        raise V05RunnerError("new run directory escapes its output root")
     if any(
         run_dir == frozen
         or run_dir.is_relative_to(frozen)
