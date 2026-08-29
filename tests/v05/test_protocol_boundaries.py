@@ -1631,6 +1631,18 @@ def test_run_development_rejects_output_ancestor_symlink_before_write(
     assert list(external.iterdir()) == []
     assert writes == []
 
+    missing_target = tmp_path / "missing-target"
+    broken_alias = tmp_path / "broken-alias"
+    broken_alias.symlink_to(missing_target, target_is_directory=True)
+    with pytest.raises(V05RunnerError, match="symlink ancestor"):
+        runner_module.run_development(
+            tmp_path / "config.yaml",
+            broken_alias / "new-run",
+            artifacts_root=tmp_path / "artifacts",
+        )
+    assert not missing_target.exists()
+    assert writes == []
+
 
 def test_frozen_root_resolver_fails_before_frozen_input_io(
     tmp_path, monkeypatch
