@@ -121,17 +121,25 @@ RL_Learnware/
   policy_learnware_v0/
   artifacts/
     relocation_manifest.json
-    policy_learnware_v0/
-      v0/
-        artifacts_retry_roundoff/
-          dmc6-outer006-policy-learnware-v0/
-      v01/
+    v0/
+      runs/
+        dmc6-outer006-policy-learnware-v0/
+    v01/
+      runs/
         dmc2-damping-outer006-v01-r0/
-    policy_training/
+    shared/
+      runtime/
+        fpo-418c2554/
       repro_fpo_ppo/
-        runs/
+        legacy-v02/
+          runs/
+            full/
   reports/
 ```
+
+`shared/repro_fpo_ppo/legacy-v02/runs/full/` 只是现存的 60-run 冷备份。该副本缺失原
+`_vendor/` runtime，状态必须标为 `incomplete`；它不能被描述为 original runtime，亦不能
+单独满足正式复现条件。
 
 root 选择顺序必须是：
 
@@ -154,12 +162,13 @@ else
   ARTIFACTS_ROOT="$PROJECT_ROOT/artifacts"
 fi
 
-V0_BASE="$ARTIFACTS_ROOT/policy_learnware_v0/v0/artifacts_retry_roundoff"
-V01_PARENT="$ARTIFACTS_ROOT/policy_learnware_v0/v01"
+RELOCATION_MANIFEST="$ARTIFACTS_ROOT/relocation_manifest.json"
+V0_BASE="$ARTIFACTS_ROOT/v0/runs"
+V01_PARENT="$ARTIFACTS_ROOT/v01/runs"
 V01_EXPERIMENT="dmc2-damping-outer006-v01-r0"
 V01_RUN="$V01_PARENT/$V01_EXPERIMENT"
-POLICY_RUNS="$ARTIFACTS_ROOT/policy_training/repro_fpo_ppo/runs"
-FPO_ROOT="$PROJECT_ROOT/policy_learnware_ope/fpo"
+POLICY_RUNS="$ARTIFACTS_ROOT/shared/repro_fpo_ppo/legacy-v02/runs/full"
+FPO_ROOT="$ARTIFACTS_ROOT/shared/runtime/fpo-418c2554"
 ```
 
 `V0_BASE` 必须是包含 pool ID 目录的父目录，不能直接指向
@@ -167,9 +176,9 @@ FPO_ROOT="$PROJECT_ROOT/policy_learnware_ope/fpo"
 
 ## Relocation manifest
 
-`$RL_LEARNWARE_ARTIFACTS_ROOT/relocation_manifest.json` 是外部位置说明，不是新的实验
-receipt，也不参与 formal protocol/config digest。它记录旧目录前缀到新目录前缀的映射，
-以及每棵已迁移资产树的独立内容清单摘要：
+根权威 manifest 的唯一名称是 `$ARTIFACTS_ROOT/relocation_manifest.json`。它是外部位置
+说明，不是新的实验 receipt，也不参与 formal protocol/config digest。它记录旧目录前缀到
+新目录前缀的映射，以及每棵已迁移资产树的独立内容清单摘要：
 
 ```json
 {
@@ -178,7 +187,7 @@ receipt，也不参与 formal protocol/config digest。它记录旧目录前缀�
     {
       "kind": "directory_prefix",
       "source": "/share/songyf/RL_Learnware/policy_learnware_v0/artifacts_retry_roundoff",
-      "target": "policy_learnware_v0/v0/artifacts_retry_roundoff",
+      "target": "v0/runs",
       "content_manifest_sha256": "<sha256>",
       "file_count": 0,
       "total_bytes": 0
@@ -186,7 +195,7 @@ receipt，也不参与 formal protocol/config digest。它记录旧目录前缀�
     {
       "kind": "directory_prefix",
       "source": "/share/songyf/RL_Learnware/policy_learnware_v0/artifacts_v01",
-      "target": "policy_learnware_v0/v01",
+      "target": "v01/runs",
       "content_manifest_sha256": "<sha256>",
       "file_count": 0,
       "total_bytes": 0
@@ -194,7 +203,9 @@ receipt，也不参与 formal protocol/config digest。它记录旧目录前缀�
     {
       "kind": "directory_prefix",
       "source": "/share/songyf/RL_Learnware/repro_fpo_ppo/runs",
-      "target": "policy_training/repro_fpo_ppo/runs",
+      "target": "shared/repro_fpo_ppo/legacy-v02/runs/full",
+      "completeness": "incomplete",
+      "known_missing": ["_vendor/"],
       "content_manifest_sha256": "<sha256>",
       "file_count": 0,
       "total_bytes": 0
@@ -238,15 +249,20 @@ manifest 表达。
 
 ## 复现层级
 
+下表定义的是满足全部输入后的能力边界，不是当前资产清点的完成声明。现有 legacy 60-run
+副本缺失原 `_vendor/`，且 FPO runtime candidate 仍须按 manifest 和 commit 验真；因此当前
+不得声称 L2 已可完成。
+
 | 层级 | 目标 | 最小输入 | 允许的结论 |
 |---|---|---|---|
 | L0 报告核读 | 阅读冻结结论 | 顶层 reports 与 artifact 内 summary/receipt | 可复述正式结论，不能声称重算 |
 | L1 receipt 验真 | 验证迁移与 digest 链 | 完整 manifest、protocol、gate、matrix sidecar 和 relocation content manifest | 可声称字节与 receipt 未变 |
-| L2 frozen revalidation | 重跑 `--resume`、Gate/recompute 与必要 parity | 正式提交 `33514ea`、pinned runtime、完整 v0/v01 artifacts、60 个 outer006 bundles、clean FPO checkout | 可声称原正式运行可复核 |
+| L2 frozen revalidation（条件能力） | 重跑 `--resume`、Gate/recompute 与必要 parity | 正式提交 `33514ea`、完整且经验证的原 `_vendor` runtime、完整 v0/v01 artifacts、60 个 outer006 bundles、经 commit/content 验真的 FPO runtime | 仅在全部条件满足后可声称原正式运行可复核；当前未满足 |
 | L3 fresh rerun | 重新生成数值实验 | 完整原始数据/训练资产与 GPU runtime | 必须使用新 root/receipt；不能覆盖 v01-r0 |
 
 L2 的正式 runtime 记录为 Python 3.12.13、JAX/JAXlib 0.7.2、Playground 0.0.5、
-MuJoCo 3.3.6、NumPy 2.5.1。FPO checkout 必须匹配 bundle provenance，并保持 tracked clean。
+MuJoCo 3.3.6、NumPy 2.5.1。`$FPO_ROOT` 必须匹配 bundle provenance 与记录的 commit，
+并通过 content-manifest 审计；路径名称相同本身不构成 original provenance。
 
 ## 冻结 receipt 复验命令
 
@@ -284,7 +300,8 @@ v01 build-report \
 
 若需要重新执行 policy parity 或 oracle，额外显式传入 `--fpo-root "$FPO_ROOT"` 与
 `--runs-root "$POLICY_RUNS"`。v01 会按 job ID 寻找 relocation 后的 bundle，并继续要求
-bundle digest 与冻结 candidate record 完全一致。
+bundle digest 与冻结 candidate record 完全一致。当前 `$POLICY_RUNS` 指向的 legacy 冷备份
+仅可用于恢复审计；在原 `_vendor/` runtime 未恢复并验真前，不得用它宣称完成 L2。
 
 ## 测试门禁
 
