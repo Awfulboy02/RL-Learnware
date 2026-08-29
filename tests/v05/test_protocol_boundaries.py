@@ -6,6 +6,7 @@ import hashlib
 import inspect
 import json
 import shutil
+import subprocess
 from types import SimpleNamespace
 from pathlib import Path
 import sys
@@ -17,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from policy_learnware_v0.hashing import canonical_json_bytes, sha256_file, sha256_json
 from policy_learnware_v0 import cli as top_level_cli
+from policy_learnware_v0 import artifacts as artifacts_module
 from policy_learnware_v0.io import atomic_write_json, read_json
 from policy_learnware_v0.rkme.reducer import ReducerConfig
 from policy_learnware_v0.v04a.protocol import (
@@ -1394,6 +1396,50 @@ def test_canonical_source_stage_persists_fit_roles_only_then_blinds_repeat(
     assert not missing_fit_bank.exists()
 
 
+def _run_git(repository: Path, *arguments: str) -> None:
+    subprocess.run(
+        ("git", "-C", str(repository), *arguments),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def _verified_fallback_checkout(tmp_path: Path, monkeypatch) -> Path:
+    repository = tmp_path / "repository"
+    repository.mkdir(parents=True)
+    (repository / "pyproject.toml").write_text(
+        '[project]\nname = "policy-learnware-v0"\n', encoding="utf-8"
+    )
+    _run_git(repository, "init", "-q")
+    _run_git(repository, "add", "pyproject.toml")
+    _run_git(
+        repository,
+        "-c",
+        "user.name=Audit Fixture",
+        "-c",
+        "user.email=audit@example.invalid",
+        "commit",
+        "-qm",
+        "fixture",
+    )
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    payload = canonical_json_bytes(
+        {
+            "schema": "rl-learnware-relocation/v1",
+            "mappings": [{"fixture": "digest-pinned-test-only"}],
+        }
+    )
+    (artifacts / "relocation_manifest.json").write_bytes(payload)
+    monkeypatch.setattr(
+        artifacts_module,
+        "_ROOT_RELOCATION_MANIFEST_SHA256",
+        hashlib.sha256(payload).hexdigest(),
+    )
+    return repository
+
+
 def test_frozen_root_resolver_uses_canonical_layout_from_any_location(
     tmp_path, monkeypatch
 ) -> None:
@@ -1422,12 +1468,7 @@ def test_frozen_root_resolver_uses_canonical_layout_from_any_location(
         other_v03.resolve(),
     )
     monkeypatch.delenv("RL_LEARNWARE_ARTIFACTS_ROOT")
-    repository = tmp_path / "repository"
-    repository.mkdir()
-    (repository / ".git").mkdir()
-    (repository / "pyproject.toml").write_text(
-        '[project]\nname = "policy-learnware-v0"\n', encoding="utf-8"
-    )
+    repository = _verified_fallback_checkout(tmp_path, monkeypatch)
     assert (
         runner_module.resolve_artifacts_root(repository_root=repository)
         == (tmp_path / "artifacts").resolve()
@@ -1449,22 +1490,32 @@ def test_artifact_root_rejects_existing_symlink_ancestor(tmp_path) -> None:
         runner_module.resolve_artifacts_root(alias / "artifacts")
 
 
-def test_artifact_root_fallback_rejects_noncheckout_and_worktree(
+def test_artifact_root_fallback_rejects_noncheckout_fake_git_and_unrooted_worktree(
     tmp_path, monkeypatch
 ) -> None:
     monkeypatch.delenv("RL_LEARNWARE_ARTIFACTS_ROOT", raising=False)
     wheel_like = tmp_path / "site-packages" / "policy_learnware_v0"
     wheel_like.mkdir(parents=True)
-    with pytest.raises(ValueError, match="outside a checkout"):
+    with pytest.raises(ValueError, match="verified Git checkout"):
         runner_module.resolve_artifacts_root(repository_root=wheel_like)
 
-    worktree = tmp_path / "audit-worktree"
-    worktree.mkdir()
-    (worktree / ".git").write_text("gitdir: /tmp/shared/.git/worktrees/audit\n")
-    (worktree / "pyproject.toml").write_text(
+    fake = tmp_path / "fake-repository"
+    fake.mkdir()
+    (fake / ".git").mkdir()
+    (fake / "pyproject.toml").write_text(
         '[project]\nname = "policy-learnware-v0"\n', encoding="utf-8"
     )
-    with pytest.raises(ValueError, match="worktrees require explicit"):
+    with pytest.raises(ValueError, match="Git checkout identity"):
+        runner_module.resolve_artifacts_root(repository_root=fake)
+
+    repository = _verified_fallback_checkout(tmp_path / "real", monkeypatch)
+    codex_ops = tmp_path / ".codex_ops"
+    codex_ops.mkdir()
+    worktree = codex_ops / "audit-worktree"
+    _run_git(repository, "worktree", "add", "--detach", str(worktree), "HEAD")
+    with pytest.raises(
+        ValueError, match="artifacts root is absent|relocation manifest"
+    ):
         runner_module.resolve_artifacts_root(repository_root=worktree)
 
 
@@ -1539,6 +1590,46 @@ def test_frozen_json_rejects_nested_symlink_escape_before_read(
             where="nested fixture",
         )
     assert frozen_reads == []
+
+
+def test_run_development_rejects_output_ancestor_symlink_before_write(
+    tmp_path, monkeypatch
+) -> None:
+    external = tmp_path / "external"
+    external.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(external, target_is_directory=True)
+    frozen = tmp_path / "frozen"
+    r4 = frozen / "r4"
+    v03 = frozen / "v03"
+    r4.mkdir(parents=True)
+    v03.mkdir()
+    monkeypatch.setattr(
+        runner_module,
+        "load_development_config",
+        lambda _path: ({}, "a" * 64),
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "_load_frozen_r4_assets",
+        lambda *_args, **_kwargs: SimpleNamespace(r4_root=r4, v03_root=v03),
+    )
+    writes = []
+    monkeypatch.setattr(
+        runner_module,
+        "atomic_write_json",
+        lambda *args, **kwargs: writes.append((args, kwargs)),
+    )
+
+    with pytest.raises(V05RunnerError, match="symlink ancestor"):
+        runner_module.run_development(
+            tmp_path / "config.yaml",
+            alias / "new-run",
+            artifacts_root=tmp_path / "artifacts",
+        )
+    assert not (external / "new-run").exists()
+    assert list(external.iterdir()) == []
+    assert writes == []
 
 
 def test_frozen_root_resolver_fails_before_frozen_input_io(

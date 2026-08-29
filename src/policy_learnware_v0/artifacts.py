@@ -9,9 +9,11 @@ the CLI never accepts an arbitrary output path.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 import os
 from pathlib import Path
 import re
+import subprocess
 from typing import Any, Mapping
 
 try:
@@ -37,6 +39,114 @@ class ArtifactLayoutError(ValueError):
 
 
 ARTIFACTS_ROOT_ENV = "RL_LEARNWARE_ARTIFACTS_ROOT"
+_ROOT_RELOCATION_MANIFEST_SHA256 = (
+    "81e726c297c78ebc110df017e06e6fb56de73face39371198635299f931bfed9"
+)
+
+
+def _absolute_without_symlinks(path: Path, where: str) -> Path:
+    candidate = path if path.is_absolute() else Path.cwd() / path
+    absolute = Path(os.path.abspath(candidate))
+    if any(
+        component.is_symlink() for component in (*reversed(absolute.parents), absolute)
+    ):
+        raise ArtifactLayoutError(f"{where} cannot have a symlink ancestor")
+    return absolute.resolve()
+
+
+def _verified_checkout(path: Path) -> Path:
+    repository = _absolute_without_symlinks(path, "repository fallback")
+    project_file = repository / "pyproject.toml"
+    git_marker = repository / ".git"
+    if (
+        not repository.is_dir()
+        or project_file.is_symlink()
+        or git_marker.is_symlink()
+        or not (git_marker.is_dir() or git_marker.is_file())
+    ):
+        raise ArtifactLayoutError("artifacts fallback requires a verified Git checkout")
+
+    def git(*arguments: str) -> str:
+        try:
+            result = subprocess.run(
+                ("git", "-C", str(repository), *arguments),
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise ArtifactLayoutError(
+                "Git checkout identity cannot be verified"
+            ) from error
+        if result.returncode != 0:
+            raise ArtifactLayoutError("Git checkout identity cannot be verified")
+        return result.stdout.strip()
+
+    top_level = git("rev-parse", "--show-toplevel")
+    if _absolute_without_symlinks(Path(top_level), "Git top-level") != repository:
+        raise ArtifactLayoutError("Git top-level differs from repository fallback")
+    head = git("rev-parse", "--verify", "HEAD^{commit}")
+    if not re.fullmatch(r"[0-9a-f]{40,64}", head):
+        raise ArtifactLayoutError("Git HEAD identity is invalid")
+    if git("ls-files", "--error-unmatch", "--", "pyproject.toml") != "pyproject.toml":
+        raise ArtifactLayoutError("pyproject.toml is not tracked at repository root")
+    git("cat-file", "-e", "HEAD:pyproject.toml")
+    if git("status", "--porcelain=v1", "--untracked-files=no", "--", "pyproject.toml"):
+        raise ArtifactLayoutError("tracked pyproject.toml differs from Git HEAD")
+    try:
+        project = tomllib.loads(project_file.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError) as error:
+        raise ArtifactLayoutError("tracked pyproject.toml is invalid") from error
+    if project.get("project", {}).get("name") != "policy-learnware-v0":
+        raise ArtifactLayoutError("Git checkout project identity differs")
+    return repository
+
+
+def _verify_root_relocation_manifest(root: Path) -> None:
+    if not root.is_dir():
+        raise ArtifactLayoutError("fallback artifacts root is absent")
+    manifest = root / "relocation_manifest.json"
+    if manifest.is_symlink() or not manifest.is_file():
+        raise ArtifactLayoutError("fallback relocation manifest is absent or unsafe")
+    try:
+        payload = manifest.read_bytes()
+    except OSError as error:
+        raise ArtifactLayoutError(
+            "fallback relocation manifest cannot be read"
+        ) from error
+    if sha256_bytes(payload) != _ROOT_RELOCATION_MANIFEST_SHA256:
+        raise ArtifactLayoutError("fallback relocation manifest digest differs")
+
+    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        value: dict[str, Any] = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError(f"duplicate key: {key}")
+            value[key] = item
+        return value
+
+    try:
+        value = json.loads(
+            payload.decode("utf-8"),
+            object_pairs_hook=unique_object,
+            parse_constant=lambda token: (_ for _ in ()).throw(
+                ValueError(f"non-finite constant: {token}")
+            ),
+        )
+        canonical_json_bytes(value)
+    except (UnicodeError, ValueError, TypeError) as error:
+        raise ArtifactLayoutError(
+            "fallback relocation manifest is invalid JSON"
+        ) from error
+    if (
+        not isinstance(value, Mapping)
+        or set(value) != {"schema", "mappings"}
+        or value["schema"] != "rl-learnware-relocation/v1"
+        or not isinstance(value["mappings"], list)
+        or not value["mappings"]
+    ):
+        raise ArtifactLayoutError("fallback relocation manifest schema differs")
 
 
 def resolve_artifacts_root(
@@ -46,6 +156,7 @@ def resolve_artifacts_root(
 ) -> Path:
     """Resolve explicit root, then the shared environment, then sibling default."""
 
+    fallback = False
     if explicit is not None:
         if isinstance(explicit, str) and not explicit.strip():
             raise ArtifactLayoutError("explicit artifacts root cannot be empty")
@@ -57,40 +168,17 @@ def resolve_artifacts_root(
                 raise ArtifactLayoutError(f"{ARTIFACTS_ROOT_ENV} cannot be empty")
             root = Path(configured).expanduser()
         else:
-            repository = (
+            repository = _verified_checkout(
                 Path(repository_root).expanduser()
                 if repository_root is not None
                 else Path(__file__).resolve().parents[2]
             )
-            project_file = repository / "pyproject.toml"
-            git_marker = repository / ".git"
-            try:
-                project = tomllib.loads(project_file.read_text(encoding="utf-8"))
-            except (OSError, UnicodeError, tomllib.TOMLDecodeError) as error:
-                raise ArtifactLayoutError(
-                    "artifacts root requires explicit path or environment outside a checkout"
-                ) from error
-            if (
-                project_file.is_symlink()
-                or git_marker.is_symlink()
-                or project.get("project", {}).get("name") != "policy-learnware-v0"
-                or not (git_marker.is_dir() or git_marker.is_file())
-            ):
-                raise ArtifactLayoutError(
-                    "artifacts root fallback requires the policy-learnware Git checkout"
-                )
-            if git_marker.is_file():
-                raise ArtifactLayoutError(
-                    "Git worktrees require explicit artifacts root or environment"
-                )
             root = repository.parent / "artifacts"
-    if not root.is_absolute():
-        root = Path.cwd() / root
-    absolute = Path(os.path.abspath(root))
-    components = (*reversed(absolute.parents), absolute)
-    if any(component.is_symlink() for component in components):
-        raise ArtifactLayoutError("artifacts root cannot have a symlink ancestor")
-    return absolute.resolve()
+            fallback = True
+    resolved = _absolute_without_symlinks(root, "artifacts root")
+    if fallback:
+        _verify_root_relocation_manifest(resolved)
+    return resolved
 
 
 _SAFE_SEGMENT = re.compile(r"^[A-Za-z0-9_.-]+$")
