@@ -19,6 +19,7 @@ from dataclasses import dataclass
 import hashlib
 import importlib
 import importlib.machinery
+import importlib.util
 import os
 from pathlib import Path, PurePosixPath
 import stat
@@ -602,7 +603,13 @@ def load_verified_fpo_upstream(
         _require_no_cached_flow_policy()
         initial_flow_modules = _namespace_snapshot("flow_policy")
         source_text = str(source_dir)
-        shim_used = False
+        caller_wandb_namespace = _namespace_snapshot("wandb")
+        wandb_was_available = "wandb" in caller_wandb_namespace
+        if not wandb_was_available:
+            try:
+                wandb_was_available = importlib.util.find_spec("wandb") is not None
+            except (ImportError, AttributeError, ValueError):
+                wandb_was_available = False
         modules: dict[str, Any]
         import_succeeded = False
         sys.path.insert(0, source_text)
@@ -624,18 +631,12 @@ def load_verified_fpo_upstream(
                 "dm_control_suite": dm_control_suite,
                 "registry": registry,
             }
-            try:
+            # Always mask even an installed/loaded real wandb distribution.
+            # The imported rollouts module intentionally retains references to
+            # this fail-closed shim, while the caller's sys.modules namespace
+            # is restored byte-for-byte by the context manager.
+            with _temporary_inference_only_wandb():
                 flow_modules = _import_flow_policy_modules()
-            except ModuleNotFoundError as error:
-                if error.name != "wandb":
-                    raise
-                # A failed package import may leave successfully imported
-                # siblings cached.  Restore the exact pre-import namespace and
-                # retry once under the import-surface-only shim.
-                _restore_namespace("flow_policy", initial_flow_modules)
-                with _temporary_inference_only_wandb():
-                    flow_modules = _import_flow_policy_modules()
-                shim_used = True
 
             modules = {**base_modules, **flow_modules}
             for name in ("fpo", "ppo", "rollouts"):
@@ -674,10 +675,9 @@ def load_verified_fpo_upstream(
                 "original_runtime_capable": False,
                 "training_replay_capable": False,
                 "inference_only": True,
-                "missing_dependency": "wandb" if shim_used else None,
-                "shim_identity": (
-                    INFERENCE_ONLY_WANDB_SHIM_IDENTITY if shim_used else None
-                ),
+                "missing_dependency": None if wandb_was_available else "wandb",
+                "shim_identity": INFERENCE_ONLY_WANDB_SHIM_IDENTITY,
+                "installed_wandb_bypassed": wandb_was_available,
             }
         )
         return VerifiedFPOUpstream(
