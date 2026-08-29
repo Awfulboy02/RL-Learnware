@@ -42,6 +42,7 @@ ARTIFACTS_ROOT_ENV = "RL_LEARNWARE_ARTIFACTS_ROOT"
 _ROOT_RELOCATION_MANIFEST_SHA256 = (
     "81e726c297c78ebc110df017e06e6fb56de73face39371198635299f931bfed9"
 )
+_TRUSTED_GIT_CANDIDATES = (Path("/usr/bin/git"), Path("/bin/git"))
 
 
 def _absolute_without_symlinks(path: Path, where: str) -> Path:
@@ -66,15 +67,27 @@ def _verified_checkout(path: Path) -> Path:
     ):
         raise ArtifactLayoutError("artifacts fallback requires a verified Git checkout")
 
+    trusted_git = next(
+        (
+            candidate
+            for candidate in _TRUSTED_GIT_CANDIDATES
+            if candidate.is_file()
+            and not candidate.is_symlink()
+            and os.access(candidate, os.X_OK)
+        ),
+        None,
+    )
+    if trusted_git is None:
+        raise ArtifactLayoutError("trusted system Git executable is unavailable")
+
     def git(*arguments: str) -> str:
-        git_environment = {
-            key: value
-            for key, value in os.environ.items()
-            if not key.upper().startswith("GIT_")
-        }
+        # Do not inherit caller-controlled repository identity or executable lookup.
+        git_environment = {"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"}
+        if any(key.upper().startswith("GIT_") for key in git_environment):
+            raise ArtifactLayoutError("trusted Git environment is invalid")
         try:
             result = subprocess.run(
-                ("git", "-C", str(repository), *arguments),
+                (str(trusted_git), "-C", str(repository), *arguments),
                 check=False,
                 capture_output=True,
                 text=True,

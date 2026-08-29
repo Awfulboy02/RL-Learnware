@@ -1544,11 +1544,14 @@ def test_artifact_root_git_identity_ignores_polluted_git_environment(
 
     real_run = subprocess.run
     observed_environments = []
+    observed_executables = []
 
     def sanitized_run(*args, **kwargs):
         environment = kwargs.get("env", {})
         observed_environments.append(environment)
+        observed_executables.append(Path(args[0][0]))
         assert not any(key.upper().startswith("GIT_") for key in environment)
+        assert environment == {"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"}
         return real_run(*args, **kwargs)
 
     monkeypatch.setattr(artifacts_module.subprocess, "run", sanitized_run)
@@ -1559,12 +1562,44 @@ def test_artifact_root_git_identity_ignores_polluted_git_environment(
         == (tmp_path / "artifacts").resolve()
     )
     assert observed_environments
+    assert all(path.is_absolute() for path in observed_executables)
+    assert set(observed_executables) <= {Path("/usr/bin/git"), Path("/bin/git")}
 
     explicit = tmp_path / "explicit-assets"
     assert runner_module.resolve_artifacts_root(explicit) == explicit.resolve()
     configured = tmp_path / "configured-assets"
     monkeypatch.setenv("RL_LEARNWARE_ARTIFACTS_ROOT", str(configured))
     assert runner_module.resolve_artifacts_root() == configured.resolve()
+
+
+def test_artifact_root_git_identity_never_uses_caller_path(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.delenv("RL_LEARNWARE_ARTIFACTS_ROOT", raising=False)
+    repository = _verified_fallback_checkout(tmp_path, monkeypatch)
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    marker = tmp_path / "fake-git-was-called"
+    fake_git = fake_bin / "git"
+    fake_git.write_text(
+        "#!/bin/sh\n" + f"touch '{marker.as_posix()}'\n" + "exit 97\n",
+        encoding="utf-8",
+    )
+    fake_git.chmod(0o755)
+    monkeypatch.setenv("PATH", str(fake_bin))
+
+    assert (
+        runner_module.resolve_artifacts_root(repository_root=repository)
+        == (tmp_path / "artifacts").resolve()
+    )
+    assert not marker.exists()
+
+    explicit = tmp_path / "explicit-assets"
+    assert runner_module.resolve_artifacts_root(explicit) == explicit.resolve()
+    configured = tmp_path / "configured-assets"
+    monkeypatch.setenv("RL_LEARNWARE_ARTIFACTS_ROOT", str(configured))
+    assert runner_module.resolve_artifacts_root() == configured.resolve()
+    assert not marker.exists()
 
 
 def test_top_level_cli_rejects_empty_artifacts_root(
