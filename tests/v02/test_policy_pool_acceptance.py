@@ -168,7 +168,9 @@ def _stub_full_acceptance(
         )
         (attempt_dir / "queue_result.json").write_text("{}\n", encoding="utf-8")
     monkeypatch.setattr(
-        module, "_canonical_job_roots", lambda _plan, _root: (jobs, plan)
+        module,
+        "_canonical_job_roots",
+        lambda _plan, _root, **_kwargs: (jobs, plan),
     )
     monkeypatch.setattr(
         module,
