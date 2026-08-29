@@ -442,6 +442,76 @@ def test_loader_import_failure_restores_preinstalled_wandb_and_flow_namespace(
     assert "flow_policy.partial" not in sys.modules
 
 
+def test_loader_second_attestation_failure_restores_flow_namespace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, _ = _make_checkout(tmp_path)
+    modules = _fake_imports(root)
+    calls = 0
+
+    def verify(_path: str | Path) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise runtime.RuntimeVerificationError("post-import attestation failed")
+        return {"ok": True}
+
+    def import_module(name: str) -> ModuleType:
+        module = modules[name]
+        if name.startswith("flow_policy."):
+            monkeypatch.setitem(sys.modules, name, module)
+        return module
+
+    monkeypatch.setattr(runtime, "verify_fpo_checkout", verify)
+    monkeypatch.setattr(runtime.importlib, "import_module", import_module)
+    monkeypatch.setattr(runtime.importlib.util, "find_spec", lambda name: None)
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    with pytest.raises(runtime.RuntimeVerificationError, match="post-import"):
+        runtime.load_verified_fpo_upstream(root, allow_reconstructed=True)
+    assert calls == 2
+    assert not [
+        name
+        for name in sys.modules
+        if name == "flow_policy" or name.startswith("flow_policy.")
+    ]
+
+
+def test_loader_post_import_path_failure_restores_flow_namespace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, _ = _make_checkout(tmp_path)
+    modules = _fake_imports(root)
+    original_path_check = runtime._absolute_path_without_symlinks
+    path_checks = 0
+
+    def path_check(path: str | Path, *, where: str) -> Path:
+        nonlocal path_checks
+        path_checks += 1
+        if path_checks == 3:
+            raise runtime.RuntimeVerificationError("post-import path check failed")
+        return original_path_check(path, where=where)
+
+    def import_module(name: str) -> ModuleType:
+        module = modules[name]
+        if name.startswith("flow_policy."):
+            monkeypatch.setitem(sys.modules, name, module)
+        return module
+
+    monkeypatch.setattr(runtime, "_absolute_path_without_symlinks", path_check)
+    monkeypatch.setattr(runtime, "verify_fpo_checkout", lambda path: {"ok": True})
+    monkeypatch.setattr(runtime.importlib, "import_module", import_module)
+    monkeypatch.setattr(runtime.importlib.util, "find_spec", lambda name: None)
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    with pytest.raises(runtime.RuntimeVerificationError, match="post-import path"):
+        runtime.load_verified_fpo_upstream(root, allow_reconstructed=True)
+    assert path_checks == 3
+    assert not [
+        name
+        for name in sys.modules
+        if name == "flow_policy" or name.startswith("flow_policy.")
+    ]
+
+
 def test_loader_does_not_shim_any_other_missing_dependency(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
