@@ -158,6 +158,7 @@ def test_loader_requires_opt_in_and_returns_reconstructed_runtime(
     monkeypatch.setattr(
         runtime.importlib, "import_module", lambda name: modules[name]
     )
+    monkeypatch.setattr(runtime.importlib.util, "find_spec", lambda name: None)
     monkeypatch.setattr(sys, "dont_write_bytecode", True)
 
     with pytest.raises(runtime.ReconstructedRuntimeNotAllowed):
@@ -173,8 +174,9 @@ def test_loader_requires_opt_in_and_returns_reconstructed_runtime(
         "original_runtime_capable": False,
         "training_replay_capable": False,
         "inference_only": True,
-        "missing_dependency": None,
-        "shim_identity": None,
+        "missing_dependency": "wandb",
+        "shim_identity": runtime.INFERENCE_ONLY_WANDB_SHIM_IDENTITY,
+        "installed_wandb_bypassed": False,
     }
     assert loaded.legacy_module_tuple() == (
         modules["jax"],
@@ -204,6 +206,7 @@ def test_loader_rejects_wrong_flow_policy_origin(
     outside.write_text("", encoding="utf-8")
     modules["flow_policy.fpo"] = _fake_module("flow_policy.fpo", outside)
     monkeypatch.setattr(runtime, "verify_fpo_checkout", lambda path: {"ok": True})
+    monkeypatch.setattr(runtime.importlib.util, "find_spec", lambda name: None)
     monkeypatch.setattr(
         runtime.importlib, "import_module", lambda name: modules[name]
     )
@@ -223,6 +226,7 @@ def test_loader_rejects_cached_flow_policy_from_another_checkout(
     cached = _fake_module("flow_policy.fpo", outside)
     monkeypatch.setitem(sys.modules, "flow_policy.fpo", cached)
     monkeypatch.setattr(runtime, "verify_fpo_checkout", lambda path: {"ok": True})
+    monkeypatch.setattr(runtime.importlib.util, "find_spec", lambda name: None)
     monkeypatch.setattr(sys, "dont_write_bytecode", True)
 
     with pytest.raises(runtime.RuntimeVerificationError, match="refusing cached"):
@@ -238,6 +242,7 @@ def test_loader_rejects_same_checkout_cached_module_even_with_trusted_origin(
     cached.MUTATED_AFTER_IMPORT = True  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "flow_policy.fpo", cached)
     monkeypatch.setattr(runtime, "verify_fpo_checkout", lambda path: {"ok": True})
+    monkeypatch.setattr(runtime.importlib.util, "find_spec", lambda name: None)
     monkeypatch.setattr(sys, "dont_write_bytecode", True)
 
     with pytest.raises(runtime.RuntimeVerificationError, match="refusing cached"):
@@ -255,6 +260,7 @@ def test_loader_uses_scoped_import_only_wandb_shim_and_restores_namespace(
     monkeypatch.delitem(sys.modules, "wandb.sdk", raising=False)
     monkeypatch.delitem(sys.modules, "wandb.sdk.wandb_run", raising=False)
     monkeypatch.setattr(runtime, "verify_fpo_checkout", lambda path: {"ok": True})
+    monkeypatch.setattr(runtime.importlib.util, "find_spec", lambda name: None)
     monkeypatch.setattr(sys, "dont_write_bytecode", True)
 
     def import_module(name: str) -> ModuleType:
@@ -278,6 +284,7 @@ def test_loader_uses_scoped_import_only_wandb_shim_and_restores_namespace(
         "inference_only": True,
         "missing_dependency": "wandb",
         "shim_identity": runtime.INFERENCE_ONLY_WANDB_SHIM_IDENTITY,
+        "installed_wandb_bypassed": False,
     }
     assert sys.modules["wandb.orphan"] is orphan
     assert "wandb" not in sys.modules
@@ -323,6 +330,86 @@ def test_wandb_shim_supports_required_import_surface_and_restores_exactly(
         if name == "wandb" or name.startswith("wandb.")
     }
     assert after == before
+
+
+def test_loader_masks_preinstalled_real_wandb_and_restores_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, _ = _make_checkout(tmp_path)
+    modules = _fake_imports(root)
+    real_wandb = _fake_module("wandb")
+    real_sdk = _fake_module("wandb.sdk")
+    real_run = _fake_module("wandb.sdk.wandb_run")
+    real_wandb.init = lambda *_args, **_kwargs: "would-connect"  # type: ignore[attr-defined]
+    real_run.Run = object  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "wandb", real_wandb)
+    monkeypatch.setitem(sys.modules, "wandb.sdk", real_sdk)
+    monkeypatch.setitem(sys.modules, "wandb.sdk.wandb_run", real_run)
+    monkeypatch.setattr(runtime, "verify_fpo_checkout", lambda path: {"ok": True})
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+
+    def import_module(name: str) -> ModuleType:
+        if name == "flow_policy.rollouts":
+            modules[name].wandb = sys.modules["wandb"]  # type: ignore[attr-defined]
+            modules[name].Run = sys.modules[  # type: ignore[attr-defined]
+                "wandb.sdk.wandb_run"
+            ].Run
+        return modules[name]
+
+    monkeypatch.setattr(runtime.importlib, "import_module", import_module)
+    loaded = runtime.load_verified_fpo_upstream(root, allow_reconstructed=True)
+
+    assert sys.modules["wandb"] is real_wandb
+    assert sys.modules["wandb.sdk"] is real_sdk
+    assert sys.modules["wandb.sdk.wandb_run"] is real_run
+    assert loaded.rollouts.wandb is not real_wandb
+    with pytest.raises(runtime.ReconstructedRuntimeNotAllowed):
+        loaded.rollouts.wandb.init()
+    with pytest.raises(runtime.ReconstructedRuntimeNotAllowed):
+        loaded.rollouts.wandb.finish()
+    assert loaded.runtime_receipt == {
+        "schema": "policy-learnware.v02-reconstructed-runtime.v1",
+        "runtime_status": runtime.RECONSTRUCTED_RUNTIME,
+        "original_runtime_capable": False,
+        "training_replay_capable": False,
+        "inference_only": True,
+        "missing_dependency": None,
+        "shim_identity": runtime.INFERENCE_ONLY_WANDB_SHIM_IDENTITY,
+        "installed_wandb_bypassed": True,
+    }
+
+    # A second source load in the same process fails closed because executed
+    # flow_policy modules are cached; it must not disturb the real wandb.
+    monkeypatch.setitem(sys.modules, "flow_policy.fpo", loaded.fpo)
+    with pytest.raises(runtime.RuntimeVerificationError, match="refusing cached"):
+        runtime.load_verified_fpo_upstream(root, allow_reconstructed=True)
+    assert sys.modules["wandb"] is real_wandb
+
+
+def test_loader_import_failure_restores_preinstalled_wandb_and_flow_namespace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, _ = _make_checkout(tmp_path)
+    modules = _fake_imports(root)
+    real_wandb = _fake_module("wandb")
+    sentinel_flow = _fake_module("unrelated")
+    monkeypatch.setitem(sys.modules, "wandb", real_wandb)
+    monkeypatch.setattr(runtime, "verify_fpo_checkout", lambda path: {"ok": True})
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+
+    def import_module(name: str) -> ModuleType:
+        if name == "flow_policy.ppo":
+            monkeypatch.setitem(sys.modules, "flow_policy.partial", sentinel_flow)
+            raise ModuleNotFoundError("No module named 'optax'", name="optax")
+        return modules[name]
+
+    monkeypatch.setattr(runtime.importlib, "import_module", import_module)
+    with pytest.raises(runtime.RuntimeVerificationError) as caught:
+        runtime.load_verified_fpo_upstream(root, allow_reconstructed=True)
+    assert isinstance(caught.value.__cause__, ModuleNotFoundError)
+    assert caught.value.__cause__.name == "optax"
+    assert sys.modules["wandb"] is real_wandb
+    assert "flow_policy.partial" not in sys.modules
 
 
 def test_loader_does_not_shim_any_other_missing_dependency(
