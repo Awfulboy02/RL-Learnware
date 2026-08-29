@@ -34,6 +34,7 @@ from ..policy.evaluate import (
 )
 from ..policy.loader import load_policy
 from ..policy.parity import verify_golden_parity
+from ..v02 import runtime as v02_runtime
 from ..v02.schemas import ExecutionABIRecord
 from .source_evaluator import (
     BackendEpisodeResult,
@@ -47,8 +48,8 @@ class FpoSourceBackendError(SourceEvaluatorError):
     """The frozen FPO/JAX runtime or its immutable inputs drifted."""
 
 
-FPO_JAX_BACKEND_SCHEMA = "policy-learnware.v03-fpo-jax-source-backend.v0"
-FPO_JAX_DRIVER_SCHEMA = "policy-learnware.v03-frozen-v02-fpo-jax-driver.v0"
+FPO_JAX_BACKEND_SCHEMA = "policy-learnware.v03-fpo-jax-source-backend.v1"
+FPO_JAX_DRIVER_SCHEMA = "policy-learnware.v03-frozen-v02-fpo-jax-driver.v1"
 POLICY_SEED_RULE = "reset_seed_plus_1000003_uint32"
 POLICY_SEED_OFFSET = 1_000_003
 PARITY_ATOL = 1.0e-6
@@ -160,30 +161,79 @@ class FrozenV02FpoJaxRuntimeDriver:
     :meth:`evaluate_seed_block`.
     """
 
-    def __init__(self, *, fpo_root: str | Path, vendor_dir: str | Path) -> None:
-        from server.repro_fpo_ppo_v02.vendor import (
-            inspect_vendor_directory,
-            require_vendor_pythonpath_first,
-        )
-
+    def __init__(
+        self,
+        *,
+        fpo_root: str | Path,
+        allow_reconstructed_runtime: bool = False,
+    ) -> None:
         if not sys.dont_write_bytecode:
             raise FpoSourceBackendError(
                 "production source evaluation requires PYTHONDONTWRITEBYTECODE=1/-B "
                 "so imports cannot dirty the attested FPO checkout"
             )
-        self._fpo_root = self._absolute_directory(fpo_root, "fpo_root")
-        self._vendor_dir = self._absolute_directory(vendor_dir, "vendor_dir")
-        self._vendor = inspect_vendor_directory(self._vendor_dir)
-        require_vendor_pythonpath_first(self._vendor)
+        if type(allow_reconstructed_runtime) is not bool:
+            raise FpoSourceBackendError(
+                "allow_reconstructed_runtime must be an explicit boolean"
+            )
+        try:
+            if not allow_reconstructed_runtime:
+                v02_runtime.require_original_vendor_runtime()
+            self._fpo_root = self._absolute_directory(fpo_root, "fpo_root")
+            self._source_attestation = MappingProxyType(
+                dict(v02_runtime.verify_fpo_checkout(self._fpo_root))
+            )
+            self._original_vendor = MappingProxyType(
+                dict(v02_runtime.original_vendor_status())
+            )
+        except v02_runtime.RuntimeVerificationError as error:
+            raise FpoSourceBackendError(str(error)) from error
+        self._upstream: v02_runtime.VerifiedFPOUpstream | None = None
         implementation = {
             "schema": FPO_JAX_DRIVER_SCHEMA,
-            "fpo_root": str(self._fpo_root),
-            "vendor_dir": str(self._vendor_dir),
+            "runtime_bridge_file_sha256": sha256_file(
+                Path(v02_runtime.__file__).resolve()
+            ),
+            "provenance_class": v02_runtime.RECONSTRUCTED_RUNTIME,
+            "source_attestation": dict(self._source_attestation),
+            "original_vendor": dict(self._original_vendor),
             "python_dont_write_bytecode": True,
         }
         self.runtime_driver_digest = sha256_json(implementation)
         self._prepared: dict[str, _PreparedCandidate] = {}
         self._quality_metrics: list[dict[str, Any]] = []
+
+    def preflight(self) -> Mapping[str, Any]:
+        """Import the attested checkout once as reconstructed inference only."""
+
+        if self._upstream is None:
+            try:
+                self._upstream = v02_runtime.load_verified_fpo_upstream(
+                    self._fpo_root,
+                    allow_reconstructed=True,
+                )
+            except v02_runtime.RuntimeVerificationError as error:
+                raise FpoSourceBackendError(str(error)) from error
+        return self.runtime_evidence()
+
+    def runtime_evidence(self) -> Mapping[str, Any]:
+        """Return portable provenance without claiming original-runtime replay."""
+
+        runtime_receipt = (
+            None
+            if self._upstream is None
+            else dict(self._upstream.runtime_receipt)
+        )
+        return MappingProxyType(
+            {
+                "provenance_class": v02_runtime.RECONSTRUCTED_RUNTIME,
+                "source_attestation": dict(self._source_attestation),
+                "original_vendor": dict(self._original_vendor),
+                "runtime_receipt": runtime_receipt,
+                "preflight_complete": self._upstream is not None,
+                "runtime_driver_digest": self.runtime_driver_digest,
+            }
+        )
 
     def drain_quality_metrics(self) -> tuple[Mapping[str, Any], ...]:
         """Return and clear non-blocking parity diagnostics."""
@@ -337,7 +387,6 @@ class FrozenV02FpoJaxRuntimeDriver:
         reset_seeds: tuple[int, ...],
     ) -> tuple[BackendEpisodeResult, ...]:
         from server.repro_fpo_ppo_v02.anchor_binding import load_and_bind_anchor
-        from server.repro_fpo_ppo_v02.runner import _load_upstream
 
         seeds = _seed_block(reset_seeds, "reset_seeds")
         # Revalidate all immutable inputs immediately before device execution.
@@ -346,9 +395,16 @@ class FrozenV02FpoJaxRuntimeDriver:
         if abi != prepared.execution_abi:
             raise FpoSourceBackendError("candidate ABI drifted during revalidation")
         try:
-            jax, jdc, jnp, _dm_control_suite, registry, fpo, ppo, _rollouts = (
-                _load_upstream(self._fpo_root)
-            )
+            self.preflight()
+            if self._upstream is None:  # defensive; preflight must populate it
+                raise FpoSourceBackendError("reconstructed runtime preflight failed")
+            upstream = self._upstream
+            jax = upstream.jax
+            jdc = upstream.jax_dataclasses
+            jnp = upstream.jax_numpy
+            registry = upstream.registry
+            fpo = upstream.fpo
+            ppo = upstream.ppo
             source_root = (self._fpo_root / "playground" / "src").resolve()
             self._require_upstream_origin(fpo, source_root, "flow_policy.fpo")
             self._require_upstream_origin(ppo, source_root, "flow_policy.ppo")
@@ -413,6 +469,8 @@ class FrozenV02FpoJaxRuntimeDriver:
                     "bundle_digest": request.bundle_digest,
                     "outer_iteration": request.outer_iteration,
                     "runtime_driver_digest": self.runtime_driver_digest,
+                    "runtime_provenance_class": upstream.provenance_class,
+                    "runtime_receipt": dict(upstream.runtime_receipt),
                     "seed_count": len(seeds),
                     "golden_passed": bool(golden.passed),
                     "golden_raw_checked": bool(golden.raw_checked),

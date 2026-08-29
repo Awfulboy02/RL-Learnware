@@ -268,7 +268,7 @@ def run_source_market(
     binding_dir: str | Path,
     output_dir: str | Path,
     fpo_root: str | Path,
-    vendor_dir: str | Path,
+    allow_reconstructed_runtime: bool = False,
     market_alias_private_nonce_file: str | Path | None = None,
     tie_break_private_nonce_file: str | Path | None = None,
     max_selection: int | None = None,
@@ -288,11 +288,11 @@ def run_source_market(
     if alias_nonce == tie_nonce:
         raise ValueError("market alias and tie-break private nonces must differ")
     frozen_fpo_root = _existing_directory(fpo_root, "fpo_root")
-    frozen_vendor = _existing_directory(vendor_dir, "vendor_dir")
     driver = FrozenV02FpoJaxRuntimeDriver(
         fpo_root=frozen_fpo_root,
-        vendor_dir=frozen_vendor,
+        allow_reconstructed_runtime=allow_reconstructed_runtime,
     )
+    runtime_evidence = dict(driver.preflight())
     backend = FpoJaxSourceEvaluatorBackend(
         runtime_driver=driver,
         selection_reset_seeds=protocol.selection_reset_seeds,
@@ -480,6 +480,7 @@ def run_source_market(
         "quality_metric_count": len(quality_rows),
         "quality_warning_count": warning_count,
         "parity_warnings_are_non_blocking": True,
+        "runtime": runtime_evidence,
         "files": files,
     }
     _write_or_match(output / "summary.json", summary, resume=resume)
@@ -510,7 +511,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--binding-dir", required=True, type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--fpo-root", required=True, type=Path)
-    parser.add_argument("--vendor-dir", required=True, type=Path)
+    parser.add_argument(
+        "--allow-reconstructed-runtime",
+        action="store_true",
+        help="explicitly permit attested reconstructed inference (never original replay)",
+    )
     parser.add_argument(
         "--market-alias-private-nonce-file", type=Path
     )
@@ -530,7 +535,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         binding_dir=args.binding_dir,
         output_dir=args.output_dir,
         fpo_root=args.fpo_root,
-        vendor_dir=args.vendor_dir,
+        allow_reconstructed_runtime=args.allow_reconstructed_runtime,
         market_alias_private_nonce_file=args.market_alias_private_nonce_file,
         tie_break_private_nonce_file=args.tie_break_private_nonce_file,
         max_selection=args.max_selection,

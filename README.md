@@ -69,6 +69,13 @@ portable code applies a separate relocation manifest when a recorded path has
 moved. The exact-90 policies are shared v0.2 assets and are not duplicated
 under `artifacts/v03/`.
 
+Fresh policy inference never searches for a workspace-sibling `fpo/` checkout.
+It uses the canonical `shared/runtime/fpo-418c2554` path (or an explicit path),
+verifies the frozen Git bytes, and requires the explicit
+`--allow-reconstructed-runtime` flag. The resulting evidence is always labelled
+`RECONSTRUCTED_RUNTIME`; the default remains fail-closed because the original
+vendor runtime is missing.
+
 Relocation rows keep the immutable historical `source` as an absolute path and
 store `target` relative to the common artifacts root, so the same manifest is
 byte-identical across local and server mirrors. Only verified rows whose
@@ -123,9 +130,11 @@ confirmatory oracle.
 ## Other retained entry points
 
 - `server.repro_fpo_ppo_v03.asset_binding`: bind a typed v0.2 intake to source
-  evaluation work units.
+  evaluation work units. Fresh runtime validation requires
+  `--allow-reconstructed-runtime`.
 - `server.repro_fpo_ppo_v03.source_market_runner`: select one runnable champion
-  per source anchor and publish public/private market views.
+  per source anchor and publish public/private market views. It performs one
+  reconstructed-runtime preflight before creating any run output.
 - `server.repro_fpo_ppo_v03.dynamics_probe_collector`: collect the fixed,
   candidate-independent source/development transition banks.
 - `server.repro_fpo_ppo_v03.signal_fit_runner` and `signal_bank_runner`: rebuild
@@ -149,13 +158,14 @@ still unavailable:
   exact-90 handoff;
 - the original `_vendor` dependency tree is missing.
 
-The recovered FPO checkout is verified source/runtime evidence, not a
-candidate; this does not reconstruct its missing `_vendor` bytes. Any
-regenerated intake or replacement vendor runtime must be labelled
-`RECONSTRUCTED`; a successful reconstructed policy rollout is not the original
-provenance replay. Until that recovery is independently verified, the
-supported reproduction boundary is stored banks through Raw-RKME ranking and
-metrics, plus read-only verification of the frozen source-market results.
+The recovered FPO checkout is verified source evidence, not a candidate. Its
+public runtime bridge supports explicitly opted-in, inference-only reconstructed
+rollouts and records that provenance, but it does not reconstruct the missing
+`_vendor` bytes or original training runtime. A successful reconstructed policy
+rollout is therefore not an original-provenance replay. The supported boundary
+is stored banks through Raw-RKME ranking and metrics, read-only verification of
+the frozen source-market results, and separately labelled reconstructed
+inference smoke.
 
 ## Privacy boundary
 

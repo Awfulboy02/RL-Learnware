@@ -779,14 +779,91 @@ def _factory(spec: str | None, args: argparse.Namespace) -> Callable[..., Any]:
     return create
 
 
+def _load_reconstructed_runtime(
+    fpo_root: Path,
+    *,
+    allow_reconstructed_runtime: bool,
+) -> Any:
+    """Load only the public, attested inference bridge with explicit opt-in."""
+
+    from policy_learnware_v0.v02 import runtime as v02_runtime
+
+    try:
+        if allow_reconstructed_runtime is not True:
+            v02_runtime.require_original_vendor_runtime()
+        return v02_runtime.load_verified_fpo_upstream(
+            fpo_root,
+            allow_reconstructed=True,
+        )
+    except v02_runtime.RuntimeVerificationError as error:
+        raise DevelopmentBaselineError(str(error)) from error
+
+
+def _verified_runtime_factory(upstream: Any) -> Callable[..., Any]:
+    """Restore policy state only from modules returned by the public bridge."""
+
+    def restore(
+        metadata: Any,
+        actor: Mapping[str, np.ndarray],
+        obs_stats: Mapping[str, np.ndarray],
+        _fpo_root: Path,
+    ) -> Any:
+        module = upstream.fpo if metadata.algorithm == "fpo" else upstream.ppo
+        config_name = "FpoConfig" if metadata.algorithm == "fpo" else "PpoConfig"
+        state_name = "FpoState" if metadata.algorithm == "fpo" else "PpoState"
+        config = getattr(module, config_name)(
+            **dict(metadata.policy_spec["training_config"])
+        )
+        environment_config = upstream.registry.get_default_config(metadata.task)
+        environment = upstream.registry.load(metadata.task, config=environment_config)
+        state = getattr(module, state_name).init(
+            prng=upstream.jax.random.key(0),
+            env=environment,
+            config=config,
+        )
+        kernel_names = sorted(name for name in actor if name.endswith("_kernel"))
+        if not kernel_names:
+            raise DevelopmentBaselineError("restored actor has no ordered layers")
+        with upstream.jax_dataclasses.copy_and_mutate(state) as restored:
+            restored.params.policy = tuple(
+                (
+                    upstream.jax_numpy.asarray(actor[name]),
+                    upstream.jax_numpy.asarray(
+                        actor[name.replace("_kernel", "_bias")]
+                    ),
+                )
+                for name in kernel_names
+            )
+            for name in ("count", "mean", "var_sum", "std"):
+                if name in obs_stats:
+                    setattr(
+                        restored.obs_stats,
+                        name,
+                        upstream.jax_numpy.asarray(obs_stats[name]),
+                    )
+        return restored
+
+    return restore
+
+
 def evaluate(args: argparse.Namespace) -> Mapping[str, Any]:
     if not sys.dont_write_bytecode:
         raise DevelopmentBaselineError("policy evaluation must run with python -B/PYTHONDONTWRITEBYTECODE=1")
-    from server.repro_fpo_ppo_v02.vendor import inspect_vendor_directory, require_vendor_pythonpath_first
     from policy_learnware_v0.policy.loader import load_policy
     from policy_learnware_v0.policy.evaluate import evaluate_frozen_policy_returns_batched
+    from policy_learnware_v0.v02 import runtime as v02_runtime
 
-    require_vendor_pythonpath_first(inspect_vendor_directory(args.vendor_dir))
+    upstream = _load_reconstructed_runtime(
+        args.fpo_root,
+        allow_reconstructed_runtime=args.allow_reconstructed_runtime,
+    )
+    runtime_factory = _verified_runtime_factory(upstream)
+    runtime_evidence = {
+        "provenance_class": upstream.provenance_class,
+        "runtime_receipt": dict(upstream.runtime_receipt),
+        "source_attestation": dict(upstream.source_attestation),
+        "original_vendor": dict(v02_runtime.original_vendor_status()),
+    }
     build = _json(args.output_dir / "representations" / "build_config.json")
     contexts = tuple(dict(row) for row in build["context_rows"])
     market = _market(args.public_policy_market, args.deployment_private_registry)
@@ -831,7 +908,6 @@ def evaluate(args: argparse.Namespace) -> Mapping[str, Any]:
                 cp0_config_path=args.cp0_config,
                 source_anchor_manifests=args.source_anchor_manifests,
                 fpo_root=args.fpo_root,
-                vendor_dir=args.vendor_dir,
             )
             environment = getattr(built, "native_environment", getattr(built, "environment", built))
         except Exception as error:
@@ -873,6 +949,7 @@ def evaluate(args: argparse.Namespace) -> Mapping[str, Any]:
                     policy_cache[opaque_id] = load_policy(
                         bundle_path,
                         fpo_root=args.fpo_root,
+                        runtime_factory=runtime_factory,
                         runtime_only=True,
                     )
                 policy = policy_cache[opaque_id]
@@ -893,6 +970,7 @@ def evaluate(args: argparse.Namespace) -> Mapping[str, Any]:
                     "normalized_mean_return": float(np.mean(values) / args.horizon),
                     "runtime_seconds": time.monotonic() - started,
                     "bundle_digest": market.deployment_private[opaque_id].bundle_digest,
+                    "runtime_provenance_class": upstream.provenance_class,
                 }
             except Exception as error:
                 record = {
@@ -908,7 +986,7 @@ def evaluate(args: argparse.Namespace) -> Mapping[str, Any]:
         "schema": SCHEMA, "stage": "evaluate", "status": "COMPLETE" if count["ERROR"] == 0 else "PARTIAL",
         "shard_index": args.shard_index, "shard_count": args.shard_count,
         "context_count": len(selected_contexts), "episodes_per_compatible_policy": args.episodes,
-        "counts": count,
+        "counts": count, "runtime": runtime_evidence,
     }
     _progress(args.output_dir / "progress" / f"evaluate-{args.shard_index:03d}-of-{args.shard_count:03d}.json", summary)
     return summary
@@ -1016,7 +1094,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--cp0-config", type=Path)
     parser.add_argument("--source-anchor-manifests", type=Path)
     parser.add_argument("--fpo-root", type=Path)
-    parser.add_argument("--vendor-dir", type=Path)
+    parser.add_argument(
+        "--allow-reconstructed-runtime",
+        action="store_true",
+        help="explicitly permit attested reconstructed inference (never original replay)",
+    )
     parser.add_argument("--environment-factory", help="optional module:callable override")
     parser.add_argument("--episodes", type=int, default=50)
     parser.add_argument("--horizon", type=int, default=1000)
@@ -1075,9 +1157,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     elif args.command == "rank":
         result = rank(args)
     elif args.command == "evaluate":
-        required = (args.v02_config, args.cp0_config, args.source_anchor_manifests, args.fpo_root, args.vendor_dir)
+        required = (args.v02_config, args.cp0_config, args.source_anchor_manifests, args.fpo_root)
         if any(value is None for value in required):
-            raise SystemExit("evaluate requires --v02-config --cp0-config --source-anchor-manifests --fpo-root --vendor-dir")
+            raise SystemExit("evaluate requires --v02-config --cp0-config --source-anchor-manifests --fpo-root")
         result = evaluate(args)
     else:
         result = summarize(args)

@@ -47,8 +47,8 @@ class ProductionAssetBindingConfig:
     intake_record_path: str | Path
     server_plan_path: str | Path
     fpo_root: str | Path
-    vendor_dir: str | Path
     output_dir: str | Path
+    allow_reconstructed_runtime: bool = False
     selection_reset_seeds: tuple[int, ...] = SELECTION_RESET_SEEDS
 
 
@@ -96,7 +96,6 @@ def bind_production_assets(config: ProductionAssetBindingConfig) -> dict[str, An
     intake_path = _file(config.intake_record_path, "intake_record")
     plan_path = _file(config.server_plan_path, "server_plan")
     fpo_root = _directory(config.fpo_root, "fpo_root")
-    vendor_dir = _directory(config.vendor_dir, "vendor_dir")
     output = Path(config.output_dir).expanduser()
     if not output.is_absolute() or output.is_symlink() or output.exists():
         raise AssetBindingError("output_dir must be a new absolute non-symlink path")
@@ -104,7 +103,11 @@ def bind_production_assets(config: ProductionAssetBindingConfig) -> dict[str, An
 
     intake = _load_intake(intake_path)
     plan = FrozenV02ServerPlanAuthority().load(plan_path)
-    driver = FrozenV02FpoJaxRuntimeDriver(fpo_root=fpo_root, vendor_dir=vendor_dir)
+    driver = FrozenV02FpoJaxRuntimeDriver(
+        fpo_root=fpo_root,
+        allow_reconstructed_runtime=config.allow_reconstructed_runtime,
+    )
+    runtime_evidence = dict(driver.preflight())
     backend = FpoJaxSourceEvaluatorBackend(
         runtime_driver=driver,
         selection_reset_seeds=config.selection_reset_seeds,
@@ -152,11 +155,11 @@ def bind_production_assets(config: ProductionAssetBindingConfig) -> dict[str, An
         units_path, source_work_unit_manifest(units), overwrite=False
     )
     receipt = {
-        "schema": "policy-learnware.v03-core-asset-binding.v0",
+        "schema": "policy-learnware.v03-core-asset-binding.v1",
         "status": "READY",
         "intake": {"path": str(intake_path)},
         "return_contract": return_contract.to_dict(),
-        "runtime": {"fpo_root": str(fpo_root), "vendor_dir": str(vendor_dir)},
+        "runtime": runtime_evidence,
         "files": {
             "source_evaluation_protocol.json": protocol_sha,
             "source_selection_work_units.json": units_sha,
@@ -173,7 +176,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--intake-record", required=True, type=Path)
     parser.add_argument("--server-plan", required=True, type=Path)
     parser.add_argument("--fpo-root", required=True, type=Path)
-    parser.add_argument("--vendor-dir", required=True, type=Path)
+    parser.add_argument(
+        "--allow-reconstructed-runtime",
+        action="store_true",
+        help="explicitly permit attested reconstructed inference (never original replay)",
+    )
     parser.add_argument("--output-dir", required=True, type=Path)
     return parser
 
@@ -185,8 +192,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             intake_record_path=args.intake_record,
             server_plan_path=args.server_plan,
             fpo_root=args.fpo_root,
-            vendor_dir=args.vendor_dir,
             output_dir=args.output_dir,
+            allow_reconstructed_runtime=args.allow_reconstructed_runtime,
         )
     )
     print(json.dumps(result, sort_keys=True, separators=(",", ":")))
