@@ -203,6 +203,36 @@ def _reject_symlink_components(root: Path, relative: str) -> None:
             )
 
 
+def _absolute_path_without_symlinks(path: str | Path, *, where: str) -> Path:
+    """Normalize a caller path without permitting a symlink in any component."""
+
+    candidate = Path(os.path.abspath(os.fspath(Path(path).expanduser())))
+    current = Path(candidate.anchor)
+    for component in candidate.parts[1:]:
+        current = current / component
+        try:
+            metadata = current.lstat()
+        except FileNotFoundError:
+            break
+        except OSError as error:
+            raise RuntimeVerificationError(
+                f"cannot inspect {where} path component: {current}"
+            ) from error
+        if stat.S_ISLNK(metadata.st_mode):
+            raise RuntimeVerificationError(
+                f"{where} path contains a symlink component: {current}"
+            )
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError as error:
+        raise RuntimeVerificationError(f"{where} path is missing: {candidate}") from error
+    if resolved != candidate:
+        raise RuntimeVerificationError(
+            f"{where} path changed or traversed a symlink while resolving"
+        )
+    return resolved
+
+
 def _other_paths(root: Path, *, ignored: bool) -> list[str]:
     arguments = ["ls-files", "--others", "-z", "--exclude-standard"]
     if ignored:
@@ -219,18 +249,14 @@ def inspect_fpo_checkout(
 ) -> dict[str, Any]:
     """Hash every tracked byte and expose all checkout-bypass surfaces.
 
-    This is an inspection primitive.  :func:`verify_fpo_checkout` additionally
-    binds the result to the frozen v0.2 digests and rejects every difference.
+    This is an inspection primitive.  Every caller-supplied path component
+    must be non-symlink. :func:`verify_fpo_checkout` additionally binds the
+    result to the frozen v0.2 digests and rejects every difference.
     """
 
     frozen_commit = FPO_COMMIT if expected_commit is None else expected_commit
-    source = Path(path)
-    if source.is_symlink():
-        raise RuntimeVerificationError("FPO checkout root cannot be a symlink")
-    try:
-        root = source.resolve(strict=True)
-    except OSError as error:
-        raise RuntimeVerificationError(f"FPO checkout is missing: {source}") from error
+    source = _absolute_path_without_symlinks(path, where="FPO checkout")
+    root = source
     git_directory = root / ".git"
     if not root.is_dir() or git_directory.is_symlink() or not git_directory.is_dir():
         raise RuntimeVerificationError(f"FPO checkout with a .git directory is missing: {root}")
@@ -332,6 +358,8 @@ def inspect_fpo_checkout(
                 "FPO status contains a non-UTF-8 path"
             ) from error
 
+    if _absolute_path_without_symlinks(root, where="FPO checkout") != root:
+        raise RuntimeVerificationError("FPO checkout path changed during attestation")
     final_head = _git_text(root, "rev-parse", "--verify", "HEAD")
     if final_head != initial_head:
         raise RuntimeVerificationError("FPO HEAD changed during source attestation")
@@ -566,8 +594,9 @@ def load_verified_fpo_upstream(
 ) -> VerifiedFPOUpstream:
     """Import FPO only after explicit opt-in and byte-level source verification.
 
-    The returned ``provenance_class`` is always ``RECONSTRUCTED_RUNTIME``.
-    This API cannot establish training replay or original-runtime provenance.
+    The caller path and all its ancestors must be non-symlink. The returned
+    ``provenance_class`` is always ``RECONSTRUCTED_RUNTIME``. This API cannot
+    establish training replay or original-runtime provenance.
     """
 
     with _RUNTIME_IMPORT_LOCK:
@@ -582,16 +611,19 @@ def load_verified_fpo_upstream(
                 "reconstructed FPO import requires sys.dont_write_bytecode=True"
             )
 
-        source_root = Path(fpo_root)
+        source_root = _absolute_path_without_symlinks(
+            fpo_root, where="FPO checkout"
+        )
         # The shim is not even considered until the complete source checkout
         # has passed its frozen commit/tree/cleanliness attestation.
         before = verify_fpo_checkout(source_root)
-        try:
-            root = source_root.resolve(strict=True)
-        except OSError as error:  # Defensive if a path disappears after verification.
+        root = _absolute_path_without_symlinks(
+            source_root, where="FPO checkout"
+        )
+        if root != source_root:
             raise RuntimeVerificationError(
-                f"FPO checkout disappeared after verification: {source_root}"
-            ) from error
+                "FPO checkout path changed after source verification"
+            )
         source_dir = root / "playground" / "src"
         expected_entry = source_dir / "flow_policy" / "fpo.py"
         if expected_entry.is_symlink() or not expected_entry.is_file():
@@ -664,7 +696,15 @@ def load_verified_fpo_upstream(
             if not import_succeeded:
                 _restore_namespace("flow_policy", initial_flow_modules)
 
-        after = verify_fpo_checkout(root)
+        current_root = _absolute_path_without_symlinks(
+            root, where="FPO checkout"
+        )
+        if current_root != root:
+            _restore_namespace("flow_policy", initial_flow_modules)
+            raise RuntimeVerificationError(
+                "FPO checkout path changed during module import"
+            )
+        after = verify_fpo_checkout(current_root)
         if after != before:
             _restore_namespace("flow_policy", initial_flow_modules)
             raise RuntimeVerificationError("FPO checkout changed during module import")

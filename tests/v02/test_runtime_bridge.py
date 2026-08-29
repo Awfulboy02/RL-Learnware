@@ -69,6 +69,36 @@ def test_verify_fpo_checkout_binds_clean_git_and_execution_bytes(
     assert expected["fpo_ignored_paths"] == []
 
 
+def test_public_verifier_and_loader_reject_symlink_ancestors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_parent = tmp_path / "real-parent"
+    real_parent.mkdir()
+    root, commit = _make_checkout(real_parent)
+    linked_parent = tmp_path / "linked-parent"
+    linked_parent.symlink_to(real_parent, target_is_directory=True)
+    linked_root = linked_parent / "fpo"
+
+    with pytest.raises(runtime.RuntimeVerificationError, match="symlink component"):
+        runtime.inspect_fpo_checkout(linked_root, expected_commit=commit)
+    with pytest.raises(runtime.RuntimeVerificationError, match="symlink component"):
+        runtime.verify_fpo_checkout(linked_root)
+
+    calls: list[Path] = []
+
+    def should_not_verify(path: str | Path) -> dict[str, object]:
+        calls.append(Path(path))
+        return {"ok": True}
+
+    monkeypatch.setattr(runtime, "verify_fpo_checkout", should_not_verify)
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    with pytest.raises(runtime.RuntimeVerificationError, match="symlink component"):
+        runtime.load_verified_fpo_upstream(
+            linked_root, allow_reconstructed=True
+        )
+    assert calls == []
+
+
 @pytest.mark.parametrize("tamper", ["tracked", "untracked", "ignored", "index"])
 def test_verify_fpo_checkout_rejects_all_checkout_bypasses(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tamper: str
