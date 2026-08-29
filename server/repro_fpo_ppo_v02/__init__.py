@@ -1,1 +1,1 @@
-"""Anchor-aware, fail-closed v0.2 policy-training backend."""
+"""Read-only verification and replay contracts for the frozen v0.2 handoff."""

@@ -18,12 +18,6 @@ import subprocess
 from typing import Any, Mapping, Sequence
 
 from ..hashing import sha256_file, sha256_json
-from .legacy_artifacts import (
-    ArtifactDomain,
-    V02ArtifactLayout,
-    V02ArtifactLayoutError,
-    V02ArtifactWriter,
-)
 
 
 ARTIFACTS_ROOT_ENV = "RL_LEARNWARE_ARTIFACTS_ROOT"
@@ -1200,7 +1194,6 @@ def capability_status(
 __all__ = [
     "ARTIFACTS_ROOT_ENV",
     "ASSET_EXPECTATIONS",
-    "ArtifactDomain",
     "CRITICAL_FILE_SHA256",
     "DirectoryAttestation",
     "EXPECTED_POOL_DIGEST",
@@ -1210,9 +1203,6 @@ __all__ = [
     "TREE_DIGEST_ALGORITHM",
     "V02AssetError",
     "V02AssetLayout",
-    "V02ArtifactLayout",
-    "V02ArtifactLayoutError",
-    "V02ArtifactWriter",
     "V02_RUN_ID",
     "attest_directory",
     "capability_status",

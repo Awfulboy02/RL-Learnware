@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Strict manifests, atomic records, and numerical-integrity checks for v0.2.
+"""Read-only provenance validators for the frozen v0.2 exact-90 handoff.
 
-This module intentionally has no JAX or MuJoCo import.  Queue validation and
-synthetic tests can therefore run on a login/CPU node before an expensive
-training process imports the native runtime.
+Validation intentionally has no JAX or MuJoCo import, so the frozen evidence
+remains independently checkable on a CPU-only host.
 """
 
 from __future__ import annotations
@@ -11,14 +10,10 @@ from __future__ import annotations
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
 import hashlib
-import importlib.metadata
 import json
 import math
-import os
 from pathlib import Path
 import re
-import sys
-import uuid
 from typing import Any, Iterable, Mapping, Sequence
 
 
@@ -491,51 +486,58 @@ def with_self_digest(value: Mapping[str, Any], *, key: str) -> dict[str, Any]:
     return result
 
 
-def _load_package_formal_freeze_api() -> tuple[Any, Any, Any]:
-    """Load the canonical package-owned freeze verifier from this checkout.
+def _validate_formal_freeze_record(value: Mapping[str, Any]) -> None:
+    """Preserve the historical typed freeze-record contract without its writer."""
 
-    The sibling server backend is also deployed next to a nested
-    ``policy_learnware_v0`` checkout, so it cannot rely on the caller's ambient
-    ``PYTHONPATH`` to contain the package source tree.
-    """
-
-    try:
-        from policy_learnware_v0.v02.freeze import (
-            FormalProtocolFreeze,
-            canonical_formal_freeze_path,
-            load_verified_formal_freeze,
-        )
-    except ModuleNotFoundError:
-        here = Path(__file__).resolve()
-        candidates = (
-            here.parents[2] / "src",
-            here.parents[1] / "policy_learnware_v0" / "src",
-        )
-        matches = [
-            candidate.resolve()
-            for candidate in candidates
-            if (candidate / "policy_learnware_v0" / "v02" / "freeze.py").is_file()
-        ]
-        if len(matches) != 1:
-            raise ContractError(
-                "cannot uniquely locate the package-owned formal freeze verifier"
-            ) from None
-        sys.path.insert(0, str(matches[0]))
-        try:
-            from policy_learnware_v0.v02.freeze import (
-                FormalProtocolFreeze,
-                canonical_formal_freeze_path,
-                load_verified_formal_freeze,
-            )
-        except (ImportError, ModuleNotFoundError) as error:
-            raise ContractError(
-                f"cannot import the package-owned formal freeze verifier: {error}"
-            ) from error
-    return (
-        load_verified_formal_freeze,
-        canonical_formal_freeze_path,
-        FormalProtocolFreeze,
+    require_exact_keys(
+        value,
+        {
+            "schema",
+            "experiment_id",
+            "stage",
+            "config_digest",
+            "config_file_sha256",
+            "benchmark_projection_digest",
+            "training_projection_digest",
+            "probe_projection_digest",
+            "analysis_projection_digest",
+            "implementation_tree_digest",
+            "software_commit",
+            "worktree_clean_at_freeze",
+            "sealed_target_state",
+            "confirmatory_oracle_state",
+            "maximum_authorized_status",
+        },
+        "formal freeze record",
     )
+    expected_literals = {
+        "schema": "policy-learnware.v02-formal-protocol-freeze.v0",
+        "stage": "v02_freeze_ready",
+        "sealed_target_state": "NOT_INSTANTIATED_OR_READ",
+        "confirmatory_oracle_state": "NOT_READ",
+        "maximum_authorized_status": "READY_FOR_V03_JOINT_CONFIRMATORY",
+    }
+    if any(value[name] != expected for name, expected in expected_literals.items()):
+        raise ContractError("formal freeze boundary/status constant mismatch")
+    if not isinstance(value["experiment_id"], str) or not value["experiment_id"]:
+        raise ContractError("formal freeze experiment_id must be non-empty")
+    for name in (
+        "config_digest",
+        "config_file_sha256",
+        "benchmark_projection_digest",
+        "training_projection_digest",
+        "probe_projection_digest",
+        "analysis_projection_digest",
+        "implementation_tree_digest",
+    ):
+        require_digest(value[name], f"formal freeze record.{name}")
+    commit = require_git_commit(
+        value["software_commit"], "formal freeze record.software_commit"
+    )
+    if len(commit) != 40:
+        raise ContractError("formal freeze software_commit must be a full SHA-1 commit")
+    if value["worktree_clean_at_freeze"] is not True:
+        raise ContractError("formal freeze requires a clean Git worktree")
 
 
 def validate_formal_freeze_binding(value: Mapping[str, Any]) -> dict[str, Any]:
@@ -572,13 +574,7 @@ def validate_formal_freeze_binding(value: Mapping[str, Any]) -> dict[str, Any]:
     record = value["freeze_record"]
     if not isinstance(record, dict):
         raise ContractError("formal freeze binding.freeze_record must be an object")
-    _, _, freeze_type = _load_package_formal_freeze_api()
-    try:
-        typed_freeze = freeze_type.from_dict(record)
-    except Exception as error:
-        raise ContractError(f"formal freeze record is invalid: {error}") from error
-    if typed_freeze.to_dict() != record:
-        raise ContractError("formal freeze record is not canonical")
+    _validate_formal_freeze_record(record)
     if record.get("config_digest") != config_digest:
         raise ContractError("formal freeze record config digest differs from its binding")
     freeze_digest = require_digest(
@@ -708,171 +704,10 @@ def validate_formal_freeze_binding(value: Mapping[str, Any]) -> dict[str, Any]:
     return dict(value)
 
 
-def load_and_bind_formal_freeze(config_path: Path | str) -> dict[str, Any]:
-    """Revalidate the canonical package freeze and make a plan binding."""
-
-    source = Path(config_path)
-    if source.is_symlink():
-        raise ContractError("formal config path must not be a symlink")
-    try:
-        source = source.resolve(strict=True)
-    except OSError as error:
-        raise ContractError(f"formal config path is unavailable: {source}") from error
-    load_verified, canonical_path, _ = _load_package_formal_freeze_api()
-    try:
-        config, freeze = load_verified(source)
-        freeze_path = canonical_path(config).resolve(strict=True)
-    except Exception as error:
-        # The package exposes its own typed error classes.  Normalize them at
-        # this server trust boundary without allowing an unchecked fallback.
-        raise ContractError(f"canonical formal freeze verification failed: {error}") from error
-    checkpoint_mapping = {
-        "fixed_final": "fixed_final",
-        "fixed_ladder": "fixed_ladder",
-        "fixed_final_checkpoint": "fixed_final",
-    }
-    config_checkpoint_rule = str(config.checkpoint_rule)
-    checkpoint_rule = checkpoint_mapping.get(config_checkpoint_rule)
-    if checkpoint_rule is None:
-        raise ContractError(
-            "reviewed formal checkpoint_rule has no exact server mapping; "
-            f"unsupported literal {config_checkpoint_rule!r}"
-        )
-    semantic_rows: dict[str, dict[str, Any]] = {}
-    for task in config.tasks:
-        for axis in config.dynamics_axes[task]:
-            for factor in config.source_factors[task][axis.axis_id]:
-                if factor.is_nominal:
-                    row = {
-                        "source_anchor_id": factor.source_anchor_id,
-                        "task": task,
-                        "nominal": True,
-                        "factor": factor.value,
-                        "factor_id": factor.factor_id,
-                        "axis_id": None,
-                        "operator_id": None,
-                        "axis_binding_digest": None,
-                        "leaf_allowlist": [],
-                    }
-                else:
-                    row = {
-                        "source_anchor_id": factor.source_anchor_id,
-                        "task": task,
-                        "nominal": False,
-                        "factor": factor.value,
-                        "factor_id": factor.factor_id,
-                        "axis_id": axis.axis_id,
-                        "operator_id": axis.operator_id,
-                        "axis_binding_digest": factor.axis_binding_digest,
-                        "leaf_allowlist": sorted(axis.leaf_allowlist),
-                    }
-                previous = semantic_rows.setdefault(factor.source_anchor_id, row)
-                if previous != row:
-                    raise ContractError(
-                        "a deduplicated formal source anchor has inconsistent semantics"
-                    )
-    ordered_rows = [semantic_rows[anchor_id] for anchor_id in config.source_anchor_ids]
-    training_contract = with_self_digest(
-        {
-            "schema": FORMAL_TRAINING_CONTRACT_SCHEMA,
-            "source_anchor_ids": list(config.source_anchor_ids),
-            "source_anchors": ordered_rows,
-            "training_seeds": list(config.training_seeds),
-            "primary_algorithm": config.primary_algorithm.lower(),
-            "training_steps": config.training_steps,
-            "checkpoint_rule": checkpoint_rule,
-            "training_projection_digest": sha256_json(config.training_projection),
-        },
-        key="contract_digest",
-    )
-    binding = with_self_digest(
-        {
-            "schema": FORMAL_FREEZE_BINDING_SCHEMA,
-            "config_path": str(source),
-            "freeze_manifest_path": str(freeze_path),
-            "config_digest": config.config_digest,
-            "freeze_record": freeze.to_dict(),
-            "freeze_digest": freeze.digest,
-            "training_contract": training_contract,
-        },
-        key="binding_digest",
-    )
-    return validate_formal_freeze_binding(binding)
-
-
-def revalidate_formal_freeze_binding(value: Mapping[str, Any]) -> dict[str, Any]:
-    """Re-read canonical config/freeze bytes and compare the complete binding."""
-
-    expected = validate_formal_freeze_binding(value)
-    observed = load_and_bind_formal_freeze(expected["config_path"])
-    if canonical_json_bytes(observed) != canonical_json_bytes(expected):
-        raise ContractError("formal freeze binding differs from canonical live inputs")
-    return observed
-
-
-def _write_temp(path: Path, data: bytes) -> Path:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.tmp-{uuid.uuid4().hex}")
-    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
-    try:
-        with os.fdopen(descriptor, "wb") as handle:
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
-    except BaseException:
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
-        raise
-    return temporary
-
-
-def atomic_write_bytes(
-    path: Path | str, data: bytes, *, overwrite: bool = True
-) -> None:
-    destination = Path(path)
-    temporary = _write_temp(destination, data)
-    try:
-        if overwrite:
-            os.replace(temporary, destination)
-        else:
-            try:
-                os.link(temporary, destination)
-            except FileExistsError as error:
-                raise FileExistsError(f"immutable artifact already exists: {destination}") from error
-            temporary.unlink()
-    finally:
-        if temporary.exists():
-            temporary.unlink()
-
-
-def atomic_write_json(
-    path: Path | str, value: Mapping[str, Any], *, overwrite: bool = True
-) -> None:
-    atomic_write_bytes(
-        path,
-        canonical_json_bytes(value) + b"\n",
-        overwrite=overwrite,
-    )
-
-
-def append_jsonl(path: Path | str, value: Mapping[str, Any]) -> None:
-    destination = Path(path)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    with destination.open("ab", buffering=0) as handle:
-        handle.write(canonical_json_bytes(value) + b"\n")
-        os.fsync(handle.fileno())
-
-
 def _positive_int(value: Any, where: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ContractError(f"{where} must be a positive integer")
     return value
-
-
-def finalize_training_protocol(value: Mapping[str, Any]) -> dict[str, Any]:
-    return validate_training_protocol(with_self_digest(value, key="protocol_digest"))
 
 
 def validate_training_protocol(value: Mapping[str, Any]) -> dict[str, Any]:
@@ -961,10 +796,6 @@ def validate_training_protocol(value: Mapping[str, Any]) -> dict[str, Any]:
     return dict(value)
 
 
-def finalize_training_job(value: Mapping[str, Any]) -> dict[str, Any]:
-    return validate_training_job(with_self_digest(value, key="job_digest"))
-
-
 def validate_training_job(value: Mapping[str, Any]) -> dict[str, Any]:
     require_exact_keys(
         value,
@@ -1012,47 +843,6 @@ def validate_training_job(value: Mapping[str, Any]) -> dict[str, Any]:
         raise ContractError("training seed must be a nonnegative integer")
     validate_self_digest(value, key="job_digest", where="training job")
     return dict(value)
-
-
-def finalize_training_plan(
-    jobs: Sequence[Mapping[str, Any]],
-    *,
-    formal_protocol_freeze: Mapping[str, Any] | None = None,
-) -> dict[str, Any]:
-    if not jobs:
-        raise ContractError("training plan must contain at least one job")
-    validated = [validate_training_job(job) for job in jobs]
-    config_digests = {job["config_digest"] for job in validated}
-    purposes = {job["execution_purpose"] for job in validated}
-    if len(config_digests) != 1 or len(purposes) != 1:
-        raise ContractError(
-            "training plan cannot mix config digests or execution purposes"
-        )
-    purpose = next(iter(purposes))
-    if purpose == FORMAL_EXECUTION_PURPOSE:
-        if formal_protocol_freeze is None:
-            raise ContractError("formal training plan requires a canonical freeze binding")
-        freeze = validate_formal_freeze_binding(formal_protocol_freeze)
-        if freeze["config_digest"] != next(iter(config_digests)):
-            raise ContractError("formal freeze binding config differs from training plan")
-        freeze_digest: str | None = freeze["binding_digest"]
-        if any(job["formal_protocol_freeze_digest"] != freeze_digest for job in validated):
-            raise ContractError("formal training jobs are not bound to the plan freeze")
-    else:
-        if formal_protocol_freeze is not None:
-            raise ContractError("non-formal training plan cannot carry a formal freeze binding")
-        freeze = None
-        freeze_digest = None
-    material = {
-        "schema": TRAINING_PLAN_SCHEMA,
-        "config_digest": next(iter(config_digests)),
-        "execution_purpose": purpose,
-        "formal_protocol_freeze": freeze,
-        "formal_protocol_freeze_digest": freeze_digest,
-        "jobs": validated,
-        "expected_job_count": len(validated),
-    }
-    return validate_training_plan(with_self_digest(material, key="plan_digest"))
 
 
 def validate_training_plan(value: Mapping[str, Any]) -> dict[str, Any]:
@@ -1121,10 +911,6 @@ def validate_training_plan(value: Mapping[str, Any]) -> dict[str, Any]:
         seen_semantics.add(semantic)
     validate_self_digest(value, key="plan_digest", where="training plan")
     return dict(value)
-
-
-def finalize_attempt(value: Mapping[str, Any]) -> dict[str, Any]:
-    return validate_attempt(with_self_digest(value, key="attempt_digest"))
 
 
 def validate_attempt(value: Mapping[str, Any]) -> dict[str, Any]:
@@ -1428,27 +1214,6 @@ def validate_implementation_provenance(
         if canonical_json_bytes(result) != canonical_json_bytes(validated_expected):
             raise ContractError("implementation provenance differs from expected source bytes")
     return result
-
-
-def package_version(name: str) -> str | None:
-    try:
-        return importlib.metadata.version(name)
-    except importlib.metadata.PackageNotFoundError:
-        return None
-
-
-def runtime_contract_projection(*, fpo_commit: str) -> dict[str, Any]:
-    """Return the exact runtime projection frozen by an anchor manifest."""
-
-    require_git_commit(fpo_commit, "fpo_commit")
-    return {
-        "fpo_commit": fpo_commit,
-        "python_major_minor": f"{sys.version_info.major}.{sys.version_info.minor}",
-        "jax": package_version("jax"),
-        "jaxlib": package_version("jaxlib"),
-        "mujoco": package_version("mujoco"),
-        "playground": package_version("playground"),
-    }
 
 
 def assert_finite_array(value: Any, *, where: str) -> None:
@@ -1956,46 +1721,16 @@ def validate_queue_result(
 
 
 __all__ = [
-    "AUDIT_SMOKE_EXECUTION_PURPOSE",
-    "AUDIT_SMOKE_EXECUTION_MODE",
-    "ATTEMPT_SCHEMA",
     "ContractError",
-    "DEVELOPMENT_EXECUTION_PURPOSE",
-    "EXECUTION_EVIDENCE_SCHEMA",
-    "EXECUTION_PURPOSES",
-    "FORMAL_GPU_EXECUTION_MODE",
     "FORMAL_EXECUTION_PURPOSE",
-    "FPO_SOURCE_ATTESTATION_KEYS",
-    "IMPLEMENTATION_FILE_LABELS",
-    "IMPLEMENTATION_PROVENANCE_SCHEMA",
+    "FORMAL_GPU_EXECUTION_MODE",
     "NumericalIntegrityError",
-    "QUEUE_RESULT_SCHEMA",
-    "RUN_MANIFEST_KEYS",
-    "RUN_MANIFEST_SCHEMA",
-    "RUN_RUNTIME_KEYS",
-    "TRAINING_JOB_SCHEMA",
-    "TRAINING_PLAN_SCHEMA",
-    "TRAINING_PROTOCOL_SCHEMA",
-    "TRAINING_RECORD_SCHEMA",
-    "VENDOR_PROVENANCE_SCHEMA",
-    "append_jsonl",
-    "assert_finite_array",
-    "assert_finite_mapping",
-    "atomic_write_bytes",
-    "atomic_write_json",
-    "canonical_json_bytes",
-    "finalize_attempt",
-    "finalize_training_job",
-    "finalize_training_plan",
-    "finalize_training_protocol",
     "json_ready",
     "load_strict_json",
     "require_digest",
     "require_git_commit",
     "require_exact_keys",
-    "require_execution_purpose",
     "require_safe_id",
-    "runtime_contract_projection",
     "sha256_file",
     "sha256_json",
     "utc_now",
@@ -2005,14 +1740,11 @@ __all__ = [
     "validate_implementation_provenance",
     "validate_policy_bundle",
     "validate_queue_result",
-    "validate_run_manifest_envelope",
     "validate_run_manifest_server_binding",
-    "validate_run_runtime_envelope",
     "validate_self_digest",
     "validate_success_record",
     "validate_training_job",
     "validate_training_plan",
-    "validate_training_protocol",
     "validate_vendor_provenance",
     "with_self_digest",
 ]

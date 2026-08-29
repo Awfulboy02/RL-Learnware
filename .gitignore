@@ -22,19 +22,16 @@ dist/
 .env.*
 !.env.example
 
-# Generated experiment data and immutable run artifacts
+# Generated experiment data and immutable run artifacts.  Canonical evidence
+# lives in the sibling artifacts/ root, never in this code checkout.
 /artifacts/
-/artifacts_retry_roundoff/
-/artifacts_v01*/
-/artifacts_v02*/
-/artifacts_paper1_joint*/
+/reports/
 /datasets/
 /runs/
-/server/repro_fpo_ppo_v02/runs/
-/server/repro_fpo_ppo_v02/*.log
 /checkpoints/
 /policy_bundles/
 /frozen_policies/
+*.log
 
 # Learned parameters, checkpoints, and binary research artifacts
 *.msgpack

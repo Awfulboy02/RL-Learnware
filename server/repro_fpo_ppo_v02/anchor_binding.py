@@ -10,6 +10,7 @@ built-in task/axis/factor table and therefore cannot silently fill a
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass, fields, is_dataclass
 import hashlib
 import math
@@ -31,7 +32,6 @@ try:  # Package import for tests/``python -m``; fallback for direct script use.
         require_safe_id,
         sha256_json,
         validate_self_digest,
-        with_self_digest,
     )
 except ImportError:  # pragma: no cover - exercised by executable entry points
     from provenance import (
@@ -45,7 +45,6 @@ except ImportError:  # pragma: no cover - exercised by executable entry points
         require_safe_id,
         sha256_json,
         validate_self_digest,
-        with_self_digest,
     )
 
 
@@ -409,12 +408,12 @@ def derive_manifest_model_diff_digest(value: Mapping[str, Any]) -> str:
 
 @dataclass(frozen=True)
 class AnchorManifest:
-    value: Mapping[str, Any]
+    _value: Mapping[str, Any]
     operator: AnchorOperator | None
 
     @classmethod
     def from_dict(cls, raw: Mapping[str, Any]) -> "AnchorManifest":
-        value = dict(raw)
+        value = deepcopy(dict(raw))
         require_exact_keys(
             value,
             {
@@ -527,50 +526,20 @@ class AnchorManifest:
         if anchor_id != expected_anchor_id:
             raise ContractError("anchor_id does not match canonical source-anchor payload")
         validate_self_digest(value, key="manifest_digest", where="anchor manifest")
-        return cls(value=MappingProxyType(value), operator=operator)
+        return cls(_value=MappingProxyType(value), operator=operator)
 
     @classmethod
     def from_path(cls, path: Path | str) -> "AnchorManifest":
         return cls.from_dict(load_strict_json(path))
 
     def to_dict(self) -> dict[str, Any]:
-        return dict(self.value)
+        return deepcopy(dict(self._value))
 
     def __getattr__(self, name: str) -> Any:
         try:
-            return self.value[name]
+            return deepcopy(self._value[name])
         except KeyError as error:
             raise AttributeError(name) from error
-
-
-def finalize_anchor_manifest(raw: Mapping[str, Any]) -> dict[str, Any]:
-    """Fill digests only; all task/axis/factor/index literals must be supplied."""
-
-    forbidden = {
-        "anchor_id",
-        "registry_config_digest",
-        "runtime_digest",
-        "operator_digest",
-        "model_diff_digest",
-        "environment_instance_digest",
-        "manifest_digest",
-    }
-    overlap = forbidden & set(raw)
-    if overlap:
-        raise ContractError(f"unfinalized anchor payload already has derived fields: {sorted(overlap)}")
-    value = json_ready(dict(raw))
-    value["registry_config_digest"] = sha256_json(value["registry_config"])
-    value["runtime_digest"] = sha256_json(value["runtime"])
-    value["operator_digest"] = (
-        None if value["operator"] is None else sha256_json(value["operator"])
-    )
-    value["model_diff_digest"] = derive_manifest_model_diff_digest(value)
-    value["environment_instance_digest"] = derive_environment_instance_digest(value)
-    value["anchor_id"] = derive_source_anchor_id(
-        environment_instance_digest=value["environment_instance_digest"],
-        axis_binding_digest=value["axis_binding_digest"],
-    )
-    return AnchorManifest.from_dict(with_self_digest(value, key="manifest_digest")).to_dict()
 
 
 def _model_type(value: Any) -> str:
@@ -762,19 +731,6 @@ class BindingAudit:
     operator_digest: str | None
     manifest_digest: str
 
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "anchor_id": self.anchor_id,
-            "environment_instance_digest": self.environment_instance_digest,
-            "nominal_model_digest": self.nominal_model_digest,
-            "bound_model_digest": self.bound_model_digest,
-            "changed_leaves": list(self.changed_leaves),
-            "model_diff_digest": self.model_diff_digest,
-            "source_unchanged": self.source_unchanged,
-            "operator_digest": self.operator_digest,
-            "manifest_digest": self.manifest_digest,
-        }
-
 
 def bind_model_to_anchor(
     model: Any, manifest: AnchorManifest
@@ -888,10 +844,6 @@ class BoundEnvironment:
     manifest: AnchorManifest
     audit: BindingAudit
 
-    @property
-    def environment_instance_digest(self) -> str:
-        return self.manifest.environment_instance_digest
-
     def verify(self) -> ModelSnapshot:
         return verify_bound_environment(self.env, self.manifest)
 
@@ -918,27 +870,8 @@ def load_and_bind_anchor(*, registry: Any, manifest: AnchorManifest) -> BoundEnv
 
 __all__ = [
     "ANCHOR_MANIFEST_SCHEMA",
-    "ANCHOR_OPERATOR_SCHEMA",
-    "ENVIRONMENT_INSTANCE_SCHEMA",
-    "MODEL_DIFF_SCHEMA",
-    "SOURCE_ANCHOR_SCHEMA",
     "AnchorBindingError",
     "AnchorManifest",
-    "AnchorOperator",
-    "BindingAudit",
     "BoundEnvironment",
-    "MutationSpec",
-    "SUPPORTED_MODEL_LEAVES",
-    "array_digest",
-    "bind_model_to_anchor",
-    "canonical_environment_instance_projection",
-    "canonical_model_diff_projection",
-    "derive_environment_instance_digest",
-    "derive_live_model_diff",
-    "derive_manifest_model_diff_digest",
-    "derive_source_anchor_id",
-    "finalize_anchor_manifest",
     "load_and_bind_anchor",
-    "snapshot_model",
-    "verify_bound_environment",
 ]

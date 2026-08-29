@@ -5,26 +5,14 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "policy-learnware-v0"
 version = "0.2.0"
-description = "Closed-set TaskSpec retrieval for Policy Learnware v0"
+description = "Frozen exact-90 source-policy handoff contracts for Policy Learnware v0.2"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
   "numpy>=1.24",
-  "PyYAML>=6.0",
 ]
-
-[project.scripts]
-policy-learnware-v0 = "policy_learnware_v0.cli:main"
-policy-learnware-v01 = "policy_learnware_v0.v01.cli:main"
-policy-learnware-v02 = "policy_learnware_v0.v02.cli:main"
 
 [project.optional-dependencies]
-research = [
-  "jax>=0.7",
-  "flax>=0.12",
-  "optax>=0.2",
-  "scipy>=1.12",
-]
 test = ["pytest>=8"]
 
 [tool.setuptools]
@@ -35,5 +23,5 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src"]
+pythonpath = ["src", "."]
 addopts = "-ra"

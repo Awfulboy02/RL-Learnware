@@ -2,11 +2,7 @@
 
 from __future__ import annotations
 
-import dataclasses
 import importlib
-import subprocess
-import sys
-import types
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol
@@ -44,97 +40,12 @@ RuntimeFactory = Callable[
 @dataclass(frozen=True)
 class _RestoredRuntime:
     state: Any
-    runtime_warning: str | None
-
-
-def _ensure_wandb_importable() -> str | None:
-    """Install the smallest import-only shim needed by upstream rollouts.
-
-    The locked GoRL environment does not contain wandb, while ``flow_policy``
-    imports it at package import time even for frozen inference.  The shim is
-    installed only after a real import fails and is never used for logging.
-    """
-
-    try:
-        importlib.import_module("wandb")
-        return None
-    except ImportError:
-        wandb = types.ModuleType("wandb")
-        sdk = types.ModuleType("wandb.sdk")
-        wandb_run = types.ModuleType("wandb.sdk.wandb_run")
-
-        class Histogram:  # pragma: no cover - import compatibility only
-            def __init__(self, *args: Any, **kwargs: Any) -> None:
-                self.args = args
-                self.kwargs = kwargs
-
-        class Run:  # pragma: no cover - import compatibility only
-            pass
-
-        wandb.Histogram = Histogram  # type: ignore[attr-defined]
-        wandb.sdk = sdk  # type: ignore[attr-defined]
-        sdk.wandb_run = wandb_run  # type: ignore[attr-defined]
-        wandb_run.Run = Run  # type: ignore[attr-defined]
-        sys.modules["wandb"] = wandb
-        sys.modules["wandb.sdk"] = sdk
-        sys.modules["wandb.sdk.wandb_run"] = wandb_run
-        return "wandb unavailable; installed an import-only shim for frozen inference"
-
-
-def _replace(instance: Any, **changes: Any) -> Any:
-    try:
-        return dataclasses.replace(instance, **changes)
-    except (TypeError, ValueError):
-        try:
-            jdc = importlib.import_module("jax_dataclasses")
-            return jdc.replace(instance, **changes)
-        except (ImportError, AttributeError, TypeError, ValueError) as error:
-            raise RuntimeAdapterUnavailable(
-                f"cannot replace fields on upstream {type(instance).__name__}"
-            ) from error
+    runtime_receipt: Mapping[str, Any]
 
 
 def _arrays(path: Path) -> dict[str, np.ndarray]:
     with np.load(path, allow_pickle=False) as archive:
         return {name: np.asarray(archive[name]) for name in archive.files}
-
-
-def _verify_upstream_checkout(metadata: PolicyBundleMetadata, fpo_root: Path) -> Path:
-    root = fpo_root.expanduser().resolve()
-    source_dir = (root / "playground" / "src").resolve()
-    if not (source_dir / "flow_policy").is_dir():
-        raise RuntimeAdapterUnavailable(f"not an upstream FPO checkout: {root}")
-    expected_commit = str(metadata.provenance.get("fpo_commit", ""))
-
-    def git(*arguments: str) -> str:
-        completed = subprocess.run(
-            ["git", "-C", str(root), *arguments],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-        if completed.returncode != 0:
-            detail = completed.stderr.strip() or completed.stdout.strip()
-            raise RuntimeAdapterUnavailable(f"cannot verify FPO checkout: {detail}")
-        return completed.stdout.strip()
-
-    if git("rev-parse", "HEAD") != expected_commit:
-        raise RuntimeAdapterUnavailable("FPO runtime commit differs from bundle provenance")
-    if git("status", "--porcelain", "--untracked-files=no"):
-        raise RuntimeAdapterUnavailable("FPO runtime has tracked modifications")
-    for name, module in tuple(sys.modules.items()):
-        if name != "flow_policy" and not name.startswith("flow_policy."):
-            continue
-        origin = getattr(module, "__file__", None)
-        if origin is None:
-            continue
-        try:
-            Path(origin).resolve().relative_to(source_dir)
-        except ValueError as error:
-            raise RuntimeAdapterUnavailable(
-                f"cached module {name!r} comes from another checkout: {origin}"
-            ) from error
-    return source_dir
 
 
 def _ordered_actor(actor: Mapping[str, np.ndarray], jnp: Any) -> tuple[tuple[Any, Any], ...]:
@@ -160,33 +71,34 @@ def _default_runtime_factory(
     tooling remain usable without JAX or MuJoCo installed.
     """
 
-    source_dir = _verify_upstream_checkout(metadata, fpo_root)
-    source_string = str(source_dir.resolve())
-    if source_string not in sys.path:
-        sys.path.insert(0, source_string)
-    runtime_warning = _ensure_wandb_importable()
     try:
-        jax = importlib.import_module("jax")
-        jnp = importlib.import_module("jax.numpy")
-        # Playground 0.0.5 re-exports ``registry`` from the package but does
-        # not install it as an importable ``mujoco_playground.registry`` module.
-        playground = importlib.import_module("mujoco_playground")
-        registry = getattr(playground, "registry")
-        jdc = importlib.import_module("jax_dataclasses")
-        policy_module = importlib.import_module(f"flow_policy.{metadata.algorithm}")
+        runtime_module = importlib.import_module("policy_learnware_v0.v02.runtime")
     except ImportError as error:
         raise RuntimeAdapterUnavailable(
-            "locked upstream runtime dependencies are unavailable; run in the GoRL environment"
+            "v0.2 reconstructed-runtime verifier is unavailable"
         ) from error
-    module_path = getattr(policy_module, "__file__", None)
-    if module_path is None:
-        raise RuntimeAdapterUnavailable("upstream policy module has no filesystem origin")
     try:
-        Path(module_path).resolve().relative_to(source_dir)
-    except ValueError as error:
+        upstream = runtime_module.load_verified_fpo_upstream(
+            fpo_root,
+            allow_reconstructed=True,
+        )
+    except runtime_module.RuntimeVerificationError as error:
         raise RuntimeAdapterUnavailable(
-            f"upstream policy module was imported from {module_path}, not {source_dir}"
+            "verified reconstructed FPO runtime is unavailable; run in the "
+            "reviewed GoRL environment with bytecode writes disabled"
         ) from error
+    if upstream.source_attestation.get("fpo_commit") != metadata.provenance.get(
+        "fpo_commit"
+    ):
+        raise RuntimeAdapterUnavailable(
+            "attested FPO commit differs from bundle provenance"
+        )
+
+    jax = upstream.jax
+    jnp = upstream.jax_numpy
+    jdc = upstream.jax_dataclasses
+    registry = upstream.registry
+    policy_module = upstream.fpo if metadata.algorithm == "fpo" else upstream.ppo
 
     config_name = "FpoConfig" if metadata.algorithm == "fpo" else "PpoConfig"
     state_name = "FpoState" if metadata.algorithm == "fpo" else "PpoState"
@@ -210,7 +122,7 @@ def _default_runtime_factory(
             restored.params.policy = _ordered_actor(actor, jnp)
             for name, value in stats_changes.items():
                 setattr(restored.obs_stats, name, value)
-        return _RestoredRuntime(restored, runtime_warning)
+        return _RestoredRuntime(restored, upstream.runtime_receipt)
     except (AttributeError, KeyError, TypeError, ValueError) as error:
         raise RuntimeAdapterUnavailable(
             f"failed to reconstruct upstream {metadata.algorithm.upper()} state: {error}"
@@ -223,13 +135,18 @@ class _UpstreamFrozenPolicy:
         metadata: PolicyBundleMetadata,
         state: Any,
         *,
-        runtime_warning: str | None = None,
+        runtime_receipt: Mapping[str, Any] | None = None,
     ) -> None:
         self.observation_dim = metadata.observation_dim
         self.action_dim = metadata.action_dim
         self.algorithm = metadata.algorithm
         self.bundle_digest = metadata.bundle_digest
-        self.runtime_warning = runtime_warning
+        self.runtime_receipt = runtime_receipt
+        self.runtime_warning = (
+            None
+            if runtime_receipt is None
+            else "policy loaded under explicitly reconstructed runtime"
+        )
         self._state = state
 
     @staticmethod
@@ -307,6 +224,6 @@ def load_policy(
         return _UpstreamFrozenPolicy(
             metadata,
             state_or_policy.state,
-            runtime_warning=state_or_policy.runtime_warning,
+            runtime_receipt=state_or_policy.runtime_receipt,
         )
     return _UpstreamFrozenPolicy(metadata, state_or_policy)
