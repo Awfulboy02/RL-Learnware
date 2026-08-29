@@ -118,4 +118,3 @@ policy:
   require_runtime_commit_match: true
   verify_module_origin: true
   dependency_mode: locked_upstream_source
-
