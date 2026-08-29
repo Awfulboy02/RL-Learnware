@@ -696,36 +696,43 @@ def load_verified_fpo_upstream(
             if not import_succeeded:
                 _restore_namespace("flow_policy", initial_flow_modules)
 
-        current_root = _absolute_path_without_symlinks(
-            root, where="FPO checkout"
-        )
-        if current_root != root:
-            _restore_namespace("flow_policy", initial_flow_modules)
-            raise RuntimeVerificationError(
-                "FPO checkout path changed during module import"
+        post_import_verified = False
+        try:
+            current_root = _absolute_path_without_symlinks(
+                root, where="FPO checkout"
             )
-        after = verify_fpo_checkout(current_root)
-        if after != before:
-            _restore_namespace("flow_policy", initial_flow_modules)
-            raise RuntimeVerificationError("FPO checkout changed during module import")
-        runtime_receipt = MappingProxyType(
-            {
-                "schema": "policy-learnware.v02-reconstructed-runtime.v1",
-                "runtime_status": RECONSTRUCTED_RUNTIME,
-                "original_runtime_capable": False,
-                "training_replay_capable": False,
-                "inference_only": True,
-                "missing_dependency": None if wandb_was_available else "wandb",
-                "shim_identity": INFERENCE_ONLY_WANDB_SHIM_IDENTITY,
-                "installed_wandb_bypassed": wandb_was_available,
-            }
-        )
-        return VerifiedFPOUpstream(
-            provenance_class=RECONSTRUCTED_RUNTIME,
-            runtime_receipt=runtime_receipt,
-            source_attestation=_immutable_attestation(after),
-            **modules,
-        )
+            if current_root != root:
+                raise RuntimeVerificationError(
+                    "FPO checkout path changed during module import"
+                )
+            after = verify_fpo_checkout(current_root)
+            if after != before:
+                raise RuntimeVerificationError(
+                    "FPO checkout changed during module import"
+                )
+            runtime_receipt = MappingProxyType(
+                {
+                    "schema": "policy-learnware.v02-reconstructed-runtime.v1",
+                    "runtime_status": RECONSTRUCTED_RUNTIME,
+                    "original_runtime_capable": False,
+                    "training_replay_capable": False,
+                    "inference_only": True,
+                    "missing_dependency": None if wandb_was_available else "wandb",
+                    "shim_identity": INFERENCE_ONLY_WANDB_SHIM_IDENTITY,
+                    "installed_wandb_bypassed": wandb_was_available,
+                }
+            )
+            result = VerifiedFPOUpstream(
+                provenance_class=RECONSTRUCTED_RUNTIME,
+                runtime_receipt=runtime_receipt,
+                source_attestation=_immutable_attestation(after),
+                **modules,
+            )
+            post_import_verified = True
+            return result
+        finally:
+            if not post_import_verified:
+                _restore_namespace("flow_policy", initial_flow_modules)
 
 
 _ORIGINAL_VENDOR_STATUS = MappingProxyType(
