@@ -194,12 +194,6 @@ class ProbeMembership:
         object.__setattr__(self, "episode_entries", tuple(normalized))
 
     @property
-    def episode_permutation(self) -> tuple[int, ...]:
-        """Compatibility alias for the frozen episode order."""
-
-        return self.episode_order
-
-    @property
     def entries(self) -> tuple[TransitionIndex, ...]:
         """All visible indices, ordered by frozen episode order then timestep."""
 

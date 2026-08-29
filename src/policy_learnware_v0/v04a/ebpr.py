@@ -629,10 +629,6 @@ class EBPRFixedProbe:
     def action_dim(self) -> int:
         return int(self.x_mean.size - self.y_mean.size)
 
-    @property
-    def valid_output_dimension_count(self) -> int:
-        return int(np.sum(self.y_valid_mask))
-
     def _validate_episode_dimensions(
         self, episodes: tuple[TransitionEpisode, ...]
     ) -> None:

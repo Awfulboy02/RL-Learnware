@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import shutil
 from types import SimpleNamespace
 
 import numpy as np
@@ -14,6 +15,7 @@ from policy_learnware_v0.hashing import (
     sha256_ndarrays,
 )
 from policy_learnware_v0.rkme.reducer import ReducedRKME
+from policy_learnware_v0.v02.artifacts import V02AssetError
 from policy_learnware_v0.v03.transition_views import (
     TransitionBank,
     V_DELTA_ONLY,
@@ -381,6 +383,27 @@ def test_origin_parity_receipt_remains_digest_bound_at_one_e_minus_six(
         runner_module, "validate_success_record", lambda *a, **k: record
     )
     assert _origin_parity_receipt(metadata, accepted_cell)["status"] == "PASS"
+    historical_bundle = (
+        Path("/historical") / tmp_path.name / bundle.relative_to(tmp_path)
+    )
+    assert (
+        _origin_parity_receipt(
+            metadata,
+            {**accepted_cell, "bundle_path": str(historical_bundle)},
+            resolver=SimpleNamespace(resolve=lambda _value: bundle.resolve()),
+        )["status"]
+        == "PASS"
+    )
+    with pytest.raises(GateFailure, match="no verified v02 relocation"):
+        _origin_parity_receipt(
+            metadata,
+            {**accepted_cell, "bundle_path": str(historical_bundle)},
+            resolver=SimpleNamespace(
+                resolve=lambda _value: (_ for _ in ()).throw(
+                    V02AssetError("unknown recorded path")
+                )
+            ),
+        )
 
     (attempt / "status.json").unlink()
     _publish(
@@ -450,19 +473,34 @@ def test_origin_pool_acceptance_replays_canonical_semantics(
     acceptance_path.chmod(0o444)
     promotion_path.chmod(0o444)
     replayed = {**stored, "accepted_at": "replayed", "report_digest": "b" * 64}
-    monkeypatch.setattr(runner_module, "accept_policy_pool", lambda **kwargs: replayed)
+    resolver = SimpleNamespace(
+        layout=SimpleNamespace(
+            root=tmp_path / "artifacts",
+            frozen_acceptance=acceptance_path,
+            promotions=promotion_path,
+            server_plan=plan_path,
+            runs_root=tmp_path / "experiment" / "training_private" / "server_runs",
+        )
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "replay_relocated_policy_pool_acceptance",
+        lambda **kwargs: replayed,
+    )
 
-    cells, receipt = _origin_pool_acceptance(acceptance_path)
+    cells, receipt = _origin_pool_acceptance(acceptance_path, resolver=resolver)
     assert cells == stored["cells"]
     assert receipt["canonical_replay"] == "PASS"
 
     monkeypatch.setattr(
         runner_module,
-        "accept_policy_pool",
-        lambda **kwargs: {**replayed, "decision": "NO_GO"},
+        "replay_relocated_policy_pool_acceptance",
+        lambda **kwargs: (_ for _ in ()).throw(
+            runner_module.V02ContractError("canonical replay differs")
+        ),
     )
-    with pytest.raises(GateFailure, match="differs from canonical replay"):
-        _origin_pool_acceptance(acceptance_path)
+    with pytest.raises(GateFailure, match="cannot revalidate"):
+        _origin_pool_acceptance(acceptance_path, resolver=resolver)
 
 
 def test_origin_parity_receipt_requires_canonical_fallback_promotion(
@@ -589,17 +627,7 @@ def test_score_parser_has_no_oracle_capability() -> None:
     parser = _parser()
     fit = parser.parse_args(["fit-source", "--run-dir", "/tmp/v04a-run"])
     assert not hasattr(fit, "source_utility_root")
-    with pytest.raises(SystemExit):
-        parser.parse_args(["score-fp", "--run-dir", "/tmp/v04a-run"])
-    parsed = parser.parse_args(
-        [
-            "score-fp",
-            "--run-dir",
-            "/tmp/v04a-run",
-            "--attempt-id",
-            "attempt-1",
-        ]
-    )
+    parsed = parser.parse_args(["score-fp", "--run-dir", "/tmp/v04a-run"])
     assert parsed.stage == "score-fp"
     assert not hasattr(parsed, "oracle_root")
     with pytest.raises(SystemExit):
@@ -608,8 +636,6 @@ def test_score_parser_has_no_oracle_capability() -> None:
                 "score-fp",
                 "--run-dir",
                 "/tmp/v04a-run",
-                "--attempt-id",
-                "attempt-1",
                 "--oracle-root",
                 "/tmp/private-oracle",
             ]
@@ -642,6 +668,155 @@ def test_score_parser_has_no_oracle_capability() -> None:
                 "--oracle-root",
                 "/tmp/private-oracle",
             ]
+        )
+
+
+def test_artifact_paths_use_one_root_with_explicit_precedence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    environment_root = tmp_path / "environment-artifacts"
+    explicit_root = tmp_path / "explicit-artifacts"
+    monkeypatch.setenv(runner_module.ARTIFACTS_ROOT_ENV, str(environment_root))
+    assert runner_module._artifacts_root() == environment_root.resolve()
+    assert runner_module._artifacts_root(explicit_root) == explicit_root.resolve()
+
+    args = runner_module._resolve_cli_paths(
+        argparse.Namespace(
+            artifacts_root=explicit_root,
+            run_dir=Path("v04a/runs/new-run"),
+        )
+    )
+    assert args.run_dir == (explicit_root / "v04a/runs/new-run").resolve()
+    with pytest.raises(V04ARunnerError, match="escapes"):
+        runner_module._artifact_path(Path("../outside"), explicit_root.resolve())
+
+    monkeypatch.delenv(runner_module.ARTIFACTS_ROOT_ENV)
+    expected_default = REPOSITORY.parent / "artifacts"
+    assert runner_module._artifacts_root() == expected_default.resolve()
+
+
+def test_r4_relocation_manifest_requires_byte_identical_trees(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "historical" / runner_module.R4_RUN_ID
+    artifacts_root = tmp_path / "artifacts"
+    destination = artifacts_root / runner_module.R4_RUN_RELATIVE
+    ranking_digest = "a" * 64
+    payloads = {
+        "run.json": {"status": "PREPARED", "formal": False},
+        "asset_census.json": {
+            "context_index_sha256": "b" * 64,
+            "bank_digests": {"context": "c" * 64},
+            "policy_bundle_and_abi": {"status": "PASS"},
+            "raw_delta": {"status": "PASS"},
+            "source_utility": {"status": "PASS_SOURCE_ONLY_PROJECTION"},
+        },
+        "fit_source_status.json": {
+            "status": "COMPLETE",
+            "source_only": True,
+            "target_contexts_read": 0,
+        },
+        "score_fp_status.json": {
+            "status": "COMPLETE",
+            "ranking_record_count": 672,
+        },
+        "seal_status.json": {
+            "status": "SEALED_PRE_ORACLE",
+            "rankings_digest": ranking_digest,
+        },
+        "rankings.seal.json": {"rankings_digest": ranking_digest},
+        "oracle_evaluate_status.json": {
+            "status": "COMPLETE",
+            "metric_record_count": 672,
+            "rankings_digest": ranking_digest,
+        },
+        "oracle_binding.json": {"rankings_digest": ranking_digest},
+        "summary.json": {
+            "status": "COMPLETE_DEVELOPMENT",
+            "formal": False,
+            "scope": "24 frozen development contexts; not confirmatory",
+        },
+    }
+    for name, payload in payloads.items():
+        _publish(source / name, payload)
+    _publish_jsonl(source / "rankings.jsonl", [{"fixture": "ranking"}])
+    _publish_jsonl(source / "metrics.jsonl", [{"fixture": "metric"}])
+    core_sha256 = {
+        name: sha256_file(source / name) for name in runner_module.R4_CORE_SHA256
+    }
+    records, total_bytes, tree_digest = runner_module._tree_inventory(source)
+    monkeypatch.setattr(runner_module, "R4_CORE_SHA256", core_sha256)
+    monkeypatch.setattr(runner_module, "R4_RUN_FILE_COUNT", len(records))
+    monkeypatch.setattr(runner_module, "R4_RUN_TOTAL_BYTES", total_bytes)
+    monkeypatch.setattr(runner_module, "R4_RUN_TREE_SHA256", tree_digest)
+    shutil.copytree(source, destination)
+    source_logs = tmp_path / "historical-logs"
+    source_diagnostics = tmp_path / "historical-diagnostics"
+    source_logs.mkdir()
+    source_diagnostics.mkdir()
+    (source_logs / "fixture.log").write_bytes(b"frozen log\n")
+    (source_diagnostics / "fixture.json").write_bytes(b'{"frozen":true}\n')
+    log_sha256 = {"fixture.log": sha256_file(source_logs / "fixture.log")}
+    diagnostic_sha256 = {
+        "fixture.json": sha256_file(source_diagnostics / "fixture.json")
+    }
+    monkeypatch.setattr(runner_module, "R4_LOG_SHA256", log_sha256)
+    monkeypatch.setattr(runner_module, "R4_DIAGNOSTIC_SHA256", diagnostic_sha256)
+    target_logs = artifacts_root / "v04a" / "logs" / runner_module.R4_RUN_ID
+    target_diagnostics = artifacts_root / runner_module.R4_DIAGNOSTIC_RELATIVE
+    shutil.copytree(source_logs, target_logs)
+    shutil.copytree(source_diagnostics, target_diagnostics)
+
+    result = runner_module.relocation_manifest(
+        argparse.Namespace(
+            source_run=source,
+            source_log_root=source_logs,
+            source_diagnostic_root=source_diagnostics,
+            artifacts_root=artifacts_root,
+            manifest_output=None,
+            resume=False,
+        )
+    )
+    assert result["status"] == "VERIFIED_RELOCATION"
+    assert result["destination"] == {
+        "canonical_relative_path": runner_module.R4_RUN_RELATIVE.as_posix(),
+        "role": "single canonical relocated R4 tree",
+        "access_class": "frozen-read-only",
+    }
+    assert result["immutable_receipts_modified"] is False
+    assert {
+        row["canonical_relative_path"] for row in result["shared_dependencies"]
+    } >= {
+        "v02/exact90/v02-reacher-formal-2r-20260825-r2",
+        "v02/formal_inputs/v02-reacher-formal-2r-20260825-r2",
+        "v03/runs/v03-main-20260827-r0/source-market",
+        "shared/runtime/fpo-418c2554",
+    }
+    manifest_path = artifacts_root / "v04a" / "relocation_manifest.json"
+    before = manifest_path.read_bytes()
+    runner_module.relocation_manifest(
+        argparse.Namespace(
+            source_run=source,
+            source_log_root=source_logs,
+            source_diagnostic_root=source_diagnostics,
+            artifacts_root=artifacts_root,
+            manifest_output=None,
+            resume=True,
+        )
+    )
+    assert manifest_path.read_bytes() == before
+
+    (destination / "metrics.jsonl").write_bytes(b"tampered\n")
+    with pytest.raises(V04ARunnerError, match="not byte-identical"):
+        runner_module.relocation_manifest(
+            argparse.Namespace(
+                source_run=source,
+                source_log_root=source_logs,
+                source_diagnostic_root=source_diagnostics,
+                artifacts_root=artifacts_root,
+                manifest_output=tmp_path / "rejected.json",
+                resume=False,
+            )
         )
 
 
@@ -1039,14 +1214,9 @@ def test_score_fp_uses_only_sanitized_reward_free_closure(
         return FakeBPR(task), FakeEBPR(task)
 
     raw_calls: list[tuple[str, int, str]] = []
-    fail_after: list[int | None] = [None]
 
     def fake_raw_scores(*, probe, task_id, candidate_ids, **kwargs):
         raw_calls.append((task_id, probe.episode_count, probe.probe_membership_digest))
-        if fail_after[0] is not None:
-            if fail_after[0] == 0:
-                raise V04ARunnerError("injected resumable score interruption")
-            fail_after[0] -= 1
         return {
             candidate: float(5 - index) for index, candidate in enumerate(candidate_ids)
         }
@@ -1089,37 +1259,15 @@ def test_score_fp_uses_only_sanitized_reward_free_closure(
     assert not (run_dir / "rankings.jsonl").exists()
     assert not (run_dir / "score_fp_status.json").exists()
 
-    fail_after[0] = 3
-    interrupted = score_fp(
-        argparse.Namespace(
-            run_dir=run_dir,
-            block_size=16,
-            resume=False,
-            attempt_id="full-failed-1",
-        )
-    )
-    assert interrupted["status"] == "NO_GO_FP_SCORING"
-    assert len(tuple((run_dir / "score_cells").glob("*/*.json"))) == 3
-    assert (run_dir / "score_attempts" / "full-failed-1.json").is_file()
-    assert not (run_dir / "rankings.jsonl").exists()
-    assert not (run_dir / "score_fp_status.json").exists()
-
-    fail_after[0] = None
-    calls_before_resume = len(raw_calls)
-    result = score_fp(
-        argparse.Namespace(
-            run_dir=run_dir,
-            block_size=16,
-            resume=True,
-            attempt_id="full-resume-1",
-        )
-    )
+    calls_before_full = len(raw_calls)
+    result = score_fp(argparse.Namespace(run_dir=run_dir, block_size=16))
     assert result["status"] == "COMPLETE"
-    assert result["immutable_cell_count"] == 24 * 7
     assert result["ranking_record_count"] == 24 * 7 * 4 == 672
     assert result["posterior_trace_count"] == 24 * 7 * 3 == 504
-    assert len(raw_calls) - calls_before_resume == 24 * 7 - 3
+    assert len(raw_calls) - calls_before_full == 24 * 7
     assert {budget for _, budget, _ in raw_calls} == set(BUDGET_EPISODES)
+    assert not (run_dir / "score_cells").exists()
+    assert not (run_dir / "score_attempts").exists()
 
     rankings = _read_jsonl(run_dir / "rankings.jsonl")
     traces = _read_jsonl(run_dir / "posterior_traces.jsonl")
@@ -1136,78 +1284,6 @@ def test_score_fp_uses_only_sanitized_reward_free_closure(
     assert b"context_index" not in run_bytes
     assert b"private_registry" not in run_bytes
     assert b"oracle" not in run_bytes
-
-    first_cell_path = sorted((run_dir / "score_cells").glob("*/*.json"))[0]
-    first_cell = runner_module._json(first_cell_path)
-    assert first_cell["binding"]["block_size"] == 16
-    assert first_cell["binding"]["target_reward_free_npz_sha256"]
-    assert first_cell["binding"]["scoring_manifest_payload_digest"]
-    assert first_cell["binding"]["runner_source_sha256"] == sha256_file(
-        runner_module.__file__
-    )
-    wrong_block = score_fp(
-        argparse.Namespace(
-            run_dir=run_dir,
-            block_size=32,
-            resume=True,
-            attempt_id="wrong-block",
-        )
-    )
-    assert wrong_block["status"] == "NO_GO_FP_SCORING"
-    assert "binding" in wrong_block["message"]
-
-    target_row = next(
-        row
-        for row in scoring_manifest["contexts"]
-        if row["context_id"] == first_cell["binding"]["context_id"]
-    )
-    target_path = run_dir / target_row["reward_free_npz"]
-    target_bytes = target_path.read_bytes()
-    target_path.write_bytes(target_bytes + b"changed")
-    changed_target = score_fp(
-        argparse.Namespace(
-            run_dir=run_dir,
-            block_size=16,
-            resume=True,
-            attempt_id="changed-target",
-        )
-    )
-    assert changed_target["status"] == "NO_GO_FP_SCORING"
-    assert "projection moved or changed" in changed_target["message"]
-    target_path.write_bytes(target_bytes)
-
-    cell_bytes = first_cell_path.read_bytes()
-    corrupted_cell = dict(first_cell)
-    corrupted_cell["binding"] = {
-        **corrupted_cell["binding"],
-        "runner_source_sha256": "corrupted-runner-binding",
-    }
-    first_cell_path.write_bytes(canonical_json_bytes(corrupted_cell) + b"\n")
-    rejected_cell = score_fp(
-        argparse.Namespace(
-            run_dir=run_dir,
-            block_size=16,
-            resume=True,
-            attempt_id="corrupted-cell",
-        )
-    )
-    assert rejected_cell["status"] == "NO_GO_FP_SCORING"
-    assert "binding" in rejected_cell["message"]
-    first_cell_path.write_bytes(cell_bytes)
-
-    completed_rankings = (run_dir / "rankings.jsonl").read_bytes()
-    calls_before_complete_resume = len(raw_calls)
-    resumed = score_fp(
-        argparse.Namespace(
-            run_dir=run_dir,
-            block_size=16,
-            resume=True,
-            attempt_id="full-resume-2",
-        )
-    )
-    assert resumed["status"] == "COMPLETE"
-    assert len(raw_calls) == calls_before_complete_resume
-    assert (run_dir / "rankings.jsonl").read_bytes() == completed_rankings
 
     seal_stage(argparse.Namespace(run_dir=run_dir, resume=False))
     with pytest.raises(V04ARunnerError, match="after ranking seal or oracle"):
@@ -1234,18 +1310,14 @@ def _source_projection_fixture(
     ]
     tasks = {
         task_id: {
-            key: value
-            for key, value in task.items()
-            if key != "raw_tie_break_tokens"
+            key: value for key, value in task.items() if key != "raw_tie_break_tokens"
         }
         for task_id, task in scoring_manifest["tasks"].items()
     }
     layout = {
         task_id: {
             **task,
-            "source_rows": [
-                row for row in contexts if row["task_id"] == task_id
-            ],
+            "source_rows": [row for row in contexts if row["task_id"] == task_id],
         }
         for task_id, task in tasks.items()
     }
@@ -1288,15 +1360,17 @@ def _source_projection_fixture(
             ),
         },
     )
-    return run_dir, mixed_root, layout, projection, runner_module._json(
-        run_dir / "run.json"
+    return (
+        run_dir,
+        mixed_root,
+        layout,
+        projection,
+        runner_module._json(run_dir / "run.json"),
     )
 
 
 def test_source_utility_projection_exact_and_no_clobber(tmp_path: Path) -> None:
-    run_dir, mixed_root, layout, projection, run = _source_projection_fixture(
-        tmp_path
-    )
+    run_dir, mixed_root, layout, projection, run = _source_projection_fixture(tmp_path)
     root = run_dir / projection["root"]
     assert projection["cell_count"] == len(projection["cells"]) == 150
     assert projection["contains_target_contexts"] is False

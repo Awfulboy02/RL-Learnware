@@ -8,9 +8,11 @@ from oracle evaluation::
     prepare -> fit-source -> score-fp -> seal-rankings
             -> oracle-evaluate -> summarize
 
-Existing v02/v03/v0.31 inputs are read-only.  Every output is an immutable file
-under a new v0.4a run directory.  Missing lineage/logger/utility evidence is a
-recorded NO_GO, never an invitation to synthesize a replacement.
+Existing v02/v03/v0.31 inputs are read-only.  Every development-stage output is
+an immutable file under a new v0.4a run directory; the separate relocation
+command verifies an external copy before writing its canonical manifest.
+Missing lineage/logger/utility evidence is a recorded NO_GO, never an
+invitation to synthesize a replacement.
 """
 
 from __future__ import annotations
@@ -19,6 +21,7 @@ import argparse
 from collections import defaultdict
 import json
 import math
+import os
 from pathlib import Path
 import resource
 import time
@@ -29,6 +32,7 @@ import yaml
 
 from policy_learnware_v0.hashing import (
     canonical_json_bytes,
+    sha256_bytes,
     sha256_file,
     sha256_json,
     sha256_ndarrays,
@@ -76,6 +80,7 @@ from policy_learnware_v0.v04a.protocol import (
     tie_break_key,
     verify_ranking_seal,
 )
+from policy_learnware_v0.v02.artifacts import RelocationResolver, V02AssetError
 from server.repro_fpo_ppo_v03.development_baseline_runner import (
     SCHEMA as V03_BASELINE_SCHEMA,
     DevelopmentBaselineError,
@@ -94,14 +99,69 @@ from server.repro_fpo_ppo_v03.signal_bank_runner import (
 from server.repro_fpo_ppo_v02.provenance import (
     ContractError as V02ContractError,
     load_strict_json,
-    validate_self_digest,
     validate_success_record,
 )
-from server.repro_fpo_ppo_v02.pool_acceptance import accept_policy_pool
+from server.repro_fpo_ppo_v02.replay import replay_relocated_policy_pool_acceptance
 
 
 SCHEMA = "policy-learnware.v04a-fixed-probe-run.v1"
 SOURCE_UTILITY_PROJECTION_SCHEMA = "policy-learnware.v04a-source-utility-projection.v1"
+RELOCATION_SCHEMA = "policy-learnware.v04a-relocation-manifest.v1"
+ARTIFACTS_ROOT_ENV = "RL_LEARNWARE_ARTIFACTS_ROOT"
+R4_RUN_ID = "v04a-primary-dev-20260828-r4"
+R4_RUN_RELATIVE = Path("v04a") / "runs" / R4_RUN_ID
+R4_RUN_TREE_SHA256 = "f8f040ba34a19b69d6eb0d8dc58b7b39e6c197657158e81a918e98d953adff5d"
+R4_RUN_FILE_COUNT = 439
+R4_RUN_TOTAL_BYTES = 30_612_855
+R4_CORE_SHA256 = {
+    "run.json": "5c510a3bcd184c1b89df625e028d90c233d0182ec40baf1a5231f1323d2b9ed7",
+    "asset_census.json": "ba6bed976f7fddbecede507c170c224ed512e199995f67264b3782de3cf5abe5",
+    "fit_source_status.json": "0995ec2643808bb110deefa9114f22ab3adc6cd727487641c0446df3fe2daf6d",
+    "score_fp_status.json": "bb5dc31bd26deb9074581f9a894778719807038aede4a8e01bf312e908def889",
+    "rankings.jsonl": "a05002077e15b9ffbb67e5e089ad7e91aa95a88d00e65cb9a96e4c454d840e7d",
+    "rankings.seal.json": "43fedd846bdb48ba957a7b5e9e6baf6df54082ac600e8e419c13de2b7bf3fa0b",
+    "seal_status.json": "ad45faaf736578f54abc1adbeb25966f85ac3557d0e8710c21d97767ae076bae",
+    "oracle_evaluate_status.json": "9db4e50359c781d5448ca1e6251b95c16104f0975f1845f948e063cb8eaa562c",
+    "oracle_binding.json": "ef116d67a1c7d9bf6693c355e8ebb91628918be06cae650e8e80324d77d8e118",
+    "metrics.jsonl": "9444cd9844a07e595faa5b54f16508b8f34d4741e439dc8198fdccfe40a13bac",
+    "summary.json": "e2ea65300274b5e13a7b15e11a938a871d035e0196bf485d4c1833c0909f34ef",
+}
+R4_LOG_SHA256 = {
+    f"{R4_RUN_ID}.fit-source.log": (
+        "2b12cd0a22702a8e62dc79acee1fcfeb02389119ee6f11b471367e7a1fe2559f"
+    ),
+    f"{R4_RUN_ID}.oracle-evaluate.log": (
+        "3915c9a78aff72eea8192b94aa905a38e56c9fec2d53ea87cdd1c0f41cdf680a"
+    ),
+    f"{R4_RUN_ID}.prepare.log": (
+        "06dcbc54b4cf6ed9c72cf8d7640137cf836c93aa92f696209c6ef2d1c4516649"
+    ),
+    f"{R4_RUN_ID}.score-cpu-084bb9c-01.log": (
+        "dd868b53f87bad37a48f984b6767e67f8b601bf1c6e07f365cf1e40f8fd37fc5"
+    ),
+    f"{R4_RUN_ID}.score-resume-audit-084bb9c-01.log": (
+        "c419655dd38e57eadf7cc5c35744550c5c0f71c231da24496fe329e3ad182716"
+    ),
+    f"{R4_RUN_ID}.seal.log": (
+        "3fe5b07934bb6af81f44e827ff9397d3fecc2e34509989074f650c878a920b42"
+    ),
+    f"{R4_RUN_ID}.summarize.log": (
+        "aae87e155f9e448f6ca98a3209ff9701620edd55710bca55bd345550800e62a7"
+    ),
+}
+R4_DIAGNOSTIC_ID = "v04a-parity-diagnostic-m2cpu-20260828-r1"
+R4_DIAGNOSTIC_RELATIVE = Path("v04a") / "diagnostics" / "m2cpu-r1"
+R4_DIAGNOSTIC_SHA256 = {
+    f"{R4_DIAGNOSTIC_ID}.json": (
+        "b5351244ccbd586072c8b0ea8d3a5b8ccf7d6c4516ec10598dd34532977b80bc"
+    ),
+    f"{R4_DIAGNOSTIC_ID}.result.json": (
+        "50ac5e13b021a415ab251f51672fabb61a334e79ae25f94e95d63c35a8f9fc46"
+    ),
+    f"{R4_DIAGNOSTIC_ID}.stderr.log": (
+        "8f7806f276b80d0c8f481d5a57de8dade4c7cf56b16d645b88d0f62e4b053373"
+    ),
+}
 PLAN_SHA256 = "d1860c1418fe807bf640e9cfb8a816b7f58e8797db76345af212796fa6d487c0"
 RAW_METHOD = "RAW_DELTA_TASK5"
 BPR_METHOD = "BPR_FP"
@@ -177,6 +237,393 @@ class GateFailure(V04ARunnerError):
         super().__init__(message)
         self.status = status
         self.details = details
+
+
+def _artifacts_root(explicit: Path | None = None) -> Path:
+    """Resolve the one shared external-asset root without compatibility aliases."""
+
+    if explicit is not None:
+        raw = Path(explicit).expanduser()
+    else:
+        configured = os.environ.get(ARTIFACTS_ROOT_ENV)
+        raw = (
+            Path(configured).expanduser()
+            if configured
+            else Path(__file__).resolve().parents[2].parent / "artifacts"
+        )
+    if raw.is_symlink():
+        raise V04ARunnerError(f"artifacts root cannot be a symlink: {raw}")
+    resolved = raw.resolve()
+    return resolved
+
+
+def _artifact_path(value: Path, root: Path) -> Path:
+    """Resolve an explicit absolute path or a root-relative artifact path."""
+
+    raw = Path(value).expanduser()
+    if raw.is_absolute():
+        return raw.resolve()
+    resolved = (root / raw).resolve()
+    if not resolved.is_relative_to(root):
+        raise V04ARunnerError(f"relative artifact path escapes its root: {raw}")
+    return resolved
+
+
+def _resolve_cli_paths(args: argparse.Namespace) -> argparse.Namespace:
+    """Apply CLI > environment > safe-default path precedence once."""
+
+    root = _artifacts_root(getattr(args, "artifacts_root", None))
+    args.artifacts_root = root
+    for name in (
+        "run_dir",
+        "context_index",
+        "public_policy_market",
+        "deployment_private_registry",
+        "origin_pool_acceptance",
+        "raw_delta_root",
+        "fpo_root",
+        "source_utility_root",
+        "oracle_root",
+        "manifest_output",
+    ):
+        value = getattr(args, name, None)
+        if value is not None:
+            setattr(args, name, _artifact_path(Path(value), root))
+    return args
+
+
+def _tree_inventory(root: Path) -> tuple[list[dict[str, Any]], int, str]:
+    """Hash a directory as sorted relative path/size/SHA records."""
+
+    if root.is_symlink() or not root.is_dir():
+        raise V04ARunnerError(f"artifact tree is absent or unsafe: {root}")
+    entries = tuple(root.rglob("*"))
+    if any(path.is_symlink() for path in entries):
+        raise V04ARunnerError(f"artifact tree contains a symlink: {root}")
+    records: list[dict[str, Any]] = []
+    for path in sorted(value for value in entries if value.is_file()):
+        payload = path.read_bytes()
+        records.append(
+            {
+                "path": path.relative_to(root).as_posix(),
+                "size": len(payload),
+                "sha256": sha256_bytes(payload),
+            }
+        )
+    total_bytes = sum(int(record["size"]) for record in records)
+    return records, total_bytes, sha256_json(records)
+
+
+def _verified_r4_summary(root: Path) -> dict[str, Any]:
+    """Verify the frozen R4 scientific state without rewriting its receipts."""
+
+    observed_core = {
+        name: sha256_file(root / name)
+        for name in R4_CORE_SHA256
+        if (root / name).is_file() and not (root / name).is_symlink()
+    }
+    if observed_core != R4_CORE_SHA256:
+        raise V04ARunnerError("R4 core artifact set or SHA-256 differs")
+    run = _json(root / "run.json")
+    fit = _json(root / "fit_source_status.json")
+    score = _json(root / "score_fp_status.json")
+    seal_status = _json(root / "seal_status.json")
+    seal = _json(root / "rankings.seal.json")
+    oracle = _json(root / "oracle_evaluate_status.json")
+    binding = _json(root / "oracle_binding.json")
+    summary = _json(root / "summary.json")
+    rankings_digest = str(seal.get("rankings_digest", ""))
+    if (
+        run.get("status") != "PREPARED"
+        or run.get("formal") is not False
+        or fit.get("status") != "COMPLETE"
+        or fit.get("source_only") is not True
+        or fit.get("target_contexts_read") != 0
+        or score.get("status") != "COMPLETE"
+        or score.get("ranking_record_count") != 672
+        or seal_status.get("status") != "SEALED_PRE_ORACLE"
+        or not rankings_digest
+        or rankings_digest != seal_status.get("rankings_digest")
+        or rankings_digest != oracle.get("rankings_digest")
+        or rankings_digest != binding.get("rankings_digest")
+        or oracle.get("status") != "COMPLETE"
+        or oracle.get("metric_record_count") != 672
+        or summary.get("status") != "COMPLETE_DEVELOPMENT"
+        or summary.get("formal") is not False
+        or summary.get("scope") != "24 frozen development contexts; not confirmatory"
+    ):
+        raise V04ARunnerError(
+            "R4 stage, source-only, seal, or scientific status differs"
+        )
+    return {
+        "status": "COMPLETE_DEVELOPMENT",
+        "formal": False,
+        "confirmatory": False,
+        "source_only_fit": True,
+        "development_context_count": 24,
+        "budget_count": 7,
+        "method_rows": 4,
+        "ranking_record_count": 672,
+        "metric_record_count": 672,
+        "rankings_digest": rankings_digest,
+    }
+
+
+def _verify_relocated_file_group(
+    source_root: Path,
+    destination: Path,
+    expected: Mapping[str, str],
+) -> dict[str, Any]:
+    if (
+        source_root.is_symlink()
+        or not source_root.is_dir()
+        or destination.is_symlink()
+        or not destination.is_dir()
+    ):
+        raise V04ARunnerError("relocation support directory is absent or unsafe")
+    source = {
+        name: sha256_file(source_root / name)
+        for name in expected
+        if (source_root / name).is_file() and not (source_root / name).is_symlink()
+    }
+    target_entries = tuple(destination.iterdir())
+    if any(path.is_symlink() or not path.is_file() for path in target_entries):
+        raise V04ARunnerError("relocation support directory has unsafe entries")
+    target = {path.name: sha256_file(path) for path in target_entries}
+    if source != dict(expected) or target != dict(expected):
+        raise V04ARunnerError("relocated support files or SHA-256 differ")
+    return {
+        "file_count": len(expected),
+        "total_bytes": sum((source_root / name).stat().st_size for name in expected),
+        "file_sha256": dict(expected),
+    }
+
+
+def relocation_manifest(args: argparse.Namespace) -> Mapping[str, Any]:
+    """Verify a byte-identical R4 relocation, then publish its new path binding."""
+
+    artifacts_root = _artifacts_root(getattr(args, "artifacts_root", None))
+    source_input = Path(args.source_run).expanduser()
+    log_source_input = Path(args.source_log_root).expanduser()
+    diagnostic_source_input = Path(args.source_diagnostic_root).expanduser()
+    if any(
+        path.is_symlink()
+        for path in (source_input, log_source_input, diagnostic_source_input)
+    ):
+        raise V04ARunnerError("relocation source roots cannot be symlinks")
+    source = source_input.resolve()
+    destination = artifacts_root / R4_RUN_RELATIVE
+    if source == destination:
+        raise V04ARunnerError("relocation source and destination must be distinct")
+    source_records, source_bytes, source_digest = _tree_inventory(source)
+    target_records, target_bytes, target_digest = _tree_inventory(destination)
+    if (
+        source_records != target_records
+        or source_bytes != target_bytes
+        or source_digest != target_digest
+    ):
+        raise V04ARunnerError("relocated R4 tree is not byte-identical to its source")
+    if (
+        source_digest != R4_RUN_TREE_SHA256
+        or len(source_records) != R4_RUN_FILE_COUNT
+        or source_bytes != R4_RUN_TOTAL_BYTES
+    ):
+        raise V04ARunnerError("R4 tree differs from the pre-registered inventory")
+    scientific_status = _verified_r4_summary(source)
+    _verified_r4_summary(destination)
+    log_source = log_source_input.resolve()
+    diagnostic_source = diagnostic_source_input.resolve()
+    log_relative = Path("v04a") / "logs" / R4_RUN_ID
+    diagnostic_relative = R4_DIAGNOSTIC_RELATIVE
+    log_summary = _verify_relocated_file_group(
+        log_source, artifacts_root / log_relative, R4_LOG_SHA256
+    )
+    diagnostic_summary = _verify_relocated_file_group(
+        diagnostic_source,
+        artifacts_root / diagnostic_relative,
+        R4_DIAGNOSTIC_SHA256,
+    )
+    census = _json(source / "asset_census.json")
+    policy_evidence = census.get("policy_bundle_and_abi")
+    raw_evidence = census.get("raw_delta")
+    utility_evidence = census.get("source_utility")
+    bank_digests = census.get("bank_digests")
+    if not all(
+        isinstance(value, Mapping)
+        for value in (policy_evidence, raw_evidence, utility_evidence, bank_digests)
+    ):
+        raise V04ARunnerError("R4 shared-input evidence is incomplete")
+    manifest = {
+        "schema": RELOCATION_SCHEMA,
+        "status": "VERIFIED_RELOCATION",
+        "artifact_id": R4_RUN_ID,
+        "kind": "sealed-development-run",
+        "owner": "v04a",
+        "run_id": R4_RUN_ID,
+        "source_commit": "084bb9c0e52c23c141940d94eb675dbd2995adc6",
+        "consumers": ["v04a-replay", "v05-source-fit-and-query-protocol"],
+        "artifacts_root_environment": ARTIFACTS_ROOT_ENV,
+        "path_precedence": [
+            "explicit CLI/config path",
+            ARTIFACTS_ROOT_ENV,
+            "repository-parent/artifacts",
+        ],
+        "source": {
+            "historical_path": str(source),
+            "role": "immutable v0.4a R4 development evidence",
+            "access_class": "frozen-read-only",
+        },
+        "destination": {
+            "canonical_relative_path": R4_RUN_RELATIVE.as_posix(),
+            "role": "single canonical relocated R4 tree",
+            "access_class": "frozen-read-only",
+        },
+        "content": {
+            "file_count": len(source_records),
+            "total_bytes": source_bytes,
+            "tree_digest_algorithm": "sha256(canonical_json(sorted[{path,size,sha256}]))",
+            "tree_sha256": source_digest,
+            "core_file_sha256": dict(R4_CORE_SHA256),
+        },
+        "supporting_assets": [
+            {
+                "artifact_id": f"{R4_RUN_ID}-logs",
+                "kind": "historical-execution-logs",
+                "owner": "v04a",
+                "consumers": ["v04a-audit"],
+                "historical_path": str(log_source),
+                "canonical_relative_path": log_relative.as_posix(),
+                **log_summary,
+            },
+            {
+                "artifact_id": R4_DIAGNOSTIC_ID,
+                "kind": "cross-backend-parity-diagnostic",
+                "owner": "v04a",
+                "consumers": ["v04a-audit"],
+                "historical_path": str(diagnostic_source),
+                "canonical_relative_path": diagnostic_relative.as_posix(),
+                **diagnostic_summary,
+            },
+        ],
+        "scientific_status": scientific_status,
+        "immutable_receipts_modified": False,
+        "shared_dependencies": [
+            {
+                "asset_id": "v02-exact90-policy-pool",
+                "owner": "v02",
+                "relocation": "reference-only; resolve through owner manifest",
+                "canonical_relative_path": (
+                    "v02/exact90/v02-reacher-formal-2r-20260825-r2"
+                ),
+                "evidence_sha256": sha256_json(policy_evidence),
+            },
+            {
+                "asset_id": "v02-formal-inputs",
+                "owner": "v02",
+                "relocation": "reference-only; resolve through owner manifest",
+                "canonical_relative_path": (
+                    "v02/formal_inputs/v02-reacher-formal-2r-20260825-r2"
+                ),
+                "evidence_sha256": sha256_json(policy_evidence),
+            },
+            {
+                "asset_id": "fpo-runtime-418c2554",
+                "owner": "shared-runtime",
+                "relocation": "reference-only; pinned source checkout; provenance declared by owner manifest",
+                "canonical_relative_path": "shared/runtime/fpo-418c2554",
+                "source_commit": "418c2554f7cd22d52e14c07d951280929d73bf2f",
+                "evidence_sha256": sha256_json(policy_evidence),
+            },
+            {
+                "asset_id": "v03-common-probe-bank",
+                "owner": "v03",
+                "relocation": "reference-only; resolve through owner manifest",
+                "canonical_relative_path": (
+                    "v03/runs/v03-signal-ranking-20260827-r1/probes"
+                ),
+                "context_index_sha256": census.get("context_index_sha256"),
+                "bank_digests_sha256": sha256_json(bank_digests),
+            },
+            {
+                "asset_id": "v03-source-market",
+                "owner": "v03",
+                "relocation": "reference-only; resolve through owner manifest",
+                "canonical_relative_path": (
+                    "v03/runs/v03-main-20260827-r0/source-market"
+                ),
+                "policy_market_id": _json(source / "run.json").get("policy_market_id"),
+                "evidence_sha256": sha256_json(policy_evidence),
+            },
+            {
+                "asset_id": "v031-raw-delta-source-operator",
+                "owner": "v03",
+                "relocation": "reference-only; resolve through owner manifest",
+                "canonical_relative_path": (
+                    "v03/runs/v031-raw-transition-controls-20260828-r1"
+                ),
+                "evidence_sha256": sha256_json(raw_evidence),
+            },
+            {
+                "asset_id": "v03-source-utility",
+                "owner": "v03",
+                "relocation": "reference-only; resolve through owner manifest",
+                "canonical_relative_path": (
+                    "v03/runs/v03-signal-ranking-20260827-r1/baseline"
+                ),
+                "evidence_sha256": sha256_json(utility_evidence),
+            },
+        ],
+        "code_reference": {
+            "module": "server.repro_fpo_ppo_v04a.bpr_runner",
+            "verification_stage": "relocation-manifest",
+            "module_sha256": sha256_file(Path(__file__)),
+            "prepare_input_flags": [
+                "--context-index",
+                "--public-policy-market",
+                "--deployment-private-registry",
+                "--origin-pool-acceptance",
+                "--raw-delta-root",
+                "--fpo-root",
+                "--source-utility-root",
+            ],
+        },
+        "verification_command": [
+            "python",
+            "-m",
+            "server.repro_fpo_ppo_v04a.bpr_runner",
+            "relocation-manifest",
+            "--artifacts-root",
+            f"${{{ARTIFACTS_ROOT_ENV}}}",
+            "--source-run",
+            "<historical-r4-run>",
+            "--source-log-root",
+            "<historical-r4-log-root>",
+            "--source-diagnostic-root",
+            "<historical-r4-diagnostic-root>",
+        ],
+        "reproduction": {
+            "config": "configs/v04a_bayesian_reuse.yaml",
+            "fresh_run_required": True,
+            "stage_order": [
+                "prepare",
+                "fit-source",
+                "smoke-fp",
+                "score-fp",
+                "seal-rankings",
+                "oracle-evaluate",
+                "summarize",
+            ],
+            "input_paths_are_artifacts_root_relative": True,
+        },
+    }
+    output = getattr(args, "manifest_output", None)
+    output_path = (
+        Path(output).expanduser().resolve()
+        if output is not None
+        else artifacts_root / "v04a" / "relocation_manifest.json"
+    )
+    _publish(output_path, manifest, resume=bool(getattr(args, "resume", False)))
+    return manifest
 
 
 def _json(path: Path) -> Mapping[str, Any]:
@@ -635,19 +1082,19 @@ def _raw_root(root: Path) -> Path:
     )
 
 
-def _origin_pool_acceptance(path: Path) -> tuple[Mapping[str, Any], dict[str, Any]]:
+def _origin_pool_acceptance(
+    path: Path, *, resolver: RelocationResolver
+) -> tuple[Mapping[str, Any], dict[str, Any]]:
     """Revalidate the immutable v02 84-direct + 6-promotion pool once."""
 
-    handoff_root = path.parent
-    experiment_root = handoff_root.parent
-    promotion_path = handoff_root / "compiled_parity_promotions.json"
-    plan_path = (
-        experiment_root / "training_private" / "plans" / "server_training_plan.json"
-    )
-    runs_root = experiment_root / "training_private" / "server_runs"
+    layout = resolver.layout
+    promotion_path = layout.promotions
+    plan_path = layout.server_plan
+    runs_root = layout.runs_root
     files = (path, promotion_path, plan_path)
     if (
-        any(item.is_symlink() or not item.is_file() for item in files)
+        path.resolve() != layout.frozen_acceptance.resolve()
+        or any(item.is_symlink() or not item.is_file() for item in files)
         or runs_root.is_symlink()
         or not runs_root.is_dir()
         or (path.stat().st_mode & 0o777) != 0o444
@@ -658,34 +1105,22 @@ def _origin_pool_acceptance(path: Path) -> tuple[Mapping[str, Any], dict[str, An
             "frozen v02 policy-pool acceptance authority is absent or writable",
         )
     try:
-        stored = load_strict_json(path)
-        validate_self_digest(
-            stored, key="report_digest", where="policy-pool acceptance"
+        stored = replay_relocated_policy_pool_acceptance(
+            artifacts_root=layout.root,
+            acceptance_path=path,
         )
         promotion = load_strict_json(promotion_path)
-        plan = load_strict_json(plan_path)
-        recomputed = accept_policy_pool(
-            server_plan=plan,
-            runs_root=runs_root,
-            promotion_manifest=promotion,
-        )
-    except (OSError, KeyError, V02ContractError, ValueError) as error:
+    except (
+        OSError,
+        KeyError,
+        V02AssetError,
+        V02ContractError,
+        ValueError,
+    ) as error:
         raise GateFailure(
             "NO_GO_MARKET_OR_TASK5_ABI",
             f"cannot revalidate frozen v02 policy-pool acceptance: {error}",
         ) from error
-    ignored = {"accepted_at", "report_digest"}
-    stored_semantics = {
-        key: value for key, value in stored.items() if key not in ignored
-    }
-    recomputed_semantics = {
-        key: value for key, value in recomputed.items() if key not in ignored
-    }
-    if stored_semantics != recomputed_semantics:
-        raise GateFailure(
-            "NO_GO_MARKET_OR_TASK5_ABI",
-            "stored v02 policy-pool acceptance differs from canonical replay",
-        )
     cells = stored.get("cells")
     if not isinstance(cells, Mapping):
         raise GateFailure(
@@ -712,21 +1147,37 @@ def _origin_pool_acceptance(path: Path) -> tuple[Mapping[str, Any], dict[str, An
 
 
 def _origin_parity_receipt(
-    metadata: Any, accepted_cell: Mapping[str, Any]
+    metadata: Any,
+    accepted_cell: Mapping[str, Any],
+    *,
+    resolver: RelocationResolver | None = None,
 ) -> dict[str, Any]:
     """Verify one bundle against its canonical v02 pool-acceptance cell."""
+
+    def recorded_path(value: Any, where: str) -> Path:
+        raw = Path(str(value))
+        try:
+            return raw.resolve() if resolver is None else resolver.resolve(raw)
+        except (OSError, V02AssetError, ValueError) as error:
+            raise GateFailure(
+                "NO_GO_MARKET_OR_TASK5_ABI",
+                f"{where} has no verified v02 relocation: {error}",
+            ) from error
 
     attempt_root = metadata.bundle_dir.parents[1]
     job_id = metadata.bundle_dir.parents[2].name
     record_path = attempt_root / "training_record.json"
     status_path = attempt_root / "status.json"
     bundle_root = metadata.bundle_dir.resolve()
+    accepted_bundle = recorded_path(
+        accepted_cell.get("bundle_path", ""), "accepted bundle path"
+    )
     if (
         accepted_cell.get("job_id") != job_id
         or accepted_cell.get("job_digest") != metadata.provenance.get("job_digest")
         or accepted_cell.get("attempt_digest")
         != metadata.provenance.get("attempt_digest")
-        or Path(str(accepted_cell.get("bundle_path", ""))).resolve() != bundle_root
+        or accepted_bundle != bundle_root
         or accepted_cell.get("bundle_digest") != metadata.bundle_digest
         or accepted_cell.get("outer_iteration") != metadata.outer_iteration
         or accepted_cell.get("environment_steps") != metadata.environment_steps
@@ -809,7 +1260,8 @@ def _origin_parity_receipt(
         row
         for row in checkpoints
         if isinstance(row, Mapping)
-        and Path(str(row.get("path", ""))).resolve() == bundle_root
+        and recorded_path(row.get("path", ""), "training-record checkpoint path")
+        == bundle_root
     ]
     if len(matching) != 1 or matching[0].get("bundle_digest") != metadata.bundle_digest:
         raise GateFailure(
@@ -1027,6 +1479,7 @@ def _deployment_action_audit(policy: Any, metadata: Any) -> dict[str, Any]:
 
 def inspect_assets(
     *,
+    artifacts_root: Path,
     context_index: Path,
     public_policy_market: Path,
     deployment_private_registry: Path,
@@ -1065,7 +1518,17 @@ def inspect_assets(
             "v0.4a development runner refuses confirmatory or extrapolation contexts",
         )
     market = _market(public_policy_market, deployment_private_registry)
-    accepted_cells, origin_acceptance = _origin_pool_acceptance(origin_pool_acceptance)
+    try:
+        resolver = RelocationResolver.load(artifacts_root=artifacts_root)
+    except (OSError, V02AssetError, ValueError) as error:
+        raise GateFailure(
+            "NO_GO_MARKET_OR_TASK5_ABI",
+            f"cannot load the verified v02 relocation manifest: {error}",
+        ) from error
+    accepted_cells, origin_acceptance = _origin_pool_acceptance(
+        origin_pool_acceptance,
+        resolver=resolver,
+    )
     if fpo_root.is_symlink() or not fpo_root.is_dir():
         raise GateFailure(
             "NO_GO_MARKET_OR_TASK5_ABI",
@@ -1132,7 +1595,15 @@ def inspect_assets(
                     f"policy market differs from accepted v02 pool: {opaque}",
                 )
             bundle_path = Path(private.bundle_path).expanduser()
-            if not bundle_path.is_absolute():
+            if bundle_path.is_absolute():
+                try:
+                    bundle_path = resolver.resolve(bundle_path)
+                except (OSError, V02AssetError, ValueError) as error:
+                    raise GateFailure(
+                        "NO_GO_MARKET_OR_TASK5_ABI",
+                        f"policy bundle has no verified v02 relocation: {opaque}: {error}",
+                    ) from error
+            else:
                 bundle_path = deployment_private_registry.parent / bundle_path
             if bundle_path.is_symlink():
                 raise GateFailure(
@@ -1149,7 +1620,11 @@ def inspect_assets(
                     expected_environment_steps=private.environment_steps,
                     runtime_only=True,
                 )
-                origin_parity = _origin_parity_receipt(metadata, accepted_cell)
+                origin_parity = _origin_parity_receipt(
+                    metadata,
+                    accepted_cell,
+                    resolver=resolver,
+                )
                 policy = load_policy(
                     metadata,
                     fpo_root=fpo_root,
@@ -1702,10 +2177,7 @@ def _validated_source_utility_projection(
         if isinstance(raw_cells, Mapping)
         else {}
     )
-    if (
-        len(cells) != 150
-        or manifest.get("aggregate_digest") != sha256_json(cells)
-    ):
+    if len(cells) != 150 or manifest.get("aggregate_digest") != sha256_json(cells):
         raise GateFailure(
             "NO_GO_SOURCE_UTILITY_GAP",
             "source utility projection count or aggregate differs",
@@ -1747,6 +2219,7 @@ def prepare(args: argparse.Namespace) -> Mapping[str, Any]:
     _assert_new_output_root(args.run_dir, inputs)
     try:
         rows, market, layout, memberships, census = inspect_assets(
+            artifacts_root=_artifacts_root(getattr(args, "artifacts_root", None)),
             context_index=args.context_index,
             public_policy_market=args.public_policy_market,
             deployment_private_registry=args.deployment_private_registry,
@@ -1847,13 +2320,11 @@ def prepare(args: argparse.Namespace) -> Mapping[str, Any]:
         for task_id, task in source_fit_manifest["tasks"].items()
     }
     try:
-        source_utility_projection_manifest = (
-            _materialize_source_utility_projection(
-                run_dir=args.run_dir,
-                source_utility_root=args.source_utility_root,
-                layout=source_utility_layout,
-                config=config,
-            )
+        source_utility_projection_manifest = _materialize_source_utility_projection(
+            run_dir=args.run_dir,
+            source_utility_root=args.source_utility_root,
+            layout=source_utility_layout,
+            config=config,
         )
     except GateFailure as error:
         return _record_prepare_failure(args, config_digest, error, status=error.status)
@@ -1862,9 +2333,7 @@ def prepare(args: argparse.Namespace) -> Mapping[str, Any]:
     census["source_utility"] = {
         "status": "PASS_SOURCE_ONLY_PROJECTION",
         "cell_count": source_utility_projection_manifest["cell_count"],
-        "aggregate_digest": source_utility_projection_manifest[
-            "aggregate_digest"
-        ],
+        "aggregate_digest": source_utility_projection_manifest["aggregate_digest"],
         "fit_cli_external_namespace_bound": False,
     }
     scoring_manifest = {
@@ -2680,9 +3149,10 @@ def fit_source(args: argparse.Namespace) -> Mapping[str, Any]:
         # The broad prepare process has already admitted and copied exactly
         # 150 cells.  This fit process has no external oracle-root argument and
         # opens only the run-relative source-only projection.
-        evidence_root, projected_evidence_digests = (
-            _validated_source_utility_projection(args.run_dir, run)
-        )
+        (
+            evidence_root,
+            projected_evidence_digests,
+        ) = _validated_source_utility_projection(args.run_dir, run)
         utility_artifact["input_namespace_provenance"] = {
             "source_projection": "run-relative exact 150-cell source-only copy",
             "projection_manifest_payload_digest": run[
@@ -2692,9 +3162,7 @@ def fit_source(args: argparse.Namespace) -> Mapping[str, Any]:
             "expected_cell_stage": "PRIVATE_ORACLE",
             "expected_source_context_count": 30,
             "expected_cell_count": 150,
-            "projection_aggregate_digest": sha256_json(
-                projected_evidence_digests
-            ),
+            "projection_aggregate_digest": sha256_json(projected_evidence_digests),
             "mixed_manifest_or_target_records_read": False,
             "input_path_withheld_from_scorer": True,
         }
@@ -2865,7 +3333,6 @@ def fit_source(args: argparse.Namespace) -> Mapping[str, Any]:
         manifest,
         resume=args.resume,
     )
-    _publish(args.run_dir / "fit_source_status.json", manifest, resume=args.resume)
     return manifest
 
 
@@ -3094,206 +3561,6 @@ def _entropy(posterior: Mapping[str, float]) -> float:
     return float(-np.sum(values * np.log(np.maximum(values, np.finfo(float).tiny))))
 
 
-def _score_cell_binding(
-    *,
-    run: Mapping[str, Any],
-    config_digest: str,
-    manifest: Mapping[str, Any],
-    manifest_sha256: str,
-    raw_adapter_sha256: str,
-    layout: Mapping[str, Mapping[str, Any]],
-    row: Mapping[str, Any],
-    budget: int,
-    methods: Sequence[str],
-    block_size: int,
-) -> dict[str, Any]:
-    """Bind one resumable full-score cell to every frozen numeric input."""
-
-    task_id = str(row["task_id"])
-    raw = run.get("raw_delta")
-    if not isinstance(raw, Mapping):
-        raise V04ARunnerError("score cell lacks a Raw-Delta binding")
-    raw_digests = raw.get("source_rkme_sha256")
-    candidates = tuple(str(value) for value in layout[task_id]["candidate_ids"])
-    if not isinstance(raw_digests, Mapping) or not set(candidates).issubset(
-        raw_digests
-    ):
-        raise V04ARunnerError("score cell Raw-Delta binding is incomplete")
-    return {
-        "config_digest": config_digest,
-        "runner_source_sha256": sha256_file(Path(__file__)),
-        "fixed_probe_protocol_id": run["fixed_probe_protocol_id"],
-        "scoring_manifest_payload_digest": run["scoring_manifest_payload_digest"],
-        "source_model_manifest_sha256": manifest_sha256,
-        "source_task_model_digest": sha256_json(manifest["models"][task_id]),
-        "raw_adapter_sha256": raw_adapter_sha256,
-        "raw_config_sha256": raw["config_sha256"],
-        "raw_task_source_digests": {
-            candidate: raw_digests[candidate] for candidate in candidates
-        },
-        "context_id": str(row["context_id"]),
-        "task_id": task_id,
-        "budget_episodes": int(budget),
-        "probe_membership_digest": str(row["probe_membership_digest"]),
-        "target_reward_free_npz_sha256": str(row["reward_free_npz_sha256"]),
-        "block_size": int(block_size),
-        "methods": list(methods),
-    }
-
-
-def _validate_score_cell_payload(
-    payload: Mapping[str, Any],
-    *,
-    binding: Mapping[str, Any],
-    layout: Mapping[str, Mapping[str, Any]],
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Validate a completed cell before its runtime and rows are reused."""
-
-    expected_fields = {"schema", "stage", "status", "binding", "rankings", "traces"}
-    if set(payload) != expected_fields:
-        raise V04ARunnerError("score cell has unexpected fields")
-    if (
-        payload.get("schema") != SCHEMA
-        or payload.get("stage") != "score-fp-cell"
-        or payload.get("status") != "COMPLETE"
-        or payload.get("binding") != dict(binding)
-    ):
-        raise V04ARunnerError("score cell binding or status differs")
-    rankings = payload.get("rankings")
-    traces = payload.get("traces")
-    if not isinstance(rankings, list) or not isinstance(traces, list):
-        raise V04ARunnerError("score cell rows are malformed")
-    methods = tuple(str(value) for value in binding["methods"])
-    posterior_methods = tuple(value for value in methods if value != RAW_METHOD)
-    if (
-        len(rankings) != len(methods)
-        or {row.get("method_id") for row in rankings} != set(methods)
-        or len(traces) != len(posterior_methods)
-        or {row.get("method_id") for row in traces} != set(posterior_methods)
-    ):
-        raise V04ARunnerError("score cell method coverage differs")
-    task = layout[str(binding["task_id"])]
-    candidates = set(str(value) for value in task["candidate_ids"])
-    source_types = set(str(value) for value in task["source_type_ids"])
-    ledger = BudgetLedger.for_budget(int(binding["budget_episodes"])).to_dict()
-    for row in rankings:
-        ranking = row.get("ranking")
-        method_id = str(row.get("method_id"))
-        expected_ties = (
-            dict(task["raw_tie_break_tokens"])
-            if method_id == RAW_METHOD
-            else {
-                candidate: tie_break_key(str(binding["config_digest"]), candidate)
-                for candidate in candidates
-            }
-        )
-        if (
-            row.get("schema") != SCHEMA
-            or row.get("stage") != "PUBLIC_RANKING_PRE_ORACLE"
-            or row.get("status") != "OK"
-            or row.get("context_role") != "development"
-            or row.get("context_id") != binding["context_id"]
-            or row.get("task_id") != binding["task_id"]
-            or method_id not in methods
-            or row.get("method_version") != "0.4a.0"
-            or row.get("access_track") != "BI0-FP-RF"
-            or row.get("candidate_scope") != "TASK_5"
-            or not isinstance(row.get("faithfulness"), str)
-            or not row.get("faithfulness")
-            or not isinstance(row.get("source_evidence_privileges"), str)
-            or not row.get("source_evidence_privileges")
-            or row.get("budget_episodes") != binding["budget_episodes"]
-            or row.get("probe_membership_digest") != binding["probe_membership_digest"]
-            or row.get("budget_ledger") != ledger
-            or any(
-                row.get(name) != value
-                for name, value in ledger.items()
-                if name != "schema"
-            )
-            or not isinstance(ranking, list)
-            or len(ranking) != 5
-            or {item.get("opaque_candidate_id") for item in ranking} != candidates
-            or [item.get("rank") for item in ranking] != list(range(1, 6))
-            or {
-                str(item.get("opaque_candidate_id")): item.get("tie_break_token")
-                for item in ranking
-            }
-            != expected_ties
-            or row.get("selected_opaque_candidate_id")
-            != ranking[0].get("opaque_candidate_id")
-            or row.get("score_semantics")
-            != (
-                "negative_mmd"
-                if method_id == RAW_METHOD
-                else "posterior_expected_source_utility"
-                if method_id in {BPR_METHOD, HYBRID_METHOD}
-                else "paired_source_type_posterior"
-            )
-            or not isinstance(row.get("runtime_accounting"), str)
-            or not row.get("runtime_accounting")
-            or isinstance(row.get("peak_memory_ru_maxrss"), bool)
-            or not isinstance(row.get("peak_memory_ru_maxrss"), int)
-            or row.get("peak_memory_ru_maxrss") < 0
-        ):
-            raise V04ARunnerError("score cell ranking payload differs")
-        scores = [item.get("score") for item in ranking]
-        if any(
-            isinstance(value, bool)
-            or not isinstance(value, (int, float))
-            or not math.isfinite(float(value))
-            for value in scores
-        ) or any(float(scores[index]) < float(scores[index + 1]) for index in range(4)):
-            raise V04ARunnerError("score cell ranking scores are malformed")
-        score_by_candidate = {
-            str(item["opaque_candidate_id"]): float(item["score"]) for item in ranking
-        }
-        expected_order = sorted(
-            candidates,
-            key=lambda candidate: (
-                -score_by_candidate[candidate],
-                expected_ties[candidate],
-            ),
-        )
-        if [str(item["opaque_candidate_id"]) for item in ranking] != expected_order:
-            raise V04ARunnerError("score cell ranking tie order differs")
-        for name in ("runtime_seconds", "shared_probe_load_seconds"):
-            value = row.get(name)
-            if (
-                isinstance(value, bool)
-                or not isinstance(value, (int, float))
-                or not math.isfinite(float(value))
-                or float(value) < 0.0
-            ):
-                raise V04ARunnerError("score cell runtime is malformed")
-    for row in traces:
-        posterior = row.get("posterior")
-        if (
-            row.get("schema") != SCHEMA
-            or row.get("context_id") != binding["context_id"]
-            or row.get("task_id") != binding["task_id"]
-            or row.get("method_id") not in posterior_methods
-            or row.get("budget_episodes") != binding["budget_episodes"]
-            or row.get("probe_membership_digest") != binding["probe_membership_digest"]
-            or row.get("fit_on_target") is not False
-            or not isinstance(posterior, Mapping)
-            or set(posterior) != source_types
-        ):
-            raise V04ARunnerError("score cell posterior trace differs")
-        probabilities = np.asarray(list(posterior.values()), dtype=np.float64)
-        entropy = float(row.get("posterior_entropy", float("nan")))
-        predictive_nll = float(row.get("target_predictive_nll", float("nan")))
-        if (
-            not np.all(np.isfinite(probabilities))
-            or np.any(probabilities < 0.0)
-            or not np.isclose(np.sum(probabilities), 1.0, rtol=0.0, atol=1.0e-10)
-            or not math.isfinite(entropy)
-            or not np.isclose(entropy, _entropy(posterior), rtol=0.0, atol=1.0e-12)
-            or not math.isfinite(predictive_nll)
-        ):
-            raise V04ARunnerError("score cell posterior values are malformed")
-    return [dict(row) for row in rankings], [dict(row) for row in traces]
-
-
 def _attempt_id(value: Any) -> str:
     attempt = str(value or "").strip()
     if (
@@ -3319,7 +3586,6 @@ def _score_fp_impl(args: argparse.Namespace) -> Mapping[str, Any]:
             "rankings.jsonl",
             "posterior_traces.jsonl",
             "score_fp_status.json",
-            "score_cells",
             "rankings.seal.json",
             "oracle_binding.json",
             "metrics.jsonl",
@@ -3415,10 +3681,6 @@ def _score_fp_impl(args: argparse.Namespace) -> Mapping[str, Any]:
         for task_id, task in layout.items()
         if task_id in active_tasks
     }
-    manifest_sha256 = sha256_file(
-        args.run_dir / "source_observation_model_manifest.json"
-    )
-    raw_adapter_sha256 = sha256_file(args.run_dir / "raw_delta_adapter.json")
     try:
         for row in development:
             task_id = str(row["task_id"])
@@ -3444,37 +3706,6 @@ def _score_fp_impl(args: argparse.Namespace) -> Mapping[str, Any]:
                     f"target scoring projection moved or changed: {row['context_id']}"
                 )
             for budget in budgets:
-                cell_binding = _score_cell_binding(
-                    run=run,
-                    config_digest=config_digest,
-                    manifest=manifest,
-                    manifest_sha256=manifest_sha256,
-                    raw_adapter_sha256=raw_adapter_sha256,
-                    layout=layout,
-                    row=row,
-                    budget=budget,
-                    methods=methods,
-                    block_size=args.block_size,
-                )
-                cell_path = (
-                    args.run_dir
-                    / "score_cells"
-                    / str(row["context_id"])
-                    / f"budget_{int(budget):03d}.json"
-                )
-                if not smoke and cell_path.exists():
-                    if not args.resume:
-                        raise V04ARunnerError(
-                            f"immutable score cell already exists: {cell_path}"
-                        )
-                    cell_rankings, cell_traces = _validate_score_cell_payload(
-                        _json(cell_path), binding=cell_binding, layout=layout
-                    )
-                    output_rankings.extend(cell_rankings)
-                    traces.extend(cell_traces)
-                    continue
-                ranking_start = len(output_rankings)
-                trace_start = len(traces)
                 probe_started = time.perf_counter()
                 probe = _projected_probe(args.run_dir, row, budget)
                 shared_probe_load_seconds = time.perf_counter() - probe_started
@@ -3617,21 +3848,6 @@ def _score_fp_impl(args: argparse.Namespace) -> Mapping[str, Any]:
                                 "fit_on_target": False,
                             }
                         )
-                if not smoke:
-                    cell_rankings = output_rankings[ranking_start:]
-                    cell_traces = traces[trace_start:]
-                    payload = {
-                        "schema": SCHEMA,
-                        "stage": "score-fp-cell",
-                        "status": "COMPLETE",
-                        "binding": cell_binding,
-                        "rankings": cell_rankings,
-                        "traces": cell_traces,
-                    }
-                    _validate_score_cell_payload(
-                        payload, binding=cell_binding, layout=layout
-                    )
-                    _publish(cell_path, payload)
     except GateFailure as error:
         raise error
     output_rankings.sort(
@@ -3665,12 +3881,8 @@ def _score_fp_impl(args: argparse.Namespace) -> Mapping[str, Any]:
         }
         _publish(output_dir / "status.json", result)
         return result
-    rankings_sha256 = _publish_jsonl(
-        args.run_dir / "rankings.jsonl", output_rankings, resume=args.resume
-    )
-    traces_sha256 = _publish_jsonl(
-        args.run_dir / "posterior_traces.jsonl", traces, resume=args.resume
-    )
+    rankings_sha256 = _publish_jsonl(args.run_dir / "rankings.jsonl", output_rankings)
+    traces_sha256 = _publish_jsonl(args.run_dir / "posterior_traces.jsonl", traces)
     result = {
         "schema": SCHEMA,
         "stage": "score-fp",
@@ -3679,7 +3891,6 @@ def _score_fp_impl(args: argparse.Namespace) -> Mapping[str, Any]:
         "development_context_count": len(development),
         "method_count": len(methods),
         "budget_count": len(BUDGET_EPISODES),
-        "immutable_cell_count": len(development) * len(BUDGET_EPISODES),
         "ranking_record_count": len(output_rankings),
         "posterior_trace_count": len(traces),
         "rankings_sha256": rankings_sha256,
@@ -3687,12 +3898,12 @@ def _score_fp_impl(args: argparse.Namespace) -> Mapping[str, Any]:
         "score_visible_input_scope": "sanitized_reward_free_and_source_only",
         "runtime_accounting": "method-specific adapter plus score; source models warm-cached; shared probe-file load excluded and reported per row",
     }
-    _publish(args.run_dir / "score_fp_status.json", result, resume=args.resume)
+    _publish(args.run_dir / "score_fp_status.json", result)
     return result
 
 
 def score_fp(args: argparse.Namespace) -> Mapping[str, Any]:
-    """Run resumable target scoring; failures live in per-attempt records."""
+    """Run one immutable full target-scoring pass."""
 
     if any(
         (args.run_dir / name).exists()
@@ -3704,7 +3915,6 @@ def score_fp(args: argparse.Namespace) -> Mapping[str, Any]:
         )
     ):
         raise V04ARunnerError("score-fp cannot run after ranking seal or oracle access")
-    attempt = _attempt_id(getattr(args, "attempt_id", None))
     try:
         return _score_fp_impl(args)
     except GateFailure as error:
@@ -3736,18 +3946,7 @@ def score_fp(args: argparse.Namespace) -> Mapping[str, Any]:
             "error_type": type(error).__name__,
             "oracle_access": False,
         }
-    result = {
-        **result,
-        "attempt_id": attempt,
-        "completed_cell_count": len(
-            tuple((args.run_dir / "score_cells").glob("*/*.json"))
-        ),
-    }
-    _publish(
-        args.run_dir / "score_attempts" / f"{attempt}.json",
-        result,
-        resume=args.resume,
-    )
+    _publish(args.run_dir / "score_fp_status.json", result)
     return result
 
 
@@ -4452,7 +4651,9 @@ def summarize(args: argparse.Namespace) -> Mapping[str, Any]:
         }
     method_cards = _json(args.run_dir / "method_cards.json")
     stage_status = {
-        "fit_source": _json(args.run_dir / "fit_source_status.json").get("status"),
+        "fit_source": _json(
+            args.run_dir / "source_observation_model_manifest.json"
+        ).get("status"),
         "score_fp": _json(args.run_dir / "score_fp_status.json").get("status"),
         "seal_rankings": _json(args.run_dir / "seal_status.json").get("status"),
         "oracle_evaluate": oracle_status.get("status"),
@@ -4496,62 +4697,90 @@ def _path(value: str) -> Path:
     return Path(value).expanduser().resolve()
 
 
+def _add_artifacts_root(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--artifacts-root",
+        type=Path,
+        help=(
+            f"external asset root; overrides {ARTIFACTS_ROOT_ENV}, whose safe "
+            "default is <repository-parent>/artifacts"
+        ),
+    )
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="stage", required=True)
     prepare_parser = subparsers.add_parser("prepare")
+    _add_artifacts_root(prepare_parser)
     prepare_parser.add_argument("--config", type=_path, required=True)
-    prepare_parser.add_argument("--run-dir", type=_path, required=True)
-    prepare_parser.add_argument("--context-index", type=_path, required=True)
-    prepare_parser.add_argument("--public-policy-market", type=_path, required=True)
+    prepare_parser.add_argument("--run-dir", type=Path, required=True)
+    prepare_parser.add_argument("--context-index", type=Path, required=True)
+    prepare_parser.add_argument("--public-policy-market", type=Path, required=True)
     prepare_parser.add_argument(
-        "--deployment-private-registry", type=_path, required=True
+        "--deployment-private-registry", type=Path, required=True
     )
-    prepare_parser.add_argument("--origin-pool-acceptance", type=_path, required=True)
-    prepare_parser.add_argument("--raw-delta-root", type=_path, required=True)
-    prepare_parser.add_argument("--fpo-root", type=_path, required=True)
-    prepare_parser.add_argument("--source-utility-root", type=_path, required=True)
+    prepare_parser.add_argument("--origin-pool-acceptance", type=Path, required=True)
+    prepare_parser.add_argument("--raw-delta-root", type=Path, required=True)
+    prepare_parser.add_argument("--fpo-root", type=Path, required=True)
+    prepare_parser.add_argument("--source-utility-root", type=Path, required=True)
     prepare_parser.set_defaults(handler=prepare)
 
     fit = subparsers.add_parser("fit-source")
-    fit.add_argument("--run-dir", type=_path, required=True)
+    _add_artifacts_root(fit)
+    fit.add_argument("--run-dir", type=Path, required=True)
     fit.add_argument("--resume", action="store_true")
     fit.set_defaults(handler=fit_source)
 
     score = subparsers.add_parser("score-fp")
-    score.add_argument("--run-dir", type=_path, required=True)
+    _add_artifacts_root(score)
+    score.add_argument("--run-dir", type=Path, required=True)
     score.add_argument("--block-size", type=int, default=2048)
-    score.add_argument("--attempt-id", required=True)
-    score.add_argument("--resume", action="store_true")
     score.set_defaults(handler=score_fp)
 
     smoke = subparsers.add_parser("smoke-fp")
-    smoke.add_argument("--run-dir", type=_path, required=True)
+    _add_artifacts_root(smoke)
+    smoke.add_argument("--run-dir", type=Path, required=True)
     smoke.add_argument("--context-id", required=True)
     smoke.add_argument("--attempt-id", required=True)
     smoke.add_argument("--block-size", type=int, default=2048)
     smoke.set_defaults(handler=smoke_fp)
 
     seal = subparsers.add_parser("seal-rankings")
-    seal.add_argument("--run-dir", type=_path, required=True)
+    _add_artifacts_root(seal)
+    seal.add_argument("--run-dir", type=Path, required=True)
     seal.add_argument("--resume", action="store_true")
     seal.set_defaults(handler=seal_stage)
 
     evaluate = subparsers.add_parser("oracle-evaluate")
-    evaluate.add_argument("--run-dir", type=_path, required=True)
-    evaluate.add_argument("--oracle-root", type=_path, required=True)
+    _add_artifacts_root(evaluate)
+    evaluate.add_argument("--run-dir", type=Path, required=True)
+    evaluate.add_argument("--oracle-root", type=Path, required=True)
     evaluate.add_argument("--resume", action="store_true")
     evaluate.set_defaults(handler=oracle_evaluate)
 
     summary = subparsers.add_parser("summarize")
-    summary.add_argument("--run-dir", type=_path, required=True)
+    _add_artifacts_root(summary)
+    summary.add_argument("--run-dir", type=Path, required=True)
     summary.add_argument("--resume", action="store_true")
     summary.set_defaults(handler=summarize)
+
+    relocate = subparsers.add_parser(
+        "relocation-manifest",
+        help="verify a byte-identical R4 copy and publish its relocation manifest",
+    )
+    _add_artifacts_root(relocate)
+    relocate.add_argument("--source-run", type=Path, required=True)
+    relocate.add_argument("--source-log-root", type=Path, required=True)
+    relocate.add_argument("--source-diagnostic-root", type=Path, required=True)
+    relocate.add_argument("--manifest-output", type=Path)
+    relocate.add_argument("--resume", action="store_true")
+    relocate.set_defaults(handler=relocation_manifest)
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    args = _parser().parse_args(argv)
+    args = _resolve_cli_paths(_parser().parse_args(argv))
     if getattr(args, "block_size", 1) <= 0:
         raise SystemExit("--block-size must be positive")
     result = args.handler(args)
@@ -4573,6 +4802,7 @@ __all__ = [
     "oracle_evaluate",
     "prepare",
     "raw_delta_task5_scores",
+    "relocation_manifest",
     "score_fp",
     "smoke_fp",
     "seal_stage",

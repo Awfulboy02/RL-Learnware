@@ -176,12 +176,6 @@ def summarize_probe(probe: RewardFreeProbe) -> np.ndarray:
     return summaries
 
 
-# Public aliases make the mathematical terminology easy to discover without
-# maintaining alternate implementations.
-episode_summary = summarize_episode
-episode_summaries = summarize_probe
-
-
 def _canonical_ids(values: Sequence[Any], where: str) -> tuple[str, ...]:
     result = tuple(_nonempty(item, f"{where} item") for item in values)
     if not result or len(set(result)) != len(result):
@@ -420,10 +414,6 @@ class BPRGaussianModel:
         object.__setattr__(
             self, "protocol_id", _nonempty(self.protocol_id, "protocol_id")
         )
-
-    @property
-    def lambda_shrinkage(self) -> float:
-        return self.shrinkage
 
     @property
     def feature_count(self) -> int:
@@ -815,8 +805,6 @@ __all__ = [
     "DEFAULT_TEMPERATURE_GRID",
     "DEFAULT_VARIANCE_FLOOR_GRID",
     "SUMMARY_DEFINITION",
-    "episode_summaries",
-    "episode_summary",
     "summarize_episode",
     "summarize_probe",
 ]

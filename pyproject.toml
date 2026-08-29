@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "policy-learnware-v0"
-version = "0.3.0"
-description = "Closed-set TaskSpec retrieval for Policy Learnware v0"
+version = "0.4.0a0"
+description = "Development-only fixed-probe policy reuse for Policy Learnware v0.4a"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [

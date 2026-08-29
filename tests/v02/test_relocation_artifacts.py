@@ -143,30 +143,40 @@ def _manifest(*, exact_status: str = "verified") -> dict[str, object]:
     }
 
 
-def test_root_resolution_precedence_and_single_manifest_location(tmp_path: Path) -> None:
+def test_root_resolution_precedence_and_single_manifest_location(
+    tmp_path: Path,
+) -> None:
     repo = tmp_path / "policy_learnware_v0"
     repo.mkdir()
     environment = {"RL_LEARNWARE_ARTIFACTS_ROOT": str(tmp_path / "from-env")}
-    assert resolve_artifacts_root(
-        tmp_path / "explicit", repository_root=repo, environ=environment
-    ) == (tmp_path / "explicit").resolve()
-    assert resolve_artifacts_root(repository_root=repo, environ=environment) == (
-        tmp_path / "from-env"
-    ).resolve()
-    assert resolve_artifacts_root(repository_root=repo, environ={}) == (
-        tmp_path / "artifacts"
-    ).resolve()
+    assert (
+        resolve_artifacts_root(
+            tmp_path / "explicit", repository_root=repo, environ=environment
+        )
+        == (tmp_path / "explicit").resolve()
+    )
+    assert (
+        resolve_artifacts_root(repository_root=repo, environ=environment)
+        == (tmp_path / "from-env").resolve()
+    )
+    assert (
+        resolve_artifacts_root(repository_root=repo, environ={})
+        == (tmp_path / "artifacts").resolve()
+    )
 
     layout = V02AssetLayout.resolve(tmp_path / "artifacts", environ={})
-    assert layout.relocation_manifest == (
-        tmp_path / "artifacts" / "relocation_manifest.json"
-    ).resolve()
-    assert layout.exact90 == (
-        tmp_path / "artifacts" / "v02" / "exact90" / V02_RUN_ID
-    ).resolve()
-    assert layout.fpo == (
-        tmp_path / "artifacts" / "shared" / "runtime" / "fpo-418c2554"
-    ).resolve()
+    assert (
+        layout.relocation_manifest
+        == (tmp_path / "artifacts" / "relocation_manifest.json").resolve()
+    )
+    assert (
+        layout.exact90
+        == (tmp_path / "artifacts" / "v02" / "exact90" / V02_RUN_ID).resolve()
+    )
+    assert (
+        layout.fpo
+        == (tmp_path / "artifacts" / "shared" / "runtime" / "fpo-418c2554").resolve()
+    )
 
     real_parent = tmp_path / "real-parent"
     real_parent.mkdir()
@@ -233,7 +243,9 @@ def test_directory_attestation_exact_sha256sum_relative_v1(tmp_path: Path) -> No
         for relative, payload in payloads.items()
     ]
     expected = hashlib.sha256(
-        b"".join(line for _, line in sorted(lines, key=lambda item: item[0].encode("utf-8")))
+        b"".join(
+            line for _, line in sorted(lines, key=lambda item: item[0].encode("utf-8"))
+        )
     ).hexdigest()
     observed = attest_directory(root)
     assert observed.file_count == 3
@@ -265,9 +277,25 @@ def test_manifest_has_exact_top_level_and_row_inventory() -> None:
         validate_relocation_manifest(missing_row_key)
 
 
+def test_ambiguous_duplicate_source_mapping_is_no_go() -> None:
+    manifest = _manifest()
+    manifest["mappings"].append(dict(manifest["mappings"][0]))  # type: ignore[index,union-attr]
+    with pytest.raises(V02AssetError, match="duplicate source prefixes"):
+        validate_relocation_manifest(manifest)
+
+
 @pytest.mark.parametrize(
     "target",
-    ["", "/absolute", "./dot", "parent/../escape", "double//slash", "back\\slash", "nul\0x", "line\nx"],
+    [
+        "",
+        "/absolute",
+        "./dot",
+        "parent/../escape",
+        "double//slash",
+        "back\\slash",
+        "nul\0x",
+        "line\nx",
+    ],
 )
 def test_manifest_rejects_unsafe_nonportable_targets(target: str) -> None:
     manifest = _manifest()
@@ -278,7 +306,16 @@ def test_manifest_rejects_unsafe_nonportable_targets(target: str) -> None:
 
 @pytest.mark.parametrize(
     "source",
-    ["relative", "/", "/dot/./x", "/parent/../x", "/double//x", "/back\\slash", "/nul\0x", "/line\nx"],
+    [
+        "relative",
+        "/",
+        "/dot/./x",
+        "/parent/../x",
+        "/double//x",
+        "/back\\slash",
+        "/nul\0x",
+        "/line\nx",
+    ],
 )
 def test_manifest_rejects_unsafe_historical_sources(source: str) -> None:
     manifest = _manifest()
@@ -333,9 +370,12 @@ def test_resolver_verified_longest_prefix_and_canonical_equivalence(
 
     assert resolver.resolve("/legacy/exact90/receipt.json") == exact_file.resolve()
     assert resolver.resolve(exact_file) == exact_file.resolve()
-    assert resolver.resolve(
-        "/legacy/exact90/training_private/coordination/waiters/g0544.json"
-    ) == runtime_file.resolve()
+    assert (
+        resolver.resolve(
+            "/legacy/exact90/training_private/coordination/waiters/g0544.json"
+        )
+        == runtime_file.resolve()
+    )
 
     with pytest.raises(V02AssetError, match="no allowlisted"):
         resolver.resolve("/unknown/path")
@@ -437,12 +477,18 @@ def test_same_manifest_is_portable_across_two_artifacts_roots(
     left = RelocationResolver(left_layout, manifest)
     right = RelocationResolver(right_layout, manifest)
     recorded = "/legacy/exact90/receipt.json"
-    assert left.resolve(recorded, must_exist=False) == (
-        tmp_path / "left" / "v02" / "exact90" / V02_RUN_ID / "receipt.json"
-    ).resolve()
-    assert right.resolve(recorded, must_exist=False) == (
-        tmp_path / "right" / "v02" / "exact90" / V02_RUN_ID / "receipt.json"
-    ).resolve()
+    assert (
+        left.resolve(recorded, must_exist=False)
+        == (
+            tmp_path / "left" / "v02" / "exact90" / V02_RUN_ID / "receipt.json"
+        ).resolve()
+    )
+    assert (
+        right.resolve(recorded, must_exist=False)
+        == (
+            tmp_path / "right" / "v02" / "exact90" / V02_RUN_ID / "receipt.json"
+        ).resolve()
+    )
     assert left.resolve(recorded, must_exist=False) != right.resolve(
         recorded, must_exist=False
     )
@@ -471,4 +517,6 @@ def test_capabilities_keep_missing_original_vendor_out_of_replay(
     resolver = RelocationResolver(layout, validate_relocation_manifest(_manifest()))
     with pytest.raises(V02AssetError, match="MISSING_ORIGINAL"):
         resolver.ensure_verified_asset("vendor_original", must_exist=False)
-    assert EXPECTED_VENDOR_TREE_DIGEST == ASSET_EXPECTATIONS["vendor_original"].tree_digest
+    assert (
+        EXPECTED_VENDOR_TREE_DIGEST == ASSET_EXPECTATIONS["vendor_original"].tree_digest
+    )
