@@ -3132,7 +3132,7 @@ def run_development(
         requested_run_dir = Path.cwd() / requested_run_dir
     lexical_run_dir = Path(os.path.abspath(requested_run_dir))
     if any(
-        path.exists() and path.is_symlink()
+        path.is_symlink()
         for path in (*reversed(lexical_run_dir.parents), lexical_run_dir)
     ):
         raise V05RunnerError("new run directory has a symlink ancestor")
