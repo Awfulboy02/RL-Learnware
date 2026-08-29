@@ -257,7 +257,7 @@ def _frozen_json(
     relative = Path(str(row.get("relative_path", "")))
     if relative.is_absolute() or ".." in relative.parts or not relative.parts:
         raise V05RunnerError(f"{where} relative path is unsafe")
-    path = root / relative
+    path = _owned_frozen_path(root, relative, where)
     payload = _frozen_bytes(path, expected_sha256, where)
 
     def unique_object(pairs: Sequence[tuple[str, Any]]) -> dict[str, Any]:
@@ -285,6 +285,21 @@ def _frozen_json(
     if not isinstance(value, dict):
         raise V05RunnerError(f"{where} JSON must be a top-level object")
     return path, value
+
+
+def _owned_frozen_path(root: Path, relative: Path, where: str) -> Path:
+    """Resolve one owner-relative frozen path without following any symlink."""
+
+    owner = root.resolve()
+    current = root
+    for part in relative.parts:
+        current = current / part
+        if current.is_symlink():
+            raise V05RunnerError(f"{where} path contains a symlink")
+    resolved = current.resolve()
+    if resolved == owner or not resolved.is_relative_to(owner):
+        raise V05RunnerError(f"{where} path escapes its frozen owner root")
+    return resolved
 
 
 def _load_frozen_r4_assets(
@@ -559,7 +574,7 @@ def _load_frozen_r4_assets(
             or dict(membership_value) != expected_membership.to_dict()
         ):
             raise V05RunnerError("probe membership does not replay from split seed")
-        path = root / relative
+        path = _owned_frozen_path(root, relative, "source bank")
         expected_sha = _digest(row["reward_free_npz_sha256"], "source bank SHA")
         bank_bytes = _frozen_bytes(path, expected_sha, "source bank")
         try:

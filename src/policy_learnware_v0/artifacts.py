@@ -14,6 +14,11 @@ from pathlib import Path
 import re
 from typing import Any, Mapping
 
+try:
+    import tomllib
+except ImportError:  # pragma: no cover - local compatibility below Python 3.11
+    import tomli as tomllib
+
 import numpy as np
 
 from .hashing import canonical_json_bytes, sha256_bytes, sha256_file
@@ -42,6 +47,8 @@ def resolve_artifacts_root(
     """Resolve explicit root, then the shared environment, then sibling default."""
 
     if explicit is not None:
+        if isinstance(explicit, str) and not explicit.strip():
+            raise ArtifactLayoutError("explicit artifacts root cannot be empty")
         root = Path(explicit).expanduser()
     else:
         configured = os.environ.get(ARTIFACTS_ROOT_ENV)
@@ -55,10 +62,35 @@ def resolve_artifacts_root(
                 if repository_root is not None
                 else Path(__file__).resolve().parents[2]
             )
+            project_file = repository / "pyproject.toml"
+            git_marker = repository / ".git"
+            try:
+                project = tomllib.loads(project_file.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, tomllib.TOMLDecodeError) as error:
+                raise ArtifactLayoutError(
+                    "artifacts root requires explicit path or environment outside a checkout"
+                ) from error
+            if (
+                project_file.is_symlink()
+                or git_marker.is_symlink()
+                or project.get("project", {}).get("name") != "policy-learnware-v0"
+                or not (git_marker.is_dir() or git_marker.is_file())
+            ):
+                raise ArtifactLayoutError(
+                    "artifacts root fallback requires the policy-learnware Git checkout"
+                )
+            if git_marker.is_file():
+                raise ArtifactLayoutError(
+                    "Git worktrees require explicit artifacts root or environment"
+                )
             root = repository.parent / "artifacts"
-    if root.is_symlink():
-        raise ArtifactLayoutError("artifacts root cannot be a symlink")
-    return root.resolve()
+    if not root.is_absolute():
+        root = Path.cwd() / root
+    absolute = Path(os.path.abspath(root))
+    components = (*reversed(absolute.parents), absolute)
+    if any(component.is_symlink() for component in components):
+        raise ArtifactLayoutError("artifacts root cannot have a symlink ancestor")
+    return absolute.resolve()
 
 
 _SAFE_SEGMENT = re.compile(r"^[A-Za-z0-9_.-]+$")

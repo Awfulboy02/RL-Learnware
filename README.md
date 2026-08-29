@@ -91,8 +91,7 @@ artifacts/
 └── v05/
     ├── runs/v05-environment-classification-dev-20260829-r0/
     ├── releases/v05-environment-classification-dev-20260829-r0/
-    ├── analysis/
-    └── evidence/final-manifest-chain/
+    └── analysis/
 ```
 
 The runner resolves the v0.3 and v0.4a inputs independently from this root; it
@@ -104,6 +103,12 @@ relocation. Their old-to-new paths and tree digests belong in the external
 relocation manifest; a relocated or reconstructed run must not claim the
 original producer provenance. The frozen run contains private truth-bearing
 material and must retain restricted access.
+
+The five former workspace-root JSON aliases are byte-identical duplicates and
+are removed after hash verification. Their authoritative copies are
+`runs/.../results/development_report.json` and the release files
+`initial_launch_receipt.json`, `execution_events.json`, `final_manifest.json`,
+and `tables_abc.json`; no duplicate evidence chain is created.
 
 Canonical narrative reports live outside Git under `reports/v05/`.
 

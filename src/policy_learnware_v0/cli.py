@@ -206,8 +206,7 @@ def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument(
         "--artifacts-root",
-        type=Path,
-        default=resolve_artifacts_root(),
+        default=None,
         help="shared root: explicit, RL_LEARNWARE_ARTIFACTS_ROOT, or sibling artifacts/",
     )
     mode = parser.add_mutually_exclusive_group()
@@ -5636,6 +5635,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     command = str(args.command)
     try:
         config = load_protocol_draft(args.config)
+        args.artifacts_root = resolve_artifacts_root(args.artifacts_root)
         layout = ArtifactLayout(args.artifacts_root, config.pool.pool_id)
         _validate_command_arguments(args, config)
         if args.dry_run:
