@@ -69,6 +69,12 @@ portable code applies a separate relocation manifest when a recorded path has
 moved. The exact-90 policies are shared v0.2 assets and are not duplicated
 under `artifacts/v03/`.
 
+The retained `configs/dmc6_outer006_v0.yaml` and
+`configs/v02_freeze_ready.yaml` files are digest-bound historical inputs.
+Machine-specific paths recorded inside them are provenance metadata only and
+must not be used for runtime discovery; fresh runtime paths resolve through the
+external artifacts root described above.
+
 Fresh policy inference never searches for a workspace-sibling `fpo/` checkout.
 It uses the canonical `shared/runtime/fpo-418c2554` path (or an explicit path),
 verifies the frozen Git bytes, and requires the explicit
