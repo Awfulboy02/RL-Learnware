@@ -1,0 +1,139 @@
+schema: policy-learnware.v05-ablation-plan.v1
+base_commit: 3c06275ebe1bcff2498acfce004af1dcd97fb7b3
+development_config:
+  relative_path: configs/v05_certified_policy_retrieval.yaml
+  file_sha256: e054995f30aa65a8367575a0a0a98dc10da3ec027bc02545f5fc0311c5ef648b
+  canonical_digest: c6b808fb0ea1f8acce8406b6b21ba29908fac790c0c2bf118b31e1aa0b13b725
+
+scope:
+  status: SECONDARY_EXPLORATORY_POST_TRUTH
+  formal_confirmatory: false
+  actual_new_acquisition_steps: 0
+  output_rule: new_analysis_directory_only
+  frozen_run_release_mutation: forbidden
+  implementation_commit: recorded_and_required_clean_in_launch_manifest
+  frozen_evidence:
+    r4_run_id: v04a-primary-dev-20260828-r4
+    source_fit_manifest_sha256: 4f468f6b885b7680cf3d186edb1fd70baf90c2c3c95c687373359a8d713296cf
+    probe_membership_sha256: dc372cbc59578f66462afac1e4bb3ee7f9d157f6aeae1dafffb4594e60e8d600
+
+methods:
+  frozen_p0:
+    - RAW_DELTA_RKME
+    - EMPIRICAL_MMD_NN
+    - SUMMARY_LOGREG
+    - KME_KRR
+    - RFF_KME_NN
+    - SWE_NN
+  additions:
+    - B0_RANDOM
+    - B3A_RAW_MOMENT_NN
+    - SUMMARY_NN
+    - RFF_LOGREG
+    - RFF_RIDGE
+    - SWE_1024_NN
+  b0_public_seed: 50503
+  swe_1024:
+    direction_count: 32
+    quantile_count: 32
+    public_seed: 50502
+  rff_logreg:
+    standardization: train_feature_zscore_zero_variance_fallback_one
+    l2_grid: [0.0001, 0.001, 0.01, 0.1, 1.0]
+    max_iter: 3000
+    gradient_tolerance: 1.0e-9
+    validation_loss: multiclass_cross_entropy
+  rff_ridge:
+    standardization: none_bounded_raw_rff_features
+    ridge_grid: [0.000001, 0.0001, 0.01, 1.0]
+    validation_loss: one_hot_mean_squared_error
+  comparison_scope: decision_rule_and_method_native_preprocessing_not_head_only
+
+row_prefix:
+  rule: sha256_order_without_replacement_per_parent_membership_episode
+  public_seed: 50504
+  nested: true
+  label_reward_result_independent: true
+
+source_fewshot:
+  family: L_SHAPED_ONE_FACTOR_AT_A_TIME
+  episode_nodes:
+    - {id: U01, train_episodes: 1, validation_episodes: 1}
+    - {id: U02, train_episodes: 2, validation_episodes: 1}
+    - {id: U03, train_episodes: 3, validation_episodes: 1}
+    - {id: U04, train_episodes: 4, validation_episodes: 1}
+    - {id: U06, train_episodes: 6, validation_episodes: 2}
+    - {id: U08, train_episodes: 8, validation_episodes: 3}
+    - {id: U12, train_episodes: 12, validation_episodes: 4}
+    - {id: U16, train_episodes: 16, validation_episodes: 5}
+    - {id: U19, train_episodes: 19, validation_episodes: 6}
+  episode_node_rows_per_episode: 64
+  row_nodes: [1, 2, 4, 8, 16, 32, 64]
+  row_node_train_episodes: 19
+  row_node_validation_episodes: 6
+  fixed_query_budgets: [1, 2, 4]
+  fixed_query_rows_per_episode: 64
+  refit_normalizer_per_node: true
+  normalizer_fit_roles: [selected_source_train, selected_source_validation]
+  refit_bandwidth_per_node_from_train_only: true
+
+query_fewshot:
+  fixed_source_node: {train_episodes: 19, validation_episodes: 6, rows_per_episode: 64}
+  budgets: [1, 2, 4]
+  rows_per_episode: [1, 2, 4, 8, 16, 32, 64]
+  episode_order: frozen_held_repeat_prefix
+  b7_sanity_in_auc: false
+  current_physical_bank_available_rows_per_episode: 64
+  future_fresh_equivalent_steps_per_episode: 1000
+
+compute_scale:
+  design: ONE_FACTOR_AT_A_TIME
+  source_preprocessing_scope: frozen_full_source_normalizer_reused_then_canonical_subset
+  reuse_timing_scope: warm_in_memory_encode_plus_score_cold_load_not_measured
+  repeats: 5
+  repeats_scope: timing_only_not_independent_performance_samples
+  warmup_repeats: 1
+  base:
+    market_anchors: 30
+    train_episodes: 19
+    validation_episodes: 6
+    rows_per_episode: 64
+    query_budget_episodes: 4
+    rff_frequency_count: 512
+    swe_direction_count: 64
+    swe_quantile_count: 64
+  market_anchors: [6, 18, 30]
+  train_episode_nodes:
+    - {train_episodes: 1, validation_episodes: 1}
+    - {train_episodes: 8, validation_episodes: 3}
+    - {train_episodes: 19, validation_episodes: 6}
+  rows_per_episode: [16, 32, 64]
+  rff_frequency_count: [128, 512, 2048]
+  swe_direction_count: [16, 32, 64]
+  swe_quantile_count: [16, 32, 64]
+  market_subset_rule: equal_anchors_per_task_in_frozen_order
+  above_30_market_status: analytic_complexity_only_no_duplicated_anchor_data
+
+reporting:
+  performance_unit: source_anchor
+  task_equal_summary: true
+  nested_nodes_are_not_independent_samples: true
+  source_tables:
+    - performance_robustness
+    - upload_fit_compute
+  query_tables:
+    - performance_robustness
+    - encode_load_score_compute
+  timing_components:
+    - shared_canonicalize
+    - bandwidth_calibration
+    - representation_encode
+    - model_fit
+    - cold_load
+    - warm_score
+  cost_columns:
+    - algorithm_used_visible_rows
+    - trusted_joint_driver_physical_rows
+    - future_fresh_equivalent_steps
+    - actual_new_acquisition_steps
+  ci_status: DEFERRED_UNTIL_CURVES_INSPECTED_THEN_PREREGISTER_INDEPENDENT_QUERY
